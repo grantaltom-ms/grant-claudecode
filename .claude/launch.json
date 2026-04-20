@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "onboarding",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "export PATH=/usr/local/bin:$PATH && cd /Users/grantcarlson/milestone-onboarding && npx vite --port 5173"],
+      "port": 5173
+    },
+    {
+      "name": "underwriting",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "export PATH=/usr/local/bin:$PATH && cd /Users/grantcarlson/milestone-financial-agent/underwriting && npx vite --port 5174"],
+      "port": 5174
+    },
+    {
+      "name": "agent",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "source ~/.zshrc && export ZAP_OUTLOOK_DRAFT=${ZAP_OUTLOOK_DRAFT:-} && export ZAP_SLACK_MESSAGE=${ZAP_SLACK_MESSAGE:-} && cd /Users/grantcarlson/milestone-financial-agent && python3 app.py"],
+      "port": 5001
+    }
+  ,{
+      "name": "milestone-finance-web",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "export PATH=/usr/local/bin:$PATH && cd /Users/grantcarlson/milestone-finance-web && node ./node_modules/.bin/next dev"],
+      "port": 3000
+    }
+  ]
+}
