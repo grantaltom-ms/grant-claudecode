@@ -211,21 +211,21 @@ async function executeTool(name, input, token) {
     }
 
     case 'create_draft_reply': {
-      // Step 1: fetch original email to get CC recipients
-      const original = await graph(token, `${base}/messages/${input.message_id}?$select=ccRecipients,conversationId`);
+      // Fetch original to get CC recipients we need to preserve
+      const original = await graph(token, `${base}/messages/${input.message_id}?$select=ccRecipients`);
       const ccRecipients = original.ccRecipients || [];
 
-      // Step 2: create the reply draft (preserves To, subject, thread/conversationId)
-      const draft = await graph(token, `${base}/messages/${input.message_id}/createReply`, 'POST', {});
-
-      // Step 3: patch body as HTML (preserves threading) and restore CC recipients
-      const htmlBody = input.body
+      // Use createReply's `comment` to prepend our text above the quoted history
+      // in a single call. PATCHing the body afterward strips the quoted block and
+      // makes Outlook render the draft as a standalone (un-threaded) email.
+      const htmlComment = input.body
         .split('\n')
         .map(line => `<div>${line || '&nbsp;'}</div>`)
         .join('');
-      await graph(token, `${base}/messages/${draft.id}`, 'PATCH', {
-        body: { contentType: 'HTML', content: htmlBody },
-        ...(ccRecipients.length && { ccRecipients }),
+
+      const draft = await graph(token, `${base}/messages/${input.message_id}/createReply`, 'POST', {
+        comment: htmlComment,
+        ...(ccRecipients.length && { message: { ccRecipients } }),
       });
 
       return { draft_id: draft.id, subject: draft.subject, message: 'Draft saved. Awaiting approval.' };
