@@ -1,0 +1,547 @@
+import crypto from 'crypto';
+import Anthropic from '@anthropic-ai/sdk';
+import { waitUntil } from '@vercel/functions';
+
+// Disable Next.js body parsing — need raw body for Slack signature verification
+export const config = { api: { bodyParser: false } };
+
+const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
+const OWNER_EMAIL = 'grant@milestoneproperties.net';
+
+// --- Microsoft Graph helpers ---
+
+let cachedToken = null;
+let tokenExpiry = 0;
+
+async function getGraphToken() {
+  if (cachedToken && Date.now() < tokenExpiry - 60_000) return cachedToken;
+
+  const res = await fetch(
+    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: process.env.AZURE_CLIENT_ID,
+        client_secret: process.env.AZURE_CLIENT_SECRET,
+        scope: 'https://graph.microsoft.com/.default',
+      }),
+    }
+  );
+  const data = await res.json();
+  if (!data.access_token) throw new Error(`Graph auth failed: ${JSON.stringify(data)}`);
+
+  cachedToken = data.access_token;
+  tokenExpiry = Date.now() + data.expires_in * 1000;
+  return cachedToken;
+}
+
+async function graph(token, path, method = 'GET', body = null) {
+  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    ...(body && { body: JSON.stringify(body) }),
+  });
+
+  // 202 Accepted = success with no body (e.g. send)
+  if (res.status === 202 || res.status === 204) return { success: true };
+
+  const text = await res.text();
+  if (!text) return { success: true };
+
+  const json = JSON.parse(text);
+  if (json.error) throw new Error(`Graph error: ${json.error.message}`);
+  return json;
+}
+
+// --- Claude tool definitions ---
+
+const EMAIL_TOOLS = [
+  {
+    name: 'list_emails',
+    description: "List recent emails from Grant's inbox or a specific folder.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        folder: { type: 'string', description: "Folder name: 'Inbox', 'SentItems', 'Drafts'. Default: Inbox." },
+        top: { type: 'number', description: 'How many to return (max 25). Default: 15.' },
+        unread_only: { type: 'boolean', description: 'If true, only return unread emails.' },
+      },
+    },
+  },
+  {
+    name: 'search_emails',
+    description: 'Search emails by keyword across subject, body, and sender.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search terms (e.g. "BECU financial documents")' },
+        top: { type: 'number', description: 'Number of results. Default: 10.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'get_email',
+    description: 'Get the full body and details of a specific email by ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The email message ID.' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'create_draft_reply',
+    description: 'Create a saved draft reply to an email. Does NOT send it — Grant must approve first. CC recipients from the original email are automatically preserved — you do not need to specify them.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'ID of the email to reply to.' },
+        body: { type: 'string', description: 'The plain-text reply body.' },
+      },
+      required: ['message_id', 'body'],
+    },
+  },
+  {
+    name: 'get_recent_drafts',
+    description: 'Get the most recent draft emails (useful to find what was just drafted for sending).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        top: { type: 'number', description: 'Number of drafts. Default: 5.' },
+      },
+    },
+  },
+  {
+    name: 'create_new_draft',
+    description: 'Create a brand new draft email (not a reply) to one or more recipients. Does NOT send — Grant must approve first.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        to: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of recipient email addresses.',
+        },
+        subject: { type: 'string', description: 'Email subject line.' },
+        body: { type: 'string', description: 'Plain-text email body.' },
+        cc: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional CC recipients.',
+        },
+      },
+      required: ['to', 'subject', 'body'],
+    },
+  },
+  {
+    name: 'send_draft',
+    description: 'Send a saved draft. Only call this after Grant explicitly approves (e.g. "send it", "looks good, send").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        draft_id: { type: 'string', description: 'The draft message ID to send.' },
+      },
+      required: ['draft_id'],
+    },
+  },
+  {
+    name: 'update_triage_rules',
+    description: "Add or remove a rule that controls how the morning digest prioritizes emails. Use when Grant says certain senders or email types should always be a specific priority. Also use to list current rules when asked.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['add', 'remove', 'list'],
+          description: 'add a new rule, remove an existing rule, or list all current rules.',
+        },
+        rule: {
+          type: 'string',
+          description: 'Plain English rule, e.g. "Emails from Crystal Li are always Action Required" or "AppFolio automated notifications are always Low Priority". Required for add/remove.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'delete_draft',
+    description: 'Delete a draft email from the Drafts folder. Use when Grant says "discard it", "delete the draft", "never mind", or similar.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        draft_id: { type: 'string', description: 'The draft message ID to delete.' },
+      },
+      required: ['draft_id'],
+    },
+  },
+];
+
+// --- Tool execution ---
+
+async function executeTool(name, input, token) {
+  const base = `/users/${OWNER_EMAIL}`;
+
+  switch (name) {
+    case 'list_emails': {
+      const folder = input.folder || 'Inbox';
+      const top = Math.min(input.top || 15, 25);
+      const select = 'id,subject,from,receivedDateTime,isRead,bodyPreview';
+      let url = `${base}/mailFolders/${folder}/messages?$top=${top}&$select=${select}&$orderby=receivedDateTime desc`;
+      if (input.unread_only) url += '&$filter=isRead eq false';
+      return graph(token, url);
+    }
+
+    case 'search_emails': {
+      const top = Math.min(input.top || 10, 25);
+      // Graph search requires $search with quoted string
+      const url = `${base}/messages?$search="${input.query}"&$top=${top}&$select=id,subject,from,receivedDateTime,isRead,bodyPreview`;
+      return graph(token, url);
+    }
+
+    case 'get_email': {
+      const select = 'id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,conversationId';
+      return graph(token, `${base}/messages/${input.id}?$select=${select}`);
+    }
+
+    case 'create_draft_reply': {
+      // Step 1: fetch original email to get CC recipients
+      const original = await graph(token, `${base}/messages/${input.message_id}?$select=ccRecipients,conversationId`);
+      const ccRecipients = original.ccRecipients || [];
+
+      // Step 2: create the reply draft (preserves To, subject, thread/conversationId)
+      const draft = await graph(token, `${base}/messages/${input.message_id}/createReply`, 'POST', {});
+
+      // Step 3: patch body as HTML (preserves threading) and restore CC recipients
+      const htmlBody = input.body
+        .split('\n')
+        .map(line => `<div>${line || '&nbsp;'}</div>`)
+        .join('');
+      await graph(token, `${base}/messages/${draft.id}`, 'PATCH', {
+        body: { contentType: 'HTML', content: htmlBody },
+        ...(ccRecipients.length && { ccRecipients }),
+      });
+
+      return { draft_id: draft.id, subject: draft.subject, message: 'Draft saved. Awaiting approval.' };
+    }
+
+    case 'get_recent_drafts': {
+      const top = input.top || 5;
+      const select = 'id,subject,toRecipients,bodyPreview,lastModifiedDateTime';
+      return graph(token, `${base}/mailFolders/Drafts/messages?$top=${top}&$select=${select}&$orderby=lastModifiedDateTime desc`);
+    }
+
+    case 'create_new_draft': {
+      const toRecipients = input.to.map(email => ({
+        emailAddress: { address: email },
+      }));
+      const ccRecipients = (input.cc || []).map(email => ({
+        emailAddress: { address: email },
+      }));
+      const draft = await graph(token, `${base}/messages`, 'POST', {
+        subject: input.subject,
+        body: { contentType: 'Text', content: input.body },
+        toRecipients,
+        ...(ccRecipients.length && { ccRecipients }),
+      });
+      return { draft_id: draft.id, subject: draft.subject, message: 'New draft created. Awaiting approval.' };
+    }
+
+    case 'send_draft': {
+      await graph(token, `${base}/messages/${input.draft_id}/send`, 'POST', {});
+      return { success: true, message: 'Email sent.' };
+    }
+
+    case 'update_triage_rules': {
+      const projectId = 'prj_1eeFtlROsHRqaCD3HkvGC6m9XMJX';
+      const teamId = 'team_1mUqHwC1cSBZNn1LlIFJJube';
+
+      // Parse current rules
+      let rules = [];
+      try { rules = JSON.parse(process.env.TRIAGE_RULES || '[]'); } catch {}
+
+      if (input.action === 'list') {
+        return { rules, message: rules.length ? `${rules.length} active rule(s).` : 'No custom rules set yet.' };
+      }
+
+      if (input.action === 'add' && input.rule) {
+        if (!rules.includes(input.rule)) rules.push(input.rule);
+      } else if (input.action === 'remove' && input.rule) {
+        rules = rules.filter(r => r !== input.rule);
+      }
+
+      const newValue = JSON.stringify(rules);
+
+      // Find or create TRIAGE_RULES env var via Vercel API
+      const listRes = await fetch(
+        `https://api.vercel.com/v9/projects/${projectId}/env?teamId=${teamId}`,
+        { headers: { Authorization: `Bearer ${process.env.VERCEL_TOKEN}` } }
+      );
+      const listData = await listRes.json();
+      const existing = listData.envs?.find(e => e.key === 'TRIAGE_RULES');
+
+      if (existing) {
+        await fetch(
+          `https://api.vercel.com/v9/projects/${projectId}/env/${existing.id}?teamId=${teamId}`,
+          {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${process.env.VERCEL_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: newValue }),
+          }
+        );
+      } else {
+        await fetch(
+          `https://api.vercel.com/v9/projects/${projectId}/env?teamId=${teamId}`,
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${process.env.VERCEL_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'TRIAGE_RULES', value: newValue, type: 'plain', target: ['production'] }),
+          }
+        );
+      }
+
+      return { rules, message: `Done. ${rules.length} active rule(s). Takes effect on the next morning digest.` };
+    }
+
+    case 'delete_draft': {
+      await graph(token, `${base}/messages/${input.draft_id}`, 'DELETE');
+      return { success: true, message: 'Draft deleted.' };
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+// --- Slack helpers ---
+
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', chunk => { data += chunk; });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+function verifySlackSignature(rawBody, headers) {
+  const timestamp = headers['x-slack-request-timestamp'];
+  const signature = headers['x-slack-signature'];
+  if (!timestamp || !signature) return false;
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
+  const hmac = crypto.createHmac('sha256', process.env.SLACK_SIGNING_SECRET);
+  hmac.update(`v0:${timestamp}:${rawBody}`);
+  const computed = `v0=${hmac.digest('hex')}`;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
+async function slackPost(text, threadTs = null) {
+  await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      channel: CHANNEL_ID,
+      text,
+      ...(threadTs && { thread_ts: threadTs }),
+    }),
+  });
+}
+
+async function getThreadHistory(threadTs) {
+  const res = await fetch(
+    `https://slack.com/api/conversations.replies?channel=${CHANNEL_ID}&ts=${threadTs}&limit=20`,
+    { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
+  );
+  const data = await res.json();
+  return data.messages || [];
+}
+
+// --- Agentic loop ---
+
+const SYSTEM_PROMPT = `You are an email assistant for Grant Carlson, Head of Operations at Milestone Properties (grant@milestoneproperties.net), a property management company in the Seattle/Burien/SeaTac area. Grant messages you in Slack. You have tools to read, search, and draft emails in his Outlook inbox.
+
+RULES:
+- NEVER send an email without Grant explicitly approving it (e.g. "send it", "looks good", "go ahead")
+- When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading. Save the draft, show it in Slack, then ask: "Send it, edit it, or discard?"
+- When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
+- When showing a reply draft, always list who it's going To: and CC: (CC recipients from the original are included automatically)
+- When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
+- If a thread message refers to earlier context (like "send it"), look at the conversation history provided
+- When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules
+
+COMPANY CONTEXT:
+- Uses AppFolio for property management, Grasshopper for texting
+- Internal team: Rhoda (principal), Conor Murphy (accounting@milestoneproperties.net), Jamie Masterson (leasing), Kelsey Dempsey (property manager), Sabrina, Jeremy, Jeri
+- External: Alpine CPAs (Josh), BECU lender (Crystal Li, Jawad Habibi), Psomas (Shannon Jensvold)
+
+WRITING STYLE — write exactly as Grant would:
+
+OVERALL VOICE:
+- Professional, calm, direct, collaborative
+- Plainspoken, low-ego, task-oriented, quietly confident
+- Never use corporate jargon, legalistic phrasing, aggressive commands, overly long explanations, or flowery closings
+
+STRUCTURE:
+Opening: Brief, human, friendly — even in technical threads
+- "Hi {Name},"
+- "Hope you're doing well."
+- "Hi {Name}, hope you're well."
+
+Body:
+- 1–2 sentences of brief context
+- One clear request, question, or clarification
+- Optional delegation or handoff
+- Short paragraphs, prefer clarity over completeness
+- Let the recipient infer urgency unless it's critical
+
+Closing: Short and polite
+- "Thanks," / "Thanks!" / "-Grant"
+- No long signature blocks in replies
+- For new external emails include: Grant Carlson | Milestone Properties | (C) 206-553-9098 (O) 206-775-7335
+
+LANGUAGE:
+Preferred phrases: "Hope you're doing well" / "When you have a chance" / "Could we" / "Do you mind" / "Happy to" / "Let me know" / "I'll let {Name} take it away"
+Avoided phrases: "Per my last email" / "Kindly advise" / "At your earliest convenience" / "Sorry to bother you" / "If it's not too much trouble"
+
+POLITENESS:
+- Respectful without weakening the request
+- Preferred: "Could we take a look at this?" / "When you have a moment, can you confirm?" / "Do you mind sharing the details?"
+- Avoided: over-apologizing, deferential hedging
+
+DELEGATION:
+- Gentle and collaborative
+- "I'll let {Name} take it away" / "{Name} had a couple questions for you" / "We've been taking a look at this and wanted your input"
+
+INFORMALITY:
+- Allowed only with known collaborators
+- Never with legal counsel, lenders, or unfamiliar vendors
+- Occasional single emoji (🙂) or light conversational aside is fine with familiar contacts
+
+AUTHORITY:
+- Implicit rather than directive
+- Frame decisions as shared, ask for confirmation instead of issuing commands, delegate rather than instruct
+
+Always write as Grant, in first person. Never explain what the email is doing — just write it.
+
+FORMAT SLACK RESPONSES:
+- *Bold* for email subjects/senders
+- Bullet points for summaries
+- Use \`\`\` code blocks for draft email text`;
+
+async function runAgent(userMessage, threadTs, threadHistory = []) {
+  const token = await getGraphToken();
+  const anthropic = new Anthropic();
+
+  // Build conversation context from thread history (so Claude knows about prior drafts, etc.)
+  const messages = [];
+  for (const msg of threadHistory) {
+    if (msg.bot_id) {
+      messages.push({ role: 'assistant', content: msg.text });
+    } else if (msg.text !== userMessage) {
+      messages.push({ role: 'user', content: msg.text });
+    }
+  }
+  messages.push({ role: 'user', content: userMessage });
+
+  while (true) {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4096,
+      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      tools: EMAIL_TOOLS,
+      messages,
+    });
+
+    if (response.stop_reason === 'end_turn') {
+      const text = response.content
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n');
+      await slackPost(text, threadTs);
+      break;
+    }
+
+    if (response.stop_reason === 'tool_use') {
+      const toolUses = response.content.filter(b => b.type === 'tool_use');
+      const results = [];
+
+      for (const tu of toolUses) {
+        try {
+          const result = await executeTool(tu.name, tu.input, token);
+          results.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: JSON.stringify(result),
+          });
+        } catch (err) {
+          results.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: `Error: ${err.message}`,
+            is_error: true,
+          });
+        }
+      }
+
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({ role: 'user', content: results });
+    }
+  }
+}
+
+// --- Main handler ---
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).end();
+
+  const rawBody = await getRawBody(req);
+  if (!verifySlackSignature(rawBody, req.headers)) return res.status(401).end();
+
+  const body = JSON.parse(rawBody);
+
+  // Slack URL verification (one-time, when you first configure the endpoint)
+  if (body.type === 'url_verification') return res.json({ challenge: body.challenge });
+
+  const { event } = body;
+
+  // Only handle real user messages in #inbox-digest
+  if (
+    body.type !== 'event_callback' ||
+    event?.type !== 'message' ||
+    event?.channel !== CHANNEL_ID ||
+    event?.bot_id ||
+    event?.subtype
+  ) {
+    return res.status(200).end();
+  }
+
+  // Acknowledge Slack immediately (required within 3s), then process in background.
+  res.status(200).json({ ok: true });
+
+  waitUntil(
+    (async () => {
+      const replyTs = event.thread_ts || event.ts;
+      await slackPost('_On it..._', replyTs);
+      const history = event.thread_ts
+        ? await getThreadHistory(event.thread_ts)
+        : [];
+      await runAgent(event.text, replyTs, history);
+    })().catch(async err => {
+      console.error('Agent error:', err);
+      await slackPost(`Something went wrong: ${err.message}`, event.ts);
+    })
+  );
+}
