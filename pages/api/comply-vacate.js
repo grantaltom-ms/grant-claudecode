@@ -15,7 +15,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://augbrysfqwgekfhfokco.s
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const COMPLY_CHANNEL_ID = 'C0BBG7ZB1MK';
 const CONOR_SLACK_ID = 'U03DB8GBSAH';
-const GOOGLE_DRIVE_FOLDER_ID = '1sqafRFOjch5Oj8-aQJqJzf7GwmLBnfkb';
 
 // ─── Lease section reference ───────────────────────────────────────────────
 const LEASE_SECTIONS = {
@@ -155,59 +154,10 @@ async function lookupTenant(propertyHint, unitNumber) {
   return { tenants, propertyName, city, unitNumber };
 }
 
-// ─── Google Drive helpers ───────────────────────────────────────────────────
-
-async function getGoogleAccessToken() {
-  const saJson = JSON.parse(
-    Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '', 'base64').toString('utf-8')
-  );
-  const now = Math.floor(Date.now() / 1000);
-  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
-  const payload = Buffer.from(
-    JSON.stringify({
-      iss: saJson.client_email,
-      scope: 'https://www.googleapis.com/auth/drive.file',
-      aud: 'https://oauth2.googleapis.com/token',
-      exp: now + 3600,
-      iat: now,
-    })
-  ).toString('base64url');
-  const { createSign } = await import('crypto');
-  const signer = createSign('SHA256');
-  signer.update(`${header}.${payload}`);
-  const sig = signer.sign(saJson.private_key, 'base64url');
-  const jwt = `${header}.${payload}.${sig}`;
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
-  });
-  const tokenData = await tokenRes.json();
-  return tokenData.access_token;
-}
-
-async function createGoogleDoc(title, content, accessToken) {
-  const createRes = await fetch('https://docs.googleapis.com/v1/documents', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title }),
-  });
-  const doc = await createRes.json();
-  const docId = doc.documentId;
-
-  await fetch(`https://docs.googleapis.com/v1/documents/${docId}:batchUpdate`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ requests: [{ insertText: { location: { index: 1 }, text: content } }] }),
-  });
-
-  await fetch(
-    `https://www.googleapis.com/drive/v3/files/${docId}?addParents=${GOOGLE_DRIVE_FOLDER_ID}&removeParents=root`,
-    { method: 'PATCH', headers: { Authorization: `Bearer ${accessToken}` } }
-  );
-
-  return { docId, url: `https://docs.google.com/document/d/${docId}/edit` };
-}
+// ─── Google Drive ───────────────────────────────────────────────────────────
+// Doc creation is handled manually via Claude's Google Drive MCP connector.
+// When Conor approves, the bot posts the final notice text in Slack.
+// Grant then asks Claude (in the Claude chat) to save it to Drive.
 
 // ─── State helpers ──────────────────────────────────────────────────────────
 
@@ -389,25 +339,18 @@ export default async function handler(req, res) {
           /\b(approved?|looks good|good to go|send it|finalize)\b/i.test(event.text || '');
 
         if (isConorApproval && state?.draft) {
-          await slackPost(COMPLY_CHANNEL_ID, '_Creating Google Doc..._', thread_ts);
-          try {
-            const accessToken = await getGoogleAccessToken();
-            const today = new Date().toISOString().split('T')[0];
-            const lastName = (state.tenantName || 'Tenant').split(' ').pop();
-            const docTitle = `${today} - ${state.propertyName} #${state.unitNumber} - ${lastName} - Comply Notice`;
-            const { url } = await createGoogleDoc(docTitle, state.draft, accessToken);
-            await slackPost(
-              COMPLY_CHANNEL_ID,
-              `✅ *Notice finalized.* Google Doc created:\n${url}\n\nThis notice is ready to print and serve. Reminder: serve via USPS Certified Mail if not hand-delivered (required as of July 2025).`,
-              thread_ts
-            );
-          } catch (err) {
-            await slackPost(
-              COMPLY_CHANNEL_ID,
-              `✅ *Conor approved.* Note: Google Doc creation failed (${err.message}). Please save the notice draft above manually.`,
-              thread_ts
-            );
-          }
+          const today = new Date().toISOString().split('T')[0];
+          const lastName = (state.tenantName || 'Tenant').split(' ').pop();
+          const docTitle = `${today} - ${state.propertyName || 'Property'} #${state.unitNumber || ''} - ${lastName} - Comply Notice`;
+          await slackPost(
+            COMPLY_CHANNEL_ID,
+            `✅ *Conor approved. Notice is finalized.*\n\n` +
+            `*Suggested filename:* \`${docTitle}\`\n\n` +
+            `*Final notice text:*\n\`\`\`\n${state.draft}\n\`\`\`\n\n` +
+            `_Grant — ask Claude to save this to Drive, or copy the text above into a Google Doc manually. ` +
+            `Reminder: serve via USPS Certified Mail if not hand-delivered (required as of July 2025)._`,
+            thread_ts
+          );
           return;
         }
 
