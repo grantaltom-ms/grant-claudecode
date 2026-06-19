@@ -9,8 +9,8 @@ import { waitUntil } from '@vercel/functions';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const SLACK_BOT_TOKEN = process.env.COMPLY_SLACK_BOT_TOKEN;
+const SLACK_SIGNING_SECRET = process.env.COMPLY_SLACK_SIGNING_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://augbrysfqwgekfhfokco.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const COMPLY_CHANNEL_ID = 'C0BBG7ZB1MK';
