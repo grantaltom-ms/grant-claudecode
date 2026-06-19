@@ -108,50 +108,42 @@ async function getBotUserId() {
 // ─── Supabase helpers ───────────────────────────────────────────────────────
 
 async function lookupTenant(propertyHint, unitNumber) {
-  // Resolve property via aliases
-  const aliasRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/property_aliases?alias=ilike.*${encodeURIComponent(propertyHint)}*&select=property_id`,
+  // Look up directly in tenant_directory using property_name and unit columns
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(propertyHint)}*&unit=eq.${encodeURIComponent(unitNumber)}&select=tenant_name,unit,email,phone,lease_to,property_name,property_city`,
     { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
   );
-  const aliases = await aliasRes.json();
+  const tenants = await res.json();
 
-  // Also try direct property name match
-  const propRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/properties?name=ilike.*${encodeURIComponent(propertyHint)}*&managed_by_milestone=eq.true&is_group=eq.false&select=id,name,city`,
-    { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
-  );
-  const directProps = await propRes.json();
-
-  const aliasIds = Array.isArray(aliases) ? aliases.map((a) => a.property_id) : [];
-  const directIds = Array.isArray(directProps) ? directProps.map((p) => p.id) : [];
-  const allIds = [...new Set([...aliasIds, ...directIds])];
-
-  if (allIds.length === 0) return { error: 'property_not_found' };
-
-  const idFilter = allIds.map((id) => `property_id.eq.${id}`).join(',');
-  const tenantRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/tenant_directory?or=(${encodeURIComponent(idFilter)})&unit_number=eq.${encodeURIComponent(unitNumber)}&select=tenant_name,unit_number,email,phone,lease_to,property_id`,
-    { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
-  );
-  const tenants = await tenantRes.json();
-
-  if (!Array.isArray(tenants) || tenants.length === 0) return { error: 'tenant_not_found' };
-
-  const propId = tenants[0].property_id;
-  const matchedProp = directProps.find((p) => p.id === propId);
-  let propertyName = matchedProp?.name || propertyHint;
-  let city = matchedProp?.city || '';
-
-  if (!matchedProp) {
-    const p2 = await fetch(
-      `${SUPABASE_URL}/rest/v1/properties?id=eq.${propId}&select=name,city`,
+  if (!Array.isArray(tenants) || tenants.length === 0) {
+    // Try resolving via properties table in case hint doesn't match property_name exactly
+    const propRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/properties?name=ilike.*${encodeURIComponent(propertyHint)}*&managed_by_milestone=eq.true&is_group=eq.false&select=id,name,city`,
       { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
     );
-    const p2data = await p2.json();
-    if (p2data?.[0]) { propertyName = p2data[0].name; city = p2data[0].city; }
+    const props = await propRes.json();
+    if (!Array.isArray(props) || props.length === 0) return { error: 'property_not_found' };
+
+    // Try each matching property name
+    for (const prop of props) {
+      const t2 = await fetch(
+        `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(prop.name)}*&unit=eq.${encodeURIComponent(unitNumber)}&select=tenant_name,unit,email,phone,lease_to,property_name,property_city`,
+        { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
+      );
+      const t2data = await t2.json();
+      if (Array.isArray(t2data) && t2data.length > 0) {
+        return { tenants: t2data, propertyName: prop.name, city: prop.city, unitNumber };
+      }
+    }
+    return { error: 'tenant_not_found' };
   }
 
-  return { tenants, propertyName, city, unitNumber };
+  return {
+    tenants,
+    propertyName: tenants[0].property_name,
+    city: tenants[0].property_city,
+    unitNumber,
+  };
 }
 
 // ─── Google Drive ───────────────────────────────────────────────────────────
