@@ -198,10 +198,28 @@ ${Object.entries(LEASE_SECTIONS)
   .join('\n\n')}
 
 ## Municipality Rules
-- **Seattle**: 10-day notice. Must include Seattle-specific legal counsel language: "RIGHT TO LEGAL COUNSEL: CITY LAW PROVIDES RENTERS WHO ARE UNABLE TO PAY FOR AN ATTORNEY THE RIGHT TO FREE LEGAL REPRESENTATION IN AN EVICTION LAWSUIT. If you need help understanding this notice or information about your renter rights, call the Renting in Seattle Helpline at (206) 684-5700 or visit www.seattle.gov/rentinginseattle."
-- **Burien**: 10-day notice. Must include just cause language. Additional mandatory language beyond state baseline required.
-- **SeaTac, Renton, Des Moines, Tacoma**: 10-day notice. State baseline language applies.
-- **All jurisdictions**: Notice must include state legal help language (Eviction Defense Screening Line 855-657-8387, NW Justice Project CLEAR Hotline 888-201-1014).
+
+All notices must include this state baseline legal help language in the body:
+"State law provides you the right to legal representation and the court may be able to appoint a lawyer to represent you without cost to you if you are a qualifying low-income renter. If you believe you are a qualifying low-income renter and would like an attorney appointed to represent you, please contact the Eviction Defense Screening Line at 855-657-8387 or apply online at https://nwjustice.org/apply-online. For additional resources, call 2-1-1 or the Northwest Justice Project CLEAR Hotline outside King County (888)201-1014 weekdays between 9:15 a.m. – 12:15 p.m., or (888) 387-7111 for seniors (age 60 and over). You may find additional information to help you at http://www.washingtonlawhelp.org. Free or low-cost mediation services to assist in nonpayment of rent disputes before any judicial proceedings occur are also available at dispute resolution centers throughout the state. You can find your nearest dispute resolution center at https://www.resolutionwa.org. State law also provides you the right to receive interpreter services at court."
+
+Municipality-specific addendum language (append after state baseline):
+
+- **WA State / Renton / Des Moines / Tacoma**: No addendum required beyond state baseline above.
+
+- **Seattle**: Add this addendum page:
+  "Additional information based on the location of your rental premises in the City of Seattle:
+  RIGHT TO LEGAL COUNSEL: CITY LAW PROVIDES RENTERS WHO ARE UNABLE TO PAY FOR AN ATTORNEY THE RIGHT TO FREE LEGAL REPRESENTATION IN AN EVICTION LAWSUIT.
+  If you need help understanding this notice or information about your renter rights, call the Renting in Seattle Helpline at (206) 684-5700 or visit the web site at www.seattle.gov/rentinginseattle."
+
+- **Burien**: Add this addendum page:
+  "Additional information based on the location of your rental premises in the City of Burien:
+  Landlords are required to attach Renting in Burien Handbook - Resources when serving this notice to a tenant in the City of Burien. The current version of the Renting in Burien Handbook - Resources can be found at https://www.burienwa.gov/city_hall/laws_regulations/renting_in_burien/information_for_landlords."
+  ⚠️ Also flag to the manager: they must physically attach the Renting in Burien Handbook - Resources document when serving this notice.
+
+- **SeaTac**: Add this addendum page:
+  "Additional information based on the location of your rental premises in the City of SeaTac:
+  SeaTac city code SMC 4.05.040(B) requires that your landlord provides you with a copy of resources found at this web address: https://www.seatacwa.gov/government/city-departments/community-and-economic-development/rental-housing-resources/rental-housing-resources-information"
+  ⚠️ Also flag to the manager: they must print and attach the SeaTac rental housing resources page when serving this notice.
 
 ## Notice Exhibit A Structure
 **Section 1**: Rental Agreement, Lease, and/or Rules and Regulations applying to your tenancy:
