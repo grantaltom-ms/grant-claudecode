@@ -87,7 +87,13 @@ async function slackPost(channel, text, thread_ts = null, blocks = null) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
     body: JSON.stringify(body),
   });
-  return res.json();
+  const data = await res.json();
+  if (!data.ok) {
+    const err = new Error(`Slack post failed: ${data.error}`);
+    console.error('slackPost error:', data.error, { channel, thread_ts, textLength: text?.length });
+    throw err;
+  }
+  return data;
 }
 
 async function getThreadHistory(channel, thread_ts) {
