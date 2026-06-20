@@ -78,11 +78,10 @@ function verifySlackSignature(req, rawBody) {
   return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(slackSig));
 }
 
-async function slackPost(channel, text, thread_ts = null, blocks = null, metadata = null) {
+async function slackPost(channel, text, thread_ts = null, blocks = null) {
   const body = { channel, text };
   if (thread_ts) body.thread_ts = thread_ts;
   if (blocks) body.blocks = blocks;
-  if (metadata) body.metadata = metadata;
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
@@ -93,7 +92,7 @@ async function slackPost(channel, text, thread_ts = null, blocks = null, metadat
 
 async function getThreadHistory(channel, thread_ts) {
   const res = await fetch(
-    `https://slack.com/api/conversations.replies?channel=${channel}&ts=${thread_ts}&limit=50&include_all_metadata=true`,
+    `https://slack.com/api/conversations.replies?channel=${channel}&ts=${thread_ts}&limit=50`,
     { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } }
   );
   const data = await res.json();
@@ -260,23 +259,26 @@ async function uploadPdfToSlack(pdfBuffer, filename, thread_ts) {
 
 // ─── State helpers ──────────────────────────────────────────────────────────
 
-function parseState(messages, botUserId) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.user !== botUserId) continue;
-    // Prefer Slack message metadata (invisible to users)
-    if (msg.metadata?.event_payload) return msg.metadata.event_payload;
-    // Fall back to HTML comment for threads created before metadata was introduced
-    const match = (msg.text || '').match(/<!--STATE:(.*?)-->/s);
-    if (match) {
-      try { return JSON.parse(match[1]); } catch {}
-    }
-  }
-  return null;
+async function loadState(thread_ts) {
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/thread_state?thread_ts=eq.${encodeURIComponent(thread_ts)}&select=state`,
+    { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
+  );
+  const rows = await res.json();
+  return Array.isArray(rows) && rows.length > 0 ? rows[0].state : null;
 }
 
-function stateMetadata(state) {
-  return { event_type: 'comply_notice_state', event_payload: state };
+async function saveState(thread_ts, state) {
+  await fetch(`${SUPABASE_URL}/rest/v1/thread_state`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates',
+    },
+    body: JSON.stringify({ thread_ts, state, updated_at: new Date().toISOString() }),
+  });
 }
 
 // ─── System prompt ──────────────────────────────────────────────────────────
@@ -456,13 +458,11 @@ export default async function handler(req, res) {
 
         await slackPost(COMPLY_CHANNEL_ID, '_On it..._', thread_ts);
 
+        const state = await loadState(thread_ts);
         let conversationHistory = [];
-        let state = null;
 
         if (!isNewThread) {
           const threadMessages = await getThreadHistory(COMPLY_CHANNEL_ID, thread_ts);
-          state = parseState(threadMessages, botUserId);
-
           for (const msg of threadMessages) {
             if (msg.ts === event.ts) continue;
             const isBot = msg.user === botUserId;
@@ -501,13 +501,14 @@ export default async function handler(req, res) {
 
         if (isDraftReady) {
           newState.draft = agentResponse;
-          await slackPost(
-            COMPLY_CHANNEL_ID,
-            agentResponse + `\n\n---\n<@${CONOR_SLACK_ID}> — please review the draft above and reply *approved* when ready to finalize.`,
-            thread_ts,
-            null,
-            stateMetadata(newState)
-          );
+          await Promise.all([
+            slackPost(
+              COMPLY_CHANNEL_ID,
+              agentResponse + `\n\n---\n<@${CONOR_SLACK_ID}> — please review the draft above and reply *approved* when ready to finalize.`,
+              thread_ts
+            ),
+            saveState(thread_ts, newState),
+          ]);
 
           try {
             const today = new Date().toISOString().split('T')[0];
@@ -519,13 +520,10 @@ export default async function handler(req, res) {
             console.error('PDF generation/upload error:', pdfErr);
           }
         } else {
-          await slackPost(
-            COMPLY_CHANNEL_ID,
-            agentResponse,
-            thread_ts,
-            null,
-            stateMetadata(newState)
-          );
+          await Promise.all([
+            slackPost(COMPLY_CHANNEL_ID, agentResponse, thread_ts),
+            saveState(thread_ts, newState),
+          ]);
         }
       } catch (err) {
         console.error('comply-vacate error:', err);
