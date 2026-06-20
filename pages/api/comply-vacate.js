@@ -345,6 +345,7 @@ Municipality-specific addendum language (append after state baseline):
 // ─── Agent loop ─────────────────────────────────────────────────────────────
 
 async function runAgent(userMessage, conversationHistory, state) {
+  let tenantData = null;
   const messages = [
     ...conversationHistory.map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage },
@@ -380,7 +381,17 @@ async function runAgent(userMessage, conversationHistory, state) {
     let toolResult;
     if (toolUseBlock.name === 'lookup_tenant') {
       const { property_hint, unit_number } = toolUseBlock.input;
-      toolResult = JSON.stringify(await lookupTenant(property_hint, unit_number));
+      const lookupResult = await lookupTenant(property_hint, unit_number);
+      toolResult = JSON.stringify(lookupResult);
+      if (!lookupResult.error && lookupResult.tenants?.length) {
+        const t = lookupResult.tenants[0];
+        tenantData = {
+          tenantName: t.tenant_name || lookupResult.tenants.map((x) => x.tenant_name).join(' & '),
+          propertyName: lookupResult.propertyName || t.property_name,
+          unitNumber: lookupResult.unitNumber || t.unit,
+          city: lookupResult.city || t.property_city,
+        };
+      }
     } else {
       toolResult = JSON.stringify({ error: 'unknown_tool' });
     }
@@ -398,7 +409,7 @@ async function runAgent(userMessage, conversationHistory, state) {
   }
 
   const textBlock = response.content.find((b) => b.type === 'text');
-  return textBlock ? textBlock.text : '(no response)';
+  return { text: textBlock ? textBlock.text : '(no response)', tenantData };
 }
 
 // ─── Main handler ───────────────────────────────────────────────────────────
@@ -470,9 +481,11 @@ export default async function handler(req, res) {
           return;
         }
 
-        const agentResponse = await runAgent(event.text || '', conversationHistory, state);
+        const { text: agentResponse, tenantData } = await runAgent(event.text || '', conversationHistory, state);
         const isDraftReady = /exhibit\s*a/i.test(agentResponse);
         let newState = state || {};
+
+        if (tenantData) Object.assign(newState, tenantData);
 
         if (isDraftReady) {
           newState.draft = agentResponse;
