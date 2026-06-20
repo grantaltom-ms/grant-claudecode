@@ -6,6 +6,8 @@
 import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { waitUntil } from '@vercel/functions';
+import PDFDocument from 'pdfkit';
+import FormData from 'form-data';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -144,6 +146,110 @@ async function lookupTenant(propertyHint, unitNumber) {
     city: tenants[0].property_city,
     unitNumber,
   };
+}
+
+// ─── PDF generation ─────────────────────────────────────────────────────────
+
+const STATE_BASELINE_LEGAL =
+  'State law provides you the right to legal representation and the court may be able to appoint a lawyer to represent you without cost to you if you are a qualifying low-income renter. ' +
+  'If you believe you are a qualifying low-income renter and would like an attorney appointed to represent you, please contact the Eviction Defense Screening Line at 855-657-8387 or apply online at https://nwjustice.org/apply-online. ' +
+  'For additional resources, call 2-1-1 or the Northwest Justice Project CLEAR Hotline outside King County (888)201-1014 weekdays between 9:15 a.m. – 12:15 p.m., or (888) 387-7111 for seniors (age 60 and over). ' +
+  'You may find additional information to help you at http://www.washingtonlawhelp.org. ' +
+  'Free or low-cost mediation services to assist in nonpayment of rent disputes before any judicial proceedings occur are also available at dispute resolution centers throughout the state. ' +
+  'You can find your nearest dispute resolution center at https://www.resolutionwa.org. ' +
+  'State law also provides you the right to receive interpreter services at court.';
+
+const MUNICIPALITY_ADDENDA = {
+  seattle:
+    'Additional information based on the location of your rental premises in the City of Seattle:\n\n' +
+    'RIGHT TO LEGAL COUNSEL: CITY LAW PROVIDES RENTERS WHO ARE UNABLE TO PAY FOR AN ATTORNEY THE RIGHT TO FREE LEGAL REPRESENTATION IN AN EVICTION LAWSUIT.\n\n' +
+    'If you need help understanding this notice or information about your renter rights, call the Renting in Seattle Helpline at (206) 684-5700 or visit the web site at www.seattle.gov/rentinginseattle.',
+  burien:
+    'Additional information based on the location of your rental premises in the City of Burien:\n\n' +
+    'Landlords are required to attach Renting in Burien Handbook - Resources when serving this notice to a tenant in the City of Burien. ' +
+    'The current version of the Renting in Burien Handbook - Resources can be found at https://www.burienwa.gov/city_hall/laws_regulations/renting_in_burien/information_for_landlords.',
+  seatac:
+    'Additional information based on the location of your rental premises in the City of SeaTac:\n\n' +
+    'SeaTac city code SMC 4.05.040(B) requires that your landlord provides you with a copy of resources found at this web address: ' +
+    'https://www.seatacwa.gov/government/city-departments/community-and-economic-development/rental-housing-resources/rental-housing-resources-information',
+};
+
+function generateNoticePdf(state) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({
+      bufferPages: true,
+      size: 'LETTER',
+      margins: { top: 72, bottom: 72, left: 72, right: 72 },
+    });
+
+    const chunks = [];
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    const draftText = (state.draft || '').replace(/<!--STATE:.*?-->/gs, '').trim();
+    const exhibitSplit = draftText.match(/^([\s\S]*?)(exhibit\s*a[\s\S]*)$/i);
+    const noticeBody = exhibitSplit ? exhibitSplit[1].trim() : draftText;
+    const exhibitAContent = exhibitSplit ? exhibitSplit[2].trim() : '';
+
+    // ── Page 1: Header + Notice Body ────────────────────────────────────────
+    doc.font('Helvetica-Bold').fontSize(16).text('Milestone Properties');
+    doc.font('Helvetica').fontSize(10)
+      .text('PO Box 18379, Seattle, WA 98118')
+      .text('206-325-1166');
+    doc.moveDown(0.5);
+    doc.moveTo(72, doc.y).lineTo(540, doc.y).stroke();
+    doc.moveDown(0.5);
+
+    doc.font('Helvetica-Bold').fontSize(13)
+      .text('10-DAY NOTICE TO COMPLY OR VACATE THE PREMISES', { align: 'center' });
+    doc.moveDown(1);
+
+    doc.font('Helvetica').fontSize(10).text(noticeBody, { lineGap: 2 });
+
+    if (!noticeBody.toLowerCase().includes('eviction defense screening line')) {
+      doc.moveDown(1);
+      doc.font('Helvetica').fontSize(9).text(STATE_BASELINE_LEGAL, { lineGap: 2 });
+    }
+
+    // ── Page 2: Exhibit A ────────────────────────────────────────────────────
+    doc.addPage();
+    doc.font('Helvetica').fontSize(10).text(exhibitAContent || 'Exhibit A — See notice body above.', { lineGap: 2 });
+
+    // ── Page 3: Municipality Addendum (if applicable) ────────────────────────
+    const city = (state.city || '').toLowerCase();
+    let addendumText = null;
+    if (city.includes('seattle')) addendumText = MUNICIPALITY_ADDENDA.seattle;
+    else if (city.includes('burien')) addendumText = MUNICIPALITY_ADDENDA.burien;
+    else if (city.includes('seatac') || city.includes('sea-tac') || city.includes('sea tac'))
+      addendumText = MUNICIPALITY_ADDENDA.seatac;
+
+    if (addendumText) {
+      doc.addPage();
+      doc.font('Helvetica-Bold').fontSize(12).text('MUNICIPALITY ADDENDUM', { align: 'center' });
+      doc.moveDown(1);
+      doc.font('Helvetica').fontSize(10).text(addendumText, { lineGap: 2 });
+    }
+
+    doc.end();
+  });
+}
+
+async function uploadPdfToSlack(pdfBuffer, filename, thread_ts) {
+  const form = new FormData();
+  form.append('token', SLACK_BOT_TOKEN);
+  form.append('channels', COMPLY_CHANNEL_ID);
+  form.append('thread_ts', thread_ts);
+  form.append('filename', filename);
+  form.append('filetype', 'pdf');
+  form.append('file', pdfBuffer, { filename, contentType: 'application/pdf' });
+
+  const res = await fetch('https://slack.com/api/files.upload', {
+    method: 'POST',
+    headers: form.getHeaders(),
+    body: form.getBuffer(),
+  });
+  return res.json();
 }
 
 // ─── Google Drive ───────────────────────────────────────────────────────────
@@ -375,6 +481,16 @@ export default async function handler(req, res) {
             agentResponse + `\n\n---\n<@${CONOR_SLACK_ID}> — please review the draft above and reply *approved* when ready to finalize.\n` + encodeState(newState),
             thread_ts
           );
+
+          try {
+            const today = new Date().toISOString().split('T')[0];
+            const lastName = (newState.tenantName || 'Tenant').split(' ').pop();
+            const pdfFilename = `${today} - ${newState.propertyName || 'Property'} #${newState.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
+            const pdfBuffer = await generateNoticePdf(newState);
+            await uploadPdfToSlack(pdfBuffer, pdfFilename, thread_ts);
+          } catch (pdfErr) {
+            console.error('PDF generation/upload error:', pdfErr);
+          }
         } else {
           await slackPost(
             COMPLY_CHANNEL_ID,
