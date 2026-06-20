@@ -78,10 +78,11 @@ function verifySlackSignature(req, rawBody) {
   return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(slackSig));
 }
 
-async function slackPost(channel, text, thread_ts = null, blocks = null) {
+async function slackPost(channel, text, thread_ts = null, blocks = null, metadata = null) {
   const body = { channel, text };
   if (thread_ts) body.thread_ts = thread_ts;
   if (blocks) body.blocks = blocks;
+  if (metadata) body.metadata = metadata;
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
@@ -92,7 +93,7 @@ async function slackPost(channel, text, thread_ts = null, blocks = null) {
 
 async function getThreadHistory(channel, thread_ts) {
   const res = await fetch(
-    `https://slack.com/api/conversations.replies?channel=${channel}&ts=${thread_ts}&limit=50`,
+    `https://slack.com/api/conversations.replies?channel=${channel}&ts=${thread_ts}&limit=50&include_all_metadata=true`,
     { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } }
   );
   const data = await res.json();
@@ -263,6 +264,9 @@ function parseState(messages, botUserId) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.user !== botUserId) continue;
+    // Prefer Slack message metadata (invisible to users)
+    if (msg.metadata?.event_payload) return msg.metadata.event_payload;
+    // Fall back to HTML comment for threads created before metadata was introduced
     const match = (msg.text || '').match(/<!--STATE:(.*?)-->/s);
     if (match) {
       try { return JSON.parse(match[1]); } catch {}
@@ -271,8 +275,8 @@ function parseState(messages, botUserId) {
   return null;
 }
 
-function encodeState(state) {
-  return `<!--STATE:${JSON.stringify(state)}-->`;
+function stateMetadata(state) {
+  return { event_type: 'comply_notice_state', event_payload: state };
 }
 
 // ─── System prompt ──────────────────────────────────────────────────────────
@@ -336,6 +340,14 @@ Municipality-specific addendum language (append after state baseline):
 - Flag any violations that might be criminal activity (drugs, violence) — those may warrant a 3-day notice instead of 10-day
 - Never include late fees or monetary amounts in a comply or vacate notice
 - Always remind the manager that the compliance deadline must be at least 10 days after service
+- When asking a question that has a fixed set of likely answers, present them as a numbered list so the manager can reply with just a number. Example:
+  What type of violation is this?
+  1. Unauthorized pet
+  2. Noise / nuisance
+  3. Smoking
+  4. Unauthorized occupant
+  5. Other — describe below
+  Always include an "Other" option when presenting numbered choices.
 
 ## Review flow
 - After manager says the draft looks good: post the full draft and tag @Conor Murphy for review
@@ -491,8 +503,10 @@ export default async function handler(req, res) {
           newState.draft = agentResponse;
           await slackPost(
             COMPLY_CHANNEL_ID,
-            agentResponse + `\n\n---\n<@${CONOR_SLACK_ID}> — please review the draft above and reply *approved* when ready to finalize.\n` + encodeState(newState),
-            thread_ts
+            agentResponse + `\n\n---\n<@${CONOR_SLACK_ID}> — please review the draft above and reply *approved* when ready to finalize.`,
+            thread_ts,
+            null,
+            stateMetadata(newState)
           );
 
           try {
@@ -507,8 +521,10 @@ export default async function handler(req, res) {
         } else {
           await slackPost(
             COMPLY_CHANNEL_ID,
-            agentResponse + '\n' + encodeState(newState),
-            thread_ts
+            agentResponse,
+            thread_ts,
+            null,
+            stateMetadata(newState)
           );
         }
       } catch (err) {
