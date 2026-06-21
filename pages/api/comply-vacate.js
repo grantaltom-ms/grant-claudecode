@@ -193,12 +193,12 @@ function generateNoticePdf(state) {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    const draftText = (state.draft || '').replace(/<!--STATE:.*?-->/gs, '').trim();
-    const exhibitSplit = draftText.match(/^([\s\S]*?)(exhibit\s*a[\s\S]*)$/i);
-    const noticeBody = exhibitSplit ? exhibitSplit[1].trim() : draftText;
-    const exhibitAContent = exhibitSplit ? exhibitSplit[2].trim() : '';
+    const tenantNames = state.tenantName || '___________________________';
+    const propertyName = state.propertyName || '___________________________';
+    const unitNumber = state.unitNumber || '___';
+    const city = (state.city || '') || '___________________________';
 
-    // ── Page 1: Header + Notice Body ────────────────────────────────────────
+    // ── Page 1: Notice Body ──────────────────────────────────────────────────
     doc.font('Helvetica-Bold').fontSize(16).text('Milestone Properties');
     doc.font('Helvetica').fontSize(10)
       .text('PO Box 18379, Seattle, WA 98118')
@@ -211,23 +211,66 @@ function generateNoticePdf(state) {
       .text('10-DAY NOTICE TO COMPLY OR VACATE THE PREMISES', { align: 'center' });
     doc.moveDown(1);
 
-    doc.font('Helvetica').fontSize(10).text(noticeBody, { lineGap: 2 });
+    doc.font('Helvetica').fontSize(10)
+      .text(`TO: ${tenantNames}`)
+      .text(`Premises: ${propertyName}, Unit ${unitNumber}`)
+      .text(`${city}, WA`);
+    doc.moveDown(1);
 
-    if (!noticeBody.toLowerCase().includes('eviction defense screening line')) {
-      doc.moveDown(1);
-      doc.font('Helvetica').fontSize(9).text(STATE_BASELINE_LEGAL, { lineGap: 2 });
-    }
+    doc.font('Helvetica').fontSize(10).text(
+      'YOU ARE HEREBY NOTIFIED that you are in violation of your rental agreement as described in ' +
+      'Exhibit A, attached hereto and incorporated herein by reference. You are required to comply ' +
+      'with your rental agreement OR vacate the premises within TEN (10) DAYS from the date of ' +
+      'service of this notice.',
+      { lineGap: 2 }
+    );
+    doc.moveDown(1);
+
+    doc.font('Helvetica').fontSize(10)
+      .text('Date of Service: _______________________________')
+      .text('Compliance Deadline: _______________________________  (10 days from date of service)');
+    doc.moveDown(1);
+
+    doc.font('Helvetica').fontSize(10)
+      .text('Landlord/Agent: Milestone Properties')
+      .text('PO Box 18379, Seattle, WA 98118')
+      .text('206-325-1166');
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(10).text('Signature: _______________________________');
+    doc.moveDown(1);
+
+    doc.font('Helvetica').fontSize(9).text(STATE_BASELINE_LEGAL, { lineGap: 2 });
 
     // ── Page 2: Exhibit A ────────────────────────────────────────────────────
     doc.addPage();
-    doc.font('Helvetica').fontSize(10).text(exhibitAContent || 'Exhibit A — See notice body above.', { lineGap: 2 });
+    doc.font('Helvetica-Bold').fontSize(13).text('EXHIBIT A', { align: 'center' });
+    doc.moveDown(0.5);
+    doc.moveTo(72, doc.y).lineTo(540, doc.y).stroke();
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(10)
+      .text('Section 1 — Rental Agreement, Lease, and/or Rules and Regulations:');
+    doc.moveDown(0.25);
+    doc.font('Helvetica').fontSize(10).text(state.section1 || '', { lineGap: 2 });
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(10)
+      .text('Section 2 — Violation(s) of the Rental Agreement:');
+    doc.moveDown(0.25);
+    doc.font('Helvetica').fontSize(10).text(state.section2 || '', { lineGap: 2 });
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(10)
+      .text('Section 3 — Required Action(s):');
+    doc.moveDown(0.25);
+    doc.font('Helvetica').fontSize(10).text(state.section3 || '', { lineGap: 2 });
 
     // ── Page 3: Municipality Addendum (if applicable) ────────────────────────
-    const city = (state.city || '').toLowerCase();
+    const cityLower = (state.city || '').toLowerCase();
     let addendumText = null;
-    if (city.includes('seattle')) addendumText = MUNICIPALITY_ADDENDA.seattle;
-    else if (city.includes('burien')) addendumText = MUNICIPALITY_ADDENDA.burien;
-    else if (city.includes('seatac') || city.includes('sea-tac') || city.includes('sea tac'))
+    if (cityLower.includes('seattle')) addendumText = MUNICIPALITY_ADDENDA.seattle;
+    else if (cityLower.includes('burien')) addendumText = MUNICIPALITY_ADDENDA.burien;
+    else if (cityLower.includes('seatac') || cityLower.includes('sea-tac') || cityLower.includes('sea tac'))
       addendumText = MUNICIPALITY_ADDENDA.seatac;
 
     if (addendumText) {
@@ -294,11 +337,8 @@ const SYSTEM_PROMPT = `You are a Lease Compliance Assistant for Milestone Proper
 You operate in a Slack channel. When a manager reports a lease violation, you:
 1. Ask targeted clarifying questions to fully understand the violation
 2. Look up the tenant in Supabase to confirm their identity
-3. Draft all three sections of Exhibit A for the RHAWA 10-Day Notice to Comply or Vacate
-4. Adjust notice language based on the property's municipality (Seattle gets extra legal counsel language, Burien gets its own language, etc.)
-5. Iterate with the manager until they approve the draft
-6. Tag Conor Murphy for final review
-7. Once Conor approves, finalize and save to Google Drive
+3. Draft each of the three Exhibit A sections ONE AT A TIME, getting approval before moving to the next
+4. Once all three sections are approved, call record_section_approval for section 3 and announce the PDF is being generated
 
 ## Lease Section Reference
 The following lease sections are available for Exhibit A, Section 1 citations. Use the exact section name and text — do not modify this language:
@@ -341,13 +381,40 @@ Municipality-specific addendum language (append after state baseline):
 **Section 3**: You are required to perform the following action(s) by the deadline specified on this notice or you may be liable of unlawful detainer:
 → List clear, specific, measurable corrective actions the tenant must take.
 
+## Section-by-section drafting flow
+
+Work through Exhibit A one section at a time. Never present more than one section at once.
+
+**Step 1 — Section 1 (Lease Citations)**
+Once you have confirmed the tenant and have enough detail about the violation, present Section 1 only:
+
+*Section 1 — Draft:*
+[cite the exact lease section name and full quoted text]
+
+✅ Approve | ✏️ Reply with changes
+
+**Step 2 — Section 2 (Violation Description)**
+When the manager approves Section 1:
+1. Call \`record_section_approval\` with section_number=1 and the final approved text
+2. Present Section 2 only, using the same format and ✅/✏️ prompt
+
+**Step 3 — Section 3 (Required Actions)**
+When the manager approves Section 2:
+1. Call \`record_section_approval\` with section_number=2 and the final approved text
+2. Present Section 3 only, using the same format and ✅/✏️ prompt
+
+**Step 4 — PDF generation**
+When the manager approves Section 3:
+1. Call \`record_section_approval\` with section_number=3 and the final approved text
+2. Reply: "All three sections approved ✅ Generating the notice PDF now — it will appear in this thread shortly."
+
+If the manager requests changes to any section, revise it and re-present it before proceeding.
+
 ## Tone and format
 - Be professional but concise in Slack messages
-- When presenting a draft, use clear section headers
 - Always confirm tenant identity before drafting
 - Flag any violations that might be criminal activity (drugs, violence) — those may warrant a 3-day notice instead of 10-day
 - Never include late fees or monetary amounts in a comply or vacate notice
-- Always remind the manager that the compliance deadline must be at least 10 days after service
 - When asking a question that has a fixed set of likely answers, present them as a numbered list so the manager can reply with just a number. Example:
   What type of violation is this?
   1. Unauthorized pet
@@ -356,16 +423,13 @@ Municipality-specific addendum language (append after state baseline):
   4. Unauthorized occupant
   5. Other — describe below
   Always include an "Other" option when presenting numbered choices.
-
-## Review flow
-- After manager says the draft looks good: post the full draft and tag @Conor Murphy for review
-- After Conor says "approved" (or similar): confirm finalization and indicate Google Doc will be created
-- You do not send the notice — you draft it for the manager to print and serve`;
+- You do not send the notice — the manager prints and serves it`;
 
 // ─── Agent loop ─────────────────────────────────────────────────────────────
 
 async function runAgent(userMessage, conversationHistory, state) {
   let tenantData = null;
+  const sectionApprovals = [];
   const messages = [
     ...conversationHistory.map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage },
@@ -382,6 +446,18 @@ async function runAgent(userMessage, conversationHistory, state) {
           unit_number: { type: 'string', description: 'Unit number (e.g. "213", "205")' },
         },
         required: ['property_hint', 'unit_number'],
+      },
+    },
+    {
+      name: 'record_section_approval',
+      description: 'Call this when the manager has approved the content for a section of Exhibit A. Records the final text for that section.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          section_number: { type: 'number', description: '1, 2, or 3' },
+          content: { type: 'string', description: 'The complete final approved text for this section' },
+        },
+        required: ['section_number', 'content'],
       },
     },
   ];
@@ -412,6 +488,10 @@ async function runAgent(userMessage, conversationHistory, state) {
           city: lookupResult.city || t.property_city,
         };
       }
+    } else if (toolUseBlock.name === 'record_section_approval') {
+      const { section_number, content } = toolUseBlock.input;
+      sectionApprovals.push({ section_number, content });
+      toolResult = JSON.stringify({ ok: true });
     } else {
       toolResult = JSON.stringify({ error: 'unknown_tool' });
     }
@@ -429,7 +509,7 @@ async function runAgent(userMessage, conversationHistory, state) {
   }
 
   const textBlock = response.content.find((b) => b.type === 'text');
-  return { text: textBlock ? textBlock.text : '(no response)', tenantData };
+  return { text: textBlock ? textBlock.text : '(no response)', tenantData, sectionApprovals };
 }
 
 // ─── Main handler ───────────────────────────────────────────────────────────
@@ -478,58 +558,31 @@ export default async function handler(req, res) {
           }
         }
 
-        // Check if Conor is approving
-        const isConorApproval =
-          event.user === CONOR_SLACK_ID &&
-          /\b(approved?|looks good|good to go|send it|finalize)\b/i.test(event.text || '');
-
-        if (isConorApproval && state?.draft) {
-          const today = new Date().toISOString().split('T')[0];
-          const lastName = (state.tenantName || 'Tenant').split(' ').pop();
-          const docTitle = `${today} - ${state.propertyName || 'Property'} #${state.unitNumber || ''} - ${lastName} - Comply Notice`;
-          await slackPost(
-            COMPLY_CHANNEL_ID,
-            `✅ *Conor approved. Notice is finalized.*\n\n` +
-            `*Suggested filename:* \`${docTitle}\`\n\n` +
-            `*Final notice text:*\n\`\`\`\n${state.draft}\n\`\`\`\n\n` +
-            `_Grant — ask Claude to save this to Drive, or copy the text above into a Google Doc manually. ` +
-            `Reminder: serve via USPS Certified Mail if not hand-delivered (required as of July 2025)._`,
-            thread_ts
-          );
-          return;
-        }
-
-        const { text: agentResponse, tenantData } = await runAgent(event.text || '', conversationHistory, state);
-        const isDraftReady = /exhibit\s*a/i.test(agentResponse);
+        const { text: agentResponse, tenantData, sectionApprovals } = await runAgent(event.text || '', conversationHistory, state);
         let newState = state || {};
 
         if (tenantData) Object.assign(newState, tenantData);
+        for (const { section_number, content } of sectionApprovals) {
+          newState[`section${section_number}`] = content;
+        }
 
-        if (isDraftReady) {
-          newState.draft = agentResponse;
-          await Promise.all([
-            slackPost(
-              COMPLY_CHANNEL_ID,
-              agentResponse + `\n\n---\n<@${CONOR_SLACK_ID}> — please review the draft above and reply *approved* when ready to finalize.`,
-              thread_ts
-            ),
-            saveState(thread_ts, newState),
-          ]);
+        const allSectionsApproved = newState.section1 && newState.section2 && newState.section3;
 
+        await Promise.all([
+          slackPost(COMPLY_CHANNEL_ID, agentResponse, thread_ts),
+          saveState(thread_ts, newState),
+        ]);
+
+        if (allSectionsApproved) {
           try {
             const today = new Date().toISOString().split('T')[0];
-            const lastName = (newState.tenantName || 'Tenant').split(' ').pop();
+            const lastName = (newState.tenantName || 'Tenant').split(/[\s,]+/).filter(Boolean).pop();
             const pdfFilename = `${today} - ${newState.propertyName || 'Property'} #${newState.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
             const pdfBuffer = await generateNoticePdf(newState);
             await uploadPdfToSlack(pdfBuffer, pdfFilename, thread_ts);
           } catch (pdfErr) {
             console.error('PDF generation/upload error:', pdfErr);
           }
-        } else {
-          await Promise.all([
-            slackPost(COMPLY_CHANNEL_ID, agentResponse, thread_ts),
-            saveState(thread_ts, newState),
-          ]);
         }
       } catch (err) {
         console.error('comply-vacate error:', err);
