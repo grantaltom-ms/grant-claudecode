@@ -525,33 +525,37 @@ async function runAgent(userMessage, conversationHistory, state) {
   });
 
   while (response.stop_reason === 'tool_use') {
-    const toolUseBlock = response.content.find((b) => b.type === 'tool_use');
-    if (!toolUseBlock) break;
+    const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
+    if (toolUseBlocks.length === 0) break;
 
-    let toolResult;
-    if (toolUseBlock.name === 'lookup_tenant') {
-      const { property_hint, unit_number } = toolUseBlock.input;
-      const lookupResult = await lookupTenant(property_hint, unit_number);
-      toolResult = JSON.stringify(lookupResult);
-      if (!lookupResult.error && lookupResult.tenants?.length) {
-        const t = lookupResult.tenants[0];
-        tenantData = {
-          tenantName: t.tenant_name || lookupResult.tenants.map((x) => x.tenant_name).join(' & '),
-          propertyName: lookupResult.propertyName || t.property_name,
-          unitNumber: lookupResult.unitNumber || t.unit,
-          city: lookupResult.city || t.property_city,
-        };
+    const toolResults = [];
+    for (const toolUseBlock of toolUseBlocks) {
+      let toolResult;
+      if (toolUseBlock.name === 'lookup_tenant') {
+        const { property_hint, unit_number } = toolUseBlock.input;
+        const lookupResult = await lookupTenant(property_hint, unit_number);
+        toolResult = JSON.stringify(lookupResult);
+        if (!lookupResult.error && lookupResult.tenants?.length) {
+          const t = lookupResult.tenants[0];
+          tenantData = {
+            tenantName: t.tenant_name || lookupResult.tenants.map((x) => x.tenant_name).join(' & '),
+            propertyName: lookupResult.propertyName || t.property_name,
+            unitNumber: lookupResult.unitNumber || t.unit,
+            city: lookupResult.city || t.property_city,
+          };
+        }
+      } else if (toolUseBlock.name === 'record_section_approval') {
+        const { section_number, content } = toolUseBlock.input;
+        sectionApprovals.push({ section_number, content });
+        toolResult = JSON.stringify({ ok: true });
+      } else {
+        toolResult = JSON.stringify({ error: 'unknown_tool' });
       }
-    } else if (toolUseBlock.name === 'record_section_approval') {
-      const { section_number, content } = toolUseBlock.input;
-      sectionApprovals.push({ section_number, content });
-      toolResult = JSON.stringify({ ok: true });
-    } else {
-      toolResult = JSON.stringify({ error: 'unknown_tool' });
+      toolResults.push({ type: 'tool_result', tool_use_id: toolUseBlock.id, content: toolResult });
     }
 
     messages.push({ role: 'assistant', content: response.content });
-    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseBlock.id, content: toolResult }] });
+    messages.push({ role: 'user', content: toolResults });
 
     response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
@@ -608,7 +612,13 @@ export default async function handler(req, res) {
             const isBot = msg.user === botUserId;
             const cleanText = (msg.text || '').replace(/<!--STATE:.*?-->/gs, '').trim();
             if (!cleanText || cleanText === '_On it..._') continue;
-            conversationHistory.push({ role: isBot ? 'assistant' : 'user', content: cleanText });
+            const role = isBot ? 'assistant' : 'user';
+            const last = conversationHistory[conversationHistory.length - 1];
+            if (last && last.role === role) {
+              last.content += '\n' + cleanText;
+            } else {
+              conversationHistory.push({ role, content: cleanText });
+            }
           }
         }
 
