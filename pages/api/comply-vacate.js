@@ -115,9 +115,16 @@ async function getBotUserId() {
 
 // ─── Supabase helpers ───────────────────────────────────────────────────────
 
+function unitFilter(unitNumber) {
+  // Units may be stored as bare "104" or address-prefixed "3614-104".
+  // Use an OR filter to match both forms.
+  const u = encodeURIComponent(unitNumber);
+  return `or=(unit.eq.${u},unit.ilike.*-${u})`;
+}
+
 async function lookupTenant(propertyHint, unitNumber) {
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(propertyHint)}*&unit=eq.${encodeURIComponent(unitNumber)}&tenant_type=eq.Financially+Responsible&select=tenant_name,unit,email,phone,lease_to,property_name,property_address,property_city,property_state,property_zip`,
+    `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(propertyHint)}*&${unitFilter(unitNumber)}&tenant_type=eq.Financially+Responsible&select=tenant_name,unit,email,phone,lease_to,property_name,property_address,property_city,property_state,property_zip`,
     { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
   );
   const tenants = await res.json();
@@ -132,7 +139,7 @@ async function lookupTenant(propertyHint, unitNumber) {
 
     for (const prop of props) {
       const t2 = await fetch(
-        `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(prop.name)}*&unit=eq.${encodeURIComponent(unitNumber)}&tenant_type=eq.Financially+Responsible&select=tenant_name,unit,email,phone,lease_to,property_name,property_address,property_city,property_state,property_zip`,
+        `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(prop.name)}*&${unitFilter(unitNumber)}&tenant_type=eq.Financially+Responsible&select=tenant_name,unit,email,phone,lease_to,property_name,property_address,property_city,property_state,property_zip`,
         { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
       );
       const t2data = await t2.json();
