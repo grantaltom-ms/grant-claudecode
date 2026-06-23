@@ -285,20 +285,36 @@ function generateNoticePdf(state) {
 }
 
 async function uploadPdfToSlack(pdfBuffer, filename, thread_ts) {
-  const form = new FormData();
-  form.append('token', SLACK_BOT_TOKEN);
-  form.append('channels', COMPLY_CHANNEL_ID);
-  form.append('thread_ts', thread_ts);
-  form.append('filename', filename);
-  form.append('filetype', 'pdf');
-  form.append('file', pdfBuffer, { filename, contentType: 'application/pdf' });
-
-  const res = await fetch('https://slack.com/api/files.upload', {
+  // Step 1: get an upload URL (Slack Files v2 API)
+  const urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
     method: 'POST',
-    headers: form.getHeaders(),
-    body: form.getBuffer(),
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    body: JSON.stringify({ filename, length: pdfBuffer.length }),
   });
-  return res.json();
+  const urlData = await urlRes.json();
+  if (!urlData.ok) throw new Error(`files.getUploadURLExternal failed: ${urlData.error}`);
+
+  // Step 2: upload the file bytes to the provided URL
+  const uploadRes = await fetch(urlData.upload_url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: pdfBuffer,
+  });
+  if (!uploadRes.ok) throw new Error(`PDF upload failed: ${uploadRes.status}`);
+
+  // Step 3: complete the upload and share into the channel/thread
+  const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    body: JSON.stringify({
+      files: [{ id: urlData.file_id }],
+      channel_id: COMPLY_CHANNEL_ID,
+      thread_ts,
+    }),
+  });
+  const completeData = await completeRes.json();
+  if (!completeData.ok) throw new Error(`files.completeUploadExternal failed: ${completeData.error}`);
+  return completeData;
 }
 
 // ─── Google Drive ───────────────────────────────────────────────────────────
