@@ -115,16 +115,21 @@ async function getBotUserId() {
 
 // ─── Supabase helpers ───────────────────────────────────────────────────────
 
+function unitFilter(unitNumber) {
+  // Units may be stored as bare "104" or address-prefixed "3614-104".
+  // Use an OR filter to match both forms.
+  const u = encodeURIComponent(unitNumber);
+  return `or=(unit.eq.${u},unit.ilike.*-${u})`;
+}
+
 async function lookupTenant(propertyHint, unitNumber) {
-  // Look up directly in tenant_directory using property_name and unit columns
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(propertyHint)}*&unit=eq.${encodeURIComponent(unitNumber)}&select=tenant_name,unit,email,phone,lease_to,property_name,property_city`,
+    `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(propertyHint)}*&${unitFilter(unitNumber)}&tenant_type=eq.Financially+Responsible&select=tenant_name,unit,email,phone,lease_to,property_name,property_address,property_city,property_state,property_zip`,
     { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
   );
   const tenants = await res.json();
 
   if (!Array.isArray(tenants) || tenants.length === 0) {
-    // Try resolving via properties table in case hint doesn't match property_name exactly
     const propRes = await fetch(
       `${SUPABASE_URL}/rest/v1/properties?name=ilike.*${encodeURIComponent(propertyHint)}*&managed_by_milestone=eq.true&is_group=eq.false&select=id,name,city`,
       { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
@@ -132,10 +137,9 @@ async function lookupTenant(propertyHint, unitNumber) {
     const props = await propRes.json();
     if (!Array.isArray(props) || props.length === 0) return { error: 'property_not_found' };
 
-    // Try each matching property name
     for (const prop of props) {
       const t2 = await fetch(
-        `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(prop.name)}*&unit=eq.${encodeURIComponent(unitNumber)}&select=tenant_name,unit,email,phone,lease_to,property_name,property_city`,
+        `${SUPABASE_URL}/rest/v1/tenant_directory?property_name=ilike.*${encodeURIComponent(prop.name)}*&${unitFilter(unitNumber)}&tenant_type=eq.Financially+Responsible&select=tenant_name,unit,email,phone,lease_to,property_name,property_address,property_city,property_state,property_zip`,
         { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
       );
       const t2data = await t2.json();
@@ -149,7 +153,10 @@ async function lookupTenant(propertyHint, unitNumber) {
   return {
     tenants,
     propertyName: tenants[0].property_name,
+    propertyAddress: tenants[0].property_address,
     city: tenants[0].property_city,
+    propertyState: tenants[0].property_state,
+    propertyZip: tenants[0].property_zip,
     unitNumber,
   };
 }
@@ -195,8 +202,11 @@ function generateNoticePdf(state) {
 
     const tenantNames = state.tenantName || '___________________________';
     const propertyName = state.propertyName || '___________________________';
+    const propertyAddress = state.propertyAddress || null;
     const unitNumber = state.unitNumber || '___';
     const city = (state.city || '') || '___________________________';
+    const propertyState = state.propertyState || 'WA';
+    const propertyZip = state.propertyZip || '';
 
     // ── Page 1: Notice Body ──────────────────────────────────────────────────
     doc.font('Helvetica-Bold').fontSize(16).text('Milestone Properties');
@@ -213,8 +223,13 @@ function generateNoticePdf(state) {
 
     doc.font('Helvetica').fontSize(10)
       .text(`TO: ${tenantNames}`)
-      .text(`Premises: ${propertyName}, Unit ${unitNumber}`)
-      .text(`${city}, WA`);
+      .text(`Premises: ${propertyName}, Unit ${unitNumber}`);
+    if (propertyAddress) {
+      doc.text(`${propertyAddress}, Unit ${unitNumber}`);
+      doc.text(`${city}, ${propertyState} ${propertyZip}`.trim());
+    } else {
+      doc.text(`${city}, WA`);
+    }
     doc.moveDown(1);
 
     doc.font('Helvetica').fontSize(10).text(
@@ -352,7 +367,7 @@ const SYSTEM_PROMPT = `You are a Lease Compliance Assistant for Milestone Proper
 
 You operate in a Slack channel. When a manager reports a lease violation, you:
 1. Ask targeted clarifying questions to fully understand the violation
-2. Look up the tenant in Supabase to confirm their identity
+2. Call lookup_tenant to find all Financially Responsible tenants for the unit. Present the results — all tenant names plus full address (street, city, state, zip) — and ask the manager: "Please confirm these are the correct tenants and address for this unit before I proceed." Wait for their confirmation before moving to step 3.
 3. Draft each of the three Exhibit A sections ONE AT A TIME, getting approval before moving to the next
 4. Once all three sections are approved, call record_section_approval for section 3 and announce the PDF is being generated
 
@@ -508,7 +523,7 @@ async function runAgent(userMessage, conversationHistory, state) {
   const tools = [
     {
       name: 'lookup_tenant',
-      description: 'Look up a tenant in Supabase by property name and unit number. Returns tenant name, lease end date, email, phone, property name, and city.',
+      description: 'Look up Financially Responsible tenants in Supabase by property name and unit number. Returns all financially responsible tenants with full address (street, city, state, zip), lease end date, email, and phone. After calling this tool, present all found tenants and their full address to the manager and ask them to confirm before proceeding.',
       input_schema: {
         type: 'object',
         properties: {
@@ -554,10 +569,13 @@ async function runAgent(userMessage, conversationHistory, state) {
         if (!lookupResult.error && lookupResult.tenants?.length) {
           const t = lookupResult.tenants[0];
           tenantData = {
-            tenantName: t.tenant_name || lookupResult.tenants.map((x) => x.tenant_name).join(' & '),
+            tenantName: lookupResult.tenants.map((x) => x.tenant_name).join(' & '),
             propertyName: lookupResult.propertyName || t.property_name,
+            propertyAddress: lookupResult.propertyAddress || t.property_address,
             unitNumber: lookupResult.unitNumber || t.unit,
             city: lookupResult.city || t.property_city,
+            propertyState: lookupResult.propertyState || t.property_state,
+            propertyZip: lookupResult.propertyZip || t.property_zip,
           };
         }
       } else if (toolUseBlock.name === 'record_section_approval') {
