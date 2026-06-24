@@ -420,19 +420,19 @@ Work through Exhibit A one section at a time. Never present more than one sectio
 Once you have confirmed the tenant and have enough detail about the violation, present Section 1 only:
 
 *Section 1 — Draft:*
-[cite the exact lease section name and full quoted text]
+*[cite the exact lease section name and full quoted text — bold the entire draft content]*
 
 ✅ Approve | ✏️ Reply with changes
 
 **Step 2 — Section 2 (Violation Description)**
 When the manager approves Section 1:
 1. Call \`record_section_approval\` with section_number=1 and the final approved text
-2. Present Section 2 only, using the same format and ✅/✏️ prompt
+2. Present Section 2 only using the same format — bold the full draft content between the header and the ✅/✏️ line
 
 **Step 3 — Section 3 (Required Actions)**
 When the manager approves Section 2:
 1. Call \`record_section_approval\` with section_number=2 and the final approved text
-2. Present Section 3 only, using the same format and ✅/✏️ prompt
+2. Present Section 3 only using the same format — bold the full draft content between the header and the ✅/✏️ line
 
 **Step 4 — PDF generation**
 When the manager approves Section 3:
@@ -515,9 +515,21 @@ Do not accept vague descriptions like "tenant has been creating disturbances." A
 async function runAgent(userMessage, conversationHistory, state) {
   let tenantData = null;
   const sectionApprovals = [];
+
+  // Prepend confirmed state so the agent doesn't re-run completed steps
+  let stateContext = '';
+  if (state?.tenantName) {
+    const addr = [state.propertyAddress, state.unitNumber && `Unit ${state.unitNumber}`, state.city, state.propertyState, state.propertyZip]
+      .filter(Boolean).join(', ');
+    stateContext += `[Confirmed state: Tenant "${state.tenantName}"${addr ? ` at ${addr}` : ''} has already been confirmed by the manager. Do NOT call lookup_tenant again — proceed from where the conversation left off.]\n`;
+  }
+  if (state?.section1) stateContext += '[Section 1 already approved — do not re-draft it.]\n';
+  if (state?.section2) stateContext += '[Section 2 already approved — do not re-draft it.]\n';
+  if (state?.section3) stateContext += '[Section 3 already approved — do not re-draft it.]\n';
+
   const messages = [
     ...conversationHistory.map((m) => ({ role: m.role, content: m.content })),
-    { role: 'user', content: userMessage },
+    { role: 'user', content: stateContext ? stateContext + userMessage : userMessage },
   ];
 
   const tools = [
