@@ -300,11 +300,12 @@ function generateNoticePdf(state) {
 }
 
 async function uploadPdfToSlack(pdfBuffer, filename, thread_ts) {
-  // Step 1: get an upload URL (Slack Files v2 API)
+  // Step 1: get an upload URL (Slack Files v2 API — requires form-encoded body)
+  const urlParams = new URLSearchParams({ filename, length: String(pdfBuffer.length) });
   const urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
-    body: JSON.stringify({ filename, length: pdfBuffer.length }),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    body: urlParams.toString(),
   });
   const urlData = await urlRes.json();
   if (!urlData.ok) throw new Error(`files.getUploadURLExternal failed: ${urlData.error}`);
@@ -687,7 +688,7 @@ export default async function handler(req, res) {
           try {
             const today = new Date().toISOString().split('T')[0];
             const lastName = (newState.tenantName || 'Tenant').split(/[\s,]+/).filter(Boolean).pop();
-            const pdfFilename = `${today} - ${newState.propertyName || 'Property'} #${newState.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
+            const pdfFilename = `${today} - ${newState.propertyName || 'Property'} Unit ${newState.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
             const pdfBuffer = await generateNoticePdf(newState);
             await uploadPdfToSlack(pdfBuffer, pdfFilename, thread_ts);
           } catch (pdfErr) {
