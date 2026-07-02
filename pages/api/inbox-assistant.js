@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
+import { createClient } from '@supabase/supabase-js';
 import { waitUntil } from '@vercel/functions';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
@@ -7,6 +8,10 @@ export const config = { api: { bodyParser: false } };
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // --- Microsoft Graph helpers ---
 
@@ -97,6 +102,17 @@ const EMAIL_TOOLS = [
     },
   },
   {
+    name: 'resolve_digest_item',
+    description: 'Resolve a numbered item from the current Slack digest thread, such as #1 or #3, to the real Outlook message ID and saved email metadata. Use this before acting on any numbered digest item.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        item_number: { type: 'number', description: 'The digest item number, e.g. 1 for #1.' },
+      },
+      required: ['item_number'],
+    },
+  },
+  {
     name: 'create_draft_reply',
     description: 'Create a saved draft reply to an email. Does NOT send it — Grant must approve first. CC recipients from the original email are automatically preserved — you do not need to specify them.',
     input_schema: {
@@ -181,11 +197,274 @@ const EMAIL_TOOLS = [
       required: ['draft_id'],
     },
   },
+  {
+    name: 'update_digest_item_status',
+    description: 'Update the action status for a numbered item in the current Slack digest thread. Use this when Grant says a digest item is done, open, waiting, drafted, or dismissed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        item_number: { type: 'number', description: 'The digest item number, e.g. 2 for #2.' },
+        action_status: {
+          type: 'string',
+          enum: ['open', 'done', 'waiting', 'drafted', 'dismissed'],
+          description: 'The new status for this digest item.',
+        },
+      },
+      required: ['item_number', 'action_status'],
+    },
+  },
+  {
+    name: 'search_memory_entities',
+    description: 'Search durable inbox memory entities such as properties, people, vendors, tenants, invoices, deadlines, insurance, financial statements, projects, and issue types.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search text, e.g. "Olympic View insurance" or "BECU financial statements".' },
+        entity_type: {
+          type: 'string',
+          enum: ['property', 'person', 'vendor', 'tenant', 'invoice', 'deadline', 'insurance', 'financial_statement', 'project', 'legal_issue', 'maintenance_issue', 'leasing_issue', 'system', 'other'],
+          description: 'Optional entity type filter.',
+        },
+        limit: { type: 'number', description: 'Maximum number of results. Default 8, max 15.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'search_thread_memory',
+    description: 'Search saved email thread summaries and open items. Use this for questions about the latest status, open loops, or prior conversations.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search text, e.g. "Delmont open items" or "insurance renewal".' },
+        limit: { type: 'number', description: 'Maximum number of results. Default 8, max 15.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'get_entity_context',
+    description: 'Get recent mentions and related email/thread context for a saved memory entity by entity_id.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        entity_id: { type: 'string', description: 'The UUID returned by search_memory_entities.' },
+        limit: { type: 'number', description: 'Maximum number of recent mentions. Default 8, max 15.' },
+      },
+      required: ['entity_id'],
+    },
+  },
 ];
 
 // --- Tool execution ---
 
-async function executeTool(name, input, token) {
+function normalizeSearchTerm(query) {
+  return (query || '').trim().replace(/\s+/g, ' ');
+}
+
+function escapeIlike(value) {
+  return value
+    .replace(/[(),]/g, ' ')
+    .replace(/[%_]/g, '\\$&')
+    .trim();
+}
+
+function boundedLimit(limit, fallback = 8, max = 15) {
+  const numericLimit = Number(limit);
+  if (!Number.isFinite(numericLimit) || numericLimit <= 0) return fallback;
+  return Math.min(Math.floor(numericLimit), max);
+}
+
+function buildEntityTypeFilter(entityType) {
+  const allowedTypes = new Set([
+    'property',
+    'person',
+    'vendor',
+    'tenant',
+    'invoice',
+    'deadline',
+    'insurance',
+    'financial_statement',
+    'project',
+    'legal_issue',
+    'maintenance_issue',
+    'leasing_issue',
+    'system',
+    'other'
+  ]);
+  return allowedTypes.has(entityType) ? entityType : null;
+}
+
+async function resolveDigestItem(threadTs, itemNumber) {
+  if (!threadTs) {
+    throw new Error('No Slack thread timestamp available for digest item lookup.');
+  }
+
+  const { data: digestRun, error: runError } = await supabase
+    .from('digest_runs')
+    .select('id, slack_thread_ts, run_started_at, status')
+    .eq('slack_thread_ts', threadTs)
+    .order('run_started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (runError) throw new Error(`Digest run lookup failed: ${runError.message}`);
+  if (!digestRun) throw new Error(`No digest run found for Slack thread ${threadTs}.`);
+
+  const { data: digestItem, error: itemError } = await supabase
+    .from('digest_items')
+    .select('id, item_number, graph_message_id, graph_conversation_id, sender_name, sender_email, subject, received_at, classification, action_status, raw_digest_input')
+    .eq('digest_run_id', digestRun.id)
+    .eq('item_number', itemNumber)
+    .maybeSingle();
+
+  if (itemError) throw new Error(`Digest item lookup failed: ${itemError.message}`);
+  if (!digestItem) throw new Error(`No digest item #${itemNumber} found for this Slack thread.`);
+
+  const { data: emailMemory, error: emailError } = await supabase
+    .from('email_messages')
+    .select('graph_message_id, graph_conversation_id, subject, sender_name, sender_email, received_at, body_preview, importance, is_read, has_attachments')
+    .eq('graph_message_id', digestItem.graph_message_id)
+    .maybeSingle();
+
+  if (emailError) {
+    console.error('Failed to load email memory for digest item:', {
+      graph_message_id: digestItem.graph_message_id,
+      error: emailError
+    });
+  }
+
+  return {
+    digest_run: digestRun,
+    digest_item: digestItem,
+    email: emailMemory || null,
+    message_id: digestItem.graph_message_id,
+    conversation_id: digestItem.graph_conversation_id,
+  };
+}
+
+async function updateDigestItemStatus(threadTs, itemNumber, actionStatus) {
+  const resolved = await resolveDigestItem(threadTs, itemNumber);
+
+  const { error } = await supabase
+    .from('digest_items')
+    .update({
+      action_status: actionStatus,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', resolved.digest_item.id);
+
+  if (error) throw new Error(`Digest item status update failed: ${error.message}`);
+
+  return {
+    item_number: itemNumber,
+    action_status: actionStatus,
+    message_id: resolved.message_id,
+    subject: resolved.digest_item.subject,
+  };
+}
+
+async function searchMemoryEntities(input) {
+  const query = normalizeSearchTerm(input.query);
+  if (!query) throw new Error('Search query is required.');
+
+  const limit = boundedLimit(input.limit);
+  const escapedQuery = escapeIlike(query);
+  let entityQuery = supabase
+    .from('entities')
+    .select('id, entity_type, name, current_summary, metadata, first_seen_at, last_seen_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .or(`name.ilike.%${escapedQuery}%,normalized_name.ilike.%${escapedQuery}%,current_summary.ilike.%${escapedQuery}%`)
+    .order('last_seen_at', { ascending: false })
+    .limit(limit);
+
+  const entityType = buildEntityTypeFilter(input.entity_type);
+  if (entityType) entityQuery = entityQuery.eq('entity_type', entityType);
+
+  const { data, error } = await entityQuery;
+  if (error) throw new Error(`Entity memory search failed: ${error.message}`);
+
+  return {
+    query,
+    entity_type: entityType,
+    results: data || [],
+  };
+}
+
+async function searchThreadMemory(input) {
+  const query = normalizeSearchTerm(input.query);
+  if (!query) throw new Error('Search query is required.');
+
+  const limit = boundedLimit(input.limit);
+  const escapedQuery = escapeIlike(query);
+  const { data, error } = await supabase
+    .from('email_threads')
+    .select('id, graph_conversation_id, latest_subject, participant_emails, participant_names, first_message_at, last_message_at, last_graph_message_id, message_count, current_summary, open_items, status, summary_updated_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .or(`latest_subject.ilike.%${escapedQuery}%,current_summary.ilike.%${escapedQuery}%`)
+    .order('last_message_at', { ascending: false })
+    .limit(limit);
+
+  if (error) throw new Error(`Thread memory search failed: ${error.message}`);
+
+  return {
+    query,
+    results: data || [],
+  };
+}
+
+async function getEntityContext(input) {
+  const limit = boundedLimit(input.limit);
+
+  const { data: entity, error: entityError } = await supabase
+    .from('entities')
+    .select('id, entity_type, name, current_summary, metadata, first_seen_at, last_seen_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('id', input.entity_id)
+    .maybeSingle();
+
+  if (entityError) throw new Error(`Entity lookup failed: ${entityError.message}`);
+  if (!entity) throw new Error('No entity found for that entity_id.');
+
+  const { data: mentions, error: mentionsError } = await supabase
+    .from('entity_mentions')
+    .select('id, graph_message_id, graph_conversation_id, source_type, mention_text, confidence, metadata, created_at')
+    .eq('entity_id', entity.id)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (mentionsError) throw new Error(`Entity mentions lookup failed: ${mentionsError.message}`);
+
+  const messageIds = [...new Set((mentions || []).map(mention => mention.graph_message_id).filter(Boolean))];
+  const conversationIds = [...new Set((mentions || []).map(mention => mention.graph_conversation_id).filter(Boolean))];
+
+  const { data: messages, error: messagesError } = messageIds.length
+    ? await supabase
+      .from('email_messages')
+      .select('graph_message_id, graph_conversation_id, subject, sender_name, sender_email, received_at, body_preview, importance, is_read, has_attachments')
+      .in('graph_message_id', messageIds)
+    : { data: [], error: null };
+
+  if (messagesError) throw new Error(`Mention email lookup failed: ${messagesError.message}`);
+
+  const { data: threads, error: threadsError } = conversationIds.length
+    ? await supabase
+      .from('email_threads')
+      .select('graph_conversation_id, latest_subject, last_message_at, message_count, current_summary, open_items, status')
+      .in('graph_conversation_id', conversationIds)
+    : { data: [], error: null };
+
+  if (threadsError) throw new Error(`Mention thread lookup failed: ${threadsError.message}`);
+
+  return {
+    entity,
+    mentions: mentions || [],
+    messages: messages || [],
+    threads: threads || [],
+  };
+}
+
+async function executeTool(name, input, token, threadTs) {
   const base = `/users/${OWNER_EMAIL}`;
 
   switch (name) {
@@ -208,6 +487,10 @@ async function executeTool(name, input, token) {
     case 'get_email': {
       const select = 'id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,conversationId';
       return graph(token, `${base}/messages/${input.id}?$select=${select}`);
+    }
+
+    case 'resolve_digest_item': {
+      return resolveDigestItem(threadTs, input.item_number);
     }
 
     case 'create_draft_reply': {
@@ -314,6 +597,22 @@ async function executeTool(name, input, token) {
       return { success: true, message: 'Draft deleted.' };
     }
 
+    case 'update_digest_item_status': {
+      return updateDigestItemStatus(threadTs, input.item_number, input.action_status);
+    }
+
+    case 'search_memory_entities': {
+      return searchMemoryEntities(input);
+    }
+
+    case 'search_thread_memory': {
+      return searchThreadMemory(input);
+    }
+
+    case 'get_entity_context': {
+      return getEntityContext(input);
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -375,12 +674,17 @@ const SYSTEM_PROMPT = `You are an email assistant for Grant Carlson, Head of Ope
 
 RULES:
 - NEVER send an email without Grant explicitly approving it (e.g. "send it", "looks good", "go ahead")
+- When Grant refers to a numbered digest item like "#1", "#2", or "number 3", call resolve_digest_item first and use its message_id for any get_email or create_draft_reply call.
 - When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading. Save the draft, show it in Slack, then ask: "Send it, edit it, or discard?"
+- If Grant says a numbered digest item is done, waiting, dismissed, or has a draft prepared, call update_digest_item_status.
 - When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
 - When showing a reply draft, always list who it's going To: and CC: (CC recipients from the original are included automatically)
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
 - When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules
+- For questions about prior context, latest status, open items, properties, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search memory first using search_memory_entities and/or search_thread_memory.
+- When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
+- When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
 
 COMPANY CONTEXT:
 - Uses AppFolio for property management, Grasshopper for texting
@@ -480,7 +784,7 @@ async function runAgent(userMessage, threadTs, threadHistory = []) {
 
       for (const tu of toolUses) {
         try {
-          const result = await executeTool(tu.name, tu.input, token);
+          const result = await executeTool(tu.name, tu.input, token, threadTs);
           results.push({
             type: 'tool_result',
             tool_use_id: tu.id,

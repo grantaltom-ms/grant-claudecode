@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.45.0",
     "@vercel/functions": "^1.4.0",
     "form-data": "^4.0.0",
     "next": "^14.2.0",

@@ -1,8 +1,13 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { createClient } from '@supabase/supabase-js';
 import { waitUntil } from '@vercel/functions';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // Verify this is a legitimate cron call (Vercel signs cron requests)
 function verifyCronRequest(req) {
@@ -83,21 +88,586 @@ async function slackPost(text, threadTs = null) {
 
 // --- Digest logic ---
 
+async function saveEmailToMemory(email) {
+  const sender = email.from?.emailAddress || {};
+
+  const { data, error } = await supabase
+    .from('email_messages')
+    .upsert({
+      graph_message_id: email.id,
+      graph_conversation_id: email.conversationId || null,
+      internet_message_id: email.internetMessageId || null,
+
+      owner_email: OWNER_EMAIL,
+      folder: 'Inbox',
+
+      subject: email.subject || null,
+      sender_name: sender.name || null,
+      sender_email: sender.address || null,
+
+      recipients: email.toRecipients || [],
+      cc_recipients: email.ccRecipients || [],
+
+      received_at: email.receivedDateTime || null,
+      sent_at: email.sentDateTime || null,
+
+      importance: email.importance || null,
+      is_read: email.isRead ?? null,
+      has_attachments: email.hasAttachments ?? false,
+
+      body_preview: email.bodyPreview || null,
+      raw_graph_payload: email,
+      updated_at: new Date().toISOString()
+    }, {
+      onConflict: 'graph_message_id'
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Failed to save email to memory:', {
+      graph_message_id: email.id,
+      subject: email.subject,
+      error
+    });
+    return null;
+  }
+
+  return data;
+}
+
+function collectEmailAddresses(recipients = []) {
+  return recipients
+    .map(recipient => recipient.emailAddress?.address)
+    .filter(Boolean);
+}
+
+function collectEmailNames(recipients = []) {
+  return recipients
+    .map(recipient => recipient.emailAddress?.name)
+    .filter(Boolean);
+}
+
+async function upsertThreadMemory(email) {
+  if (!email.conversationId) return null;
+
+  const sender = email.from?.emailAddress || {};
+  const participantEmails = [
+    sender.address,
+    ...collectEmailAddresses(email.toRecipients),
+    ...collectEmailAddresses(email.ccRecipients)
+  ].filter(Boolean);
+  const participantNames = [
+    sender.name,
+    ...collectEmailNames(email.toRecipients),
+    ...collectEmailNames(email.ccRecipients)
+  ].filter(Boolean);
+
+  const { data: existingThread, error: existingError } = await supabase
+    .from('email_threads')
+    .select('first_message_at,last_message_at,participant_emails,participant_names')
+    .eq('graph_conversation_id', email.conversationId)
+    .maybeSingle();
+
+  if (existingError) {
+    console.error('Failed to load existing thread memory:', {
+      graph_conversation_id: email.conversationId,
+      error: existingError
+    });
+    return null;
+  }
+
+  const receivedAt = email.receivedDateTime || email.sentDateTime || null;
+  const existingEmails = existingThread?.participant_emails || [];
+  const existingNames = existingThread?.participant_names || [];
+  const mergedEmails = [...new Set([...existingEmails, ...participantEmails])];
+  const mergedNames = [...new Set([...existingNames, ...participantNames])];
+  const firstMessageAt = [existingThread?.first_message_at, receivedAt]
+    .filter(Boolean)
+    .sort()[0] || null;
+  const lastMessageCandidates = [existingThread?.last_message_at, receivedAt]
+    .filter(Boolean)
+    .sort();
+  const lastMessageAt = lastMessageCandidates[lastMessageCandidates.length - 1] || null;
+
+  const { count, error: countError } = await supabase
+    .from('email_messages')
+    .select('id', { count: 'exact', head: true })
+    .eq('graph_conversation_id', email.conversationId);
+
+  if (countError) {
+    console.error('Failed to count thread messages:', {
+      graph_conversation_id: email.conversationId,
+      error: countError
+    });
+  }
+
+  const { data, error } = await supabase
+    .from('email_threads')
+    .upsert({
+      graph_conversation_id: email.conversationId,
+      owner_email: OWNER_EMAIL,
+      latest_subject: email.subject || null,
+      participant_emails: mergedEmails,
+      participant_names: mergedNames,
+      first_message_at: firstMessageAt,
+      last_message_at: lastMessageAt,
+      last_graph_message_id: email.id,
+      message_count: count || 0,
+      updated_at: new Date().toISOString()
+    }, {
+      onConflict: 'graph_conversation_id'
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Failed to upsert thread memory:', {
+      graph_conversation_id: email.conversationId,
+      subject: email.subject,
+      error
+    });
+    return null;
+  }
+
+  return data;
+}
+
+async function createDigestRun({ totalEmails, savedEmails }) {
+  const { data, error } = await supabase
+    .from('digest_runs')
+    .insert({
+      owner_email: OWNER_EMAIL,
+      slack_channel_id: CHANNEL_ID,
+      total_emails: totalEmails,
+      saved_emails: savedEmails,
+      status: 'started'
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Failed to create digest run:', { error });
+    return null;
+  }
+
+  return data;
+}
+
+async function updateDigestRun(digestRunId, updates) {
+  if (!digestRunId) return;
+
+  const { error } = await supabase
+    .from('digest_runs')
+    .update({
+      ...updates,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', digestRunId);
+
+  if (error) {
+    console.error('Failed to update digest run:', {
+      digest_run_id: digestRunId,
+      error
+    });
+  }
+}
+
+async function saveDigestItems(digestRunId, emails) {
+  if (!digestRunId || emails.length === 0) return [];
+
+  const items = emails.map((email, index) => {
+    const sender = email.from?.emailAddress || {};
+
+    return {
+      digest_run_id: digestRunId,
+      item_number: index + 1,
+      graph_message_id: email.id,
+      graph_conversation_id: email.conversationId || null,
+      sender_name: sender.name || null,
+      sender_email: sender.address || null,
+      subject: email.subject || null,
+      received_at: email.receivedDateTime || null,
+      classification: 'digest_candidate',
+      action_status: 'open',
+      raw_digest_input: {
+        body_preview: email.bodyPreview || null,
+        importance: email.importance || null,
+        is_read: email.isRead ?? null,
+        has_attachments: email.hasAttachments ?? false
+      }
+    };
+  });
+
+  const { data, error } = await supabase
+    .from('digest_items')
+    .insert(items)
+    .select();
+
+  if (error) {
+    console.error('Failed to save digest items:', {
+      digest_run_id: digestRunId,
+      error
+    });
+    return [];
+  }
+
+  return data || [];
+}
+
+function parseJsonObject(text) {
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonArray(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {}
+
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return null;
+
+  try {
+    const parsed = JSON.parse(match[0]);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeEntityName(name) {
+  return (name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeEntityType(entityType) {
+  const allowedTypes = new Set([
+    'property',
+    'person',
+    'vendor',
+    'tenant',
+    'invoice',
+    'deadline',
+    'insurance',
+    'financial_statement',
+    'project',
+    'legal_issue',
+    'maintenance_issue',
+    'leasing_issue',
+    'system',
+    'other'
+  ]);
+  return allowedTypes.has(entityType) ? entityType : 'other';
+}
+
+function normalizeConfidence(confidence) {
+  const numericConfidence = Number(confidence);
+  if (!Number.isFinite(numericConfidence)) return null;
+  return Math.max(0, Math.min(1, numericConfidence));
+}
+
+async function saveEntityMention(entityCandidate) {
+  const normalizedName = normalizeEntityName(entityCandidate.name);
+  if (!entityCandidate.entity_type || !entityCandidate.name || !normalizedName) return null;
+
+  const now = new Date().toISOString();
+  const entityType = normalizeEntityType(entityCandidate.entity_type);
+  const confidence = normalizeConfidence(entityCandidate.confidence);
+  const { data: entity, error: entityError } = await supabase
+    .from('entities')
+    .upsert({
+      owner_email: OWNER_EMAIL,
+      entity_type: entityType,
+      name: entityCandidate.name,
+      normalized_name: normalizedName,
+      last_seen_at: now,
+      updated_at: now,
+      metadata: {
+        latest_confidence: confidence
+      }
+    }, {
+      onConflict: 'owner_email,entity_type,normalized_name'
+    })
+    .select()
+    .single();
+
+  if (entityError) {
+    console.error('Failed to save entity:', {
+      entity_type: entityType,
+      name: entityCandidate.name,
+      error: entityError
+    });
+    return null;
+  }
+
+  const { error: mentionError } = await supabase
+    .from('entity_mentions')
+    .upsert({
+      entity_id: entity.id,
+      graph_message_id: entityCandidate.graph_message_id || null,
+      graph_conversation_id: entityCandidate.graph_conversation_id || null,
+      source_type: 'email_preview',
+      mention_text: entityCandidate.context || null,
+      confidence,
+      metadata: {
+        subject: entityCandidate.subject || null
+      }
+    }, {
+      onConflict: 'entity_id,graph_message_id,source_type'
+    });
+
+  if (mentionError) {
+    console.error('Failed to save entity mention:', {
+      entity_id: entity.id,
+      graph_message_id: entityCandidate.graph_message_id,
+      error: mentionError
+    });
+    return null;
+  }
+
+  return entity;
+}
+
+async function extractEntitiesFromEmails(anthropic, emails) {
+  const maxEmailsForExtraction = 20;
+  const emailsForExtraction = emails.slice(0, maxEmailsForExtraction);
+  if (emailsForExtraction.length === 0) return [];
+
+  const extractionInput = emailsForExtraction.map((email, index) => (
+    `${index + 1}. graph_message_id: ${email.id}\n` +
+    `conversation_id: ${email.conversationId || ''}\n` +
+    `from: ${email.from?.emailAddress?.name || ''} <${email.from?.emailAddress?.address || ''}>\n` +
+    `subject: ${email.subject || ''}\n` +
+    `preview: ${(email.bodyPreview || '').slice(0, 500)}`
+  )).join('\n\n');
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1200,
+    system: `Extract durable business entities from Outlook email previews for Grant Carlson at Milestone Properties.
+
+Return ONLY a valid JSON array. Each item must have:
+{
+  "entity_type": "property" | "person" | "vendor" | "tenant" | "invoice" | "deadline" | "insurance" | "financial_statement" | "project" | "legal_issue" | "maintenance_issue" | "leasing_issue" | "system" | "other",
+  "name": "specific entity name",
+  "graph_message_id": "message id copied exactly from input",
+  "graph_conversation_id": "conversation id copied exactly from input when present",
+  "subject": "email subject",
+  "context": "brief reason this entity matters",
+  "confidence": 0.0
+}
+
+Be conservative. Do not invent names. Prefer specific property names, vendor/company names, tenant/person names, invoice/deadline references, insurance items, financial statement requests or reports, projects, and issue types that will be useful for future retrieval.`,
+    messages: [{
+      role: 'user',
+      content: `Extract entities from these email previews:\n\n${extractionInput}`,
+    }],
+  });
+
+  const text = response.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+    .trim();
+  const parsed = parseJsonArray(text);
+
+  if (!parsed) {
+    console.error('Failed to parse entity extraction response:', { response: text });
+    return [];
+  }
+
+  const savedEntities = [];
+  for (const entityCandidate of parsed) {
+    try {
+      const saved = await saveEntityMention(entityCandidate);
+      if (saved) savedEntities.push(saved);
+    } catch (error) {
+      console.error('Entity save failed:', { entityCandidate, error });
+    }
+  }
+
+  if (emails.length > maxEmailsForExtraction) {
+    console.log(`Skipped entity extraction for ${emails.length - maxEmailsForExtraction} emails due to per-digest cap.`);
+  }
+
+  return savedEntities;
+}
+
+async function summarizeThreadMemory(anthropic, conversationId) {
+  const { data: messages, error } = await supabase
+    .from('email_messages')
+    .select('subject,sender_name,sender_email,received_at,body_preview,importance,is_read')
+    .eq('graph_conversation_id', conversationId)
+    .order('received_at', { ascending: false })
+    .limit(12);
+
+  if (error) {
+    console.error('Failed to load thread messages for summary:', {
+      graph_conversation_id: conversationId,
+      error
+    });
+    return null;
+  }
+
+  if (!messages || messages.length === 0) return null;
+
+  const chronologicalMessages = [...messages].reverse();
+  const threadInput = chronologicalMessages.map((message, index) => (
+    `${index + 1}. ${message.received_at || 'unknown date'} | ` +
+    `From: ${message.sender_name || message.sender_email || 'Unknown'} <${message.sender_email || ''}> | ` +
+    `Subject: ${message.subject || '(no subject)'} | ` +
+    `Importance: ${message.importance || 'normal'} | ` +
+    `Read: ${message.is_read} | ` +
+    `Preview: ${(message.body_preview || '').slice(0, 500)}`
+  )).join('\n');
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 700,
+    system: `You summarize business email threads into durable memory for Grant Carlson at Milestone Properties.
+
+Return ONLY valid JSON with this shape:
+{
+  "current_summary": "one compact paragraph, max 80 words",
+  "open_items": ["short action/waiting item", "..."],
+  "status": "active" | "waiting" | "done" | "stale"
+}
+
+Use only the email previews provided. If previews are too thin, say what is known and keep open_items conservative.`,
+    messages: [{
+      role: 'user',
+      content: `Summarize this Outlook conversation from saved previews:\n\n${threadInput}`,
+    }],
+  });
+
+  const text = response.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+    .trim();
+  const parsed = parseJsonObject(text);
+
+  if (!parsed?.current_summary) {
+    console.error('Failed to parse thread summary response:', {
+      graph_conversation_id: conversationId,
+      response: text
+    });
+    return null;
+  }
+
+  const openItems = Array.isArray(parsed.open_items) ? parsed.open_items : [];
+  const allowedStatuses = new Set(['active', 'waiting', 'done', 'stale']);
+  const status = allowedStatuses.has(parsed.status) ? parsed.status : 'active';
+
+  const { data, error: updateError } = await supabase
+    .from('email_threads')
+    .update({
+      current_summary: parsed.current_summary,
+      open_items: openItems,
+      status,
+      summary_updated_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq('graph_conversation_id', conversationId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error('Failed to update thread summary:', {
+      graph_conversation_id: conversationId,
+      error: updateError
+    });
+    return null;
+  }
+
+  return data;
+}
+
+async function summarizeThreadMemories(anthropic, emails) {
+  const conversationIds = [
+    ...new Set(emails.map(email => email.conversationId).filter(Boolean))
+  ];
+  const maxThreadsPerDigest = 12;
+  const summarizedThreads = [];
+
+  for (const conversationId of conversationIds.slice(0, maxThreadsPerDigest)) {
+    try {
+      const summary = await summarizeThreadMemory(anthropic, conversationId);
+      if (summary) summarizedThreads.push(summary);
+    } catch (error) {
+      console.error('Thread summarization failed:', {
+        graph_conversation_id: conversationId,
+        error
+      });
+    }
+  }
+
+  if (conversationIds.length > maxThreadsPerDigest) {
+    console.log(`Skipped ${conversationIds.length - maxThreadsPerDigest} thread summaries due to per-digest cap.`);
+  }
+
+  return summarizedThreads;
+}
+
 async function runDigest() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Missing Supabase environment variables: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY');
+  }
+
   const token = await getGraphToken();
 
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
     + `?$top=50`
-    + `&$select=id,subject,from,receivedDateTime,isRead,bodyPreview,importance`
+    + `&$select=id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,bodyPreview,importance,hasAttachments`
     + `&$filter=receivedDateTime ge ${since}`
     + `&$orderby=receivedDateTime desc`;
 
   const result = await graph(token, url);
   const emails = result.value || [];
 
+  const savedEmails = [];
+  const savedThreads = [];
+
+  for (const email of emails) {
+    const saved = await saveEmailToMemory(email);
+    if (saved) {
+      savedEmails.push(saved);
+      const savedThread = await upsertThreadMemory(email);
+      if (savedThread) savedThreads.push(savedThread);
+    }
+  }
+
+  console.log(`Saved ${savedEmails.length}/${emails.length} emails to memory.`);
+  console.log(`Updated ${savedThreads.length}/${savedEmails.length} thread memories.`);
+
+  const digestRun = await createDigestRun({
+    totalEmails: emails.length,
+    savedEmails: savedEmails.length
+  });
+
   if (emails.length === 0) {
-    await slackPost('*Morning Digest* — No new emails in the last 24 hours. ✅');
+    const digestTs = await slackPost('*Morning Digest* — No new emails in the last 24 hours. ✅');
+    await updateDigestRun(digestRun?.id, {
+      slack_thread_ts: digestTs || null,
+      run_completed_at: new Date().toISOString(),
+      status: 'no_emails'
+    });
     return;
   }
 
@@ -162,9 +732,26 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
 
   if (filteredEmails.length === 0) {
     const archivedNote = archivedCount > 0 ? ` (${archivedCount} spam emails auto-archived)` : '';
-    await slackPost(`*Morning Digest* — No actionable emails in the last 24 hours.${archivedNote} ✅`);
+    const digestTs = await slackPost(`*Morning Digest* — No actionable emails in the last 24 hours.${archivedNote} ✅`);
+    await updateDigestRun(digestRun?.id, {
+      slack_thread_ts: digestTs || null,
+      run_completed_at: new Date().toISOString(),
+      included_count: 0,
+      actionable_count: 0,
+      archived_count: archivedCount,
+      status: 'no_actionable'
+    });
     return;
   }
+
+  const summarizedThreads = await summarizeThreadMemories(anthropic, filteredEmails);
+  console.log(`Summarized ${summarizedThreads.length} thread memories.`);
+
+  const savedEntities = await extractEntitiesFromEmails(anthropic, filteredEmails);
+  console.log(`Saved ${savedEntities.length} entity mentions.`);
+
+  const savedDigestItems = await saveDigestItems(digestRun?.id, filteredEmails);
+  console.log(`Saved ${savedDigestItems.length}/${filteredEmails.length} digest item mappings.`);
 
   const emailList = filteredEmails.map((e, i) => {
     const received = new Date(e.receivedDateTime);
@@ -241,6 +828,13 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
   }
 
   const digestTs = await slackPost(digest);
+  await updateDigestRun(digestRun?.id, {
+    slack_thread_ts: digestTs || null,
+    run_completed_at: new Date().toISOString(),
+    included_count: filteredEmails.length,
+    archived_count: archivedCount,
+    status: 'posted'
+  });
 
   await slackPost(
     '_Reply here to act on any email — e.g. "draft reply to #1", "what does #3 say", "mark #2 as done"_',
