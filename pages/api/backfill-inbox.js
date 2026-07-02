@@ -110,7 +110,24 @@ async function saveEmailToMemory(email) {
   return data;
 }
 
-async function upsertThreadMemory(email) {
+function safeError(error) {
+  return {
+    code: error?.code || null,
+    message: error?.message || 'Unknown error',
+    details: error?.details || null,
+    hint: error?.hint || null
+  };
+}
+
+function projectRefFromUrl() {
+  try {
+    return new URL(process.env.SUPABASE_URL).hostname.split('.')[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function upsertThreadMemory(email, threadErrors) {
   if (!email.conversationId) return null;
 
   const sender = email.from?.emailAddress || {};
@@ -135,6 +152,12 @@ async function upsertThreadMemory(email) {
     console.error('Backfill failed to load thread memory:', {
       graph_conversation_id: email.conversationId,
       error: existingError
+    });
+    threadErrors.push({
+      stage: 'load_thread',
+      graph_conversation_id: email.conversationId,
+      subject: email.subject,
+      error: safeError(existingError)
     });
     return null;
   }
@@ -162,6 +185,12 @@ async function upsertThreadMemory(email) {
       graph_conversation_id: email.conversationId,
       error: countError
     });
+    threadErrors.push({
+      stage: 'count_messages',
+      graph_conversation_id: email.conversationId,
+      subject: email.subject,
+      error: safeError(countError)
+    });
   }
 
   const { data, error } = await supabase
@@ -188,6 +217,12 @@ async function upsertThreadMemory(email) {
       graph_conversation_id: email.conversationId,
       subject: email.subject,
       error
+    });
+    threadErrors.push({
+      stage: 'upsert_thread',
+      graph_conversation_id: email.conversationId,
+      subject: email.subject,
+      error: safeError(error)
     });
     return null;
   }
@@ -226,6 +261,7 @@ export default async function handler(req, res) {
   let savedEmails = 0;
   let updatedThreads = 0;
   const errors = [];
+  const threadErrors = [];
 
   while (url && fetched < maxMessages) {
     const result = await graph(token, url);
@@ -242,7 +278,7 @@ export default async function handler(req, res) {
       }
 
       savedEmails += 1;
-      const savedThread = await upsertThreadMemory(email);
+      const savedThread = await upsertThreadMemory(email, threadErrors);
       if (savedThread) updatedThreads += 1;
     }
 
@@ -251,11 +287,14 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     ok: true,
+    supabase_project_ref: projectRefFromUrl(),
     days,
     max_messages: maxMessages,
     fetched,
     saved_emails: savedEmails,
     updated_threads: updatedThreads,
     errors,
+    thread_error_count: threadErrors.length,
+    thread_errors: threadErrors.slice(0, 10),
   });
 }
