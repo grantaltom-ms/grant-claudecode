@@ -7,6 +7,7 @@ const TABLES = [
   'digest_items',
   'entities',
   'entity_mentions',
+  'email_attachments',
   'memory_chunks',
   'retrieval_logs'
 ];
