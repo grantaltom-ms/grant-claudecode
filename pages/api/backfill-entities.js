@@ -35,12 +35,17 @@ function safeError(error) {
 }
 
 function parseJsonArray(text) {
+  const normalizedText = text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(normalizedText);
     return Array.isArray(parsed) ? parsed : null;
   } catch {}
 
-  const match = text.match(/\[[\s\S]*\]/);
+  const match = normalizedText.match(/\[[\s\S]*\]/);
   if (!match) return null;
 
   try {
@@ -114,7 +119,7 @@ async function extractEntityCandidates(anthropic, messages) {
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 1800,
+    max_tokens: 4000,
     system: `Extract durable business entities from saved Outlook email previews for Grant Carlson at Milestone Properties.
 
 Return ONLY a valid JSON array. Each item must have:
@@ -131,7 +136,7 @@ Return ONLY a valid JSON array. Each item must have:
 Be conservative but useful. Prefer specific property names, vendor/company names, tenant/person names, invoice/deadline references, insurance items, financial statement requests or reports, projects, and issue types that will help future retrieval.`,
     messages: [{
       role: 'user',
-      content: `Extract entities from these saved email previews:\n\n${extractionInput}`,
+      content: `Extract at most 25 entities from these saved email previews. Return raw JSON only, with no markdown fences:\n\n${extractionInput}`,
     }],
   });
 
