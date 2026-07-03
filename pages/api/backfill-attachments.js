@@ -76,6 +76,15 @@ function decodeBase64Text(contentBytes) {
   }
 }
 
+function sanitizeText(value) {
+  if (value == null) return null;
+  return String(value)
+    .replace(/\u0000/g, '')
+    .replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isTextLikeAttachment(attachment) {
   const contentType = (attachment.contentType || '').toLowerCase();
   const name = (attachment.name || '').toLowerCase();
@@ -142,16 +151,16 @@ async function saveAttachment(message, attachment, contentText) {
       graph_message_id: message.graph_message_id,
       graph_attachment_id: attachment.id,
       owner_email: OWNER_EMAIL,
-      name: attachment.name || null,
-      content_type: attachment.contentType || null,
+      name: sanitizeText(attachment.name),
+      content_type: sanitizeText(attachment.contentType),
       size_bytes: attachment.size || null,
       is_inline: attachment.isInline ?? false,
-      content_text: contentText || null,
+      content_text: sanitizeText(contentText),
       metadata: {
-        odata_type: attachment['@odata.type'] || null,
-        last_modified_date_time: attachment.lastModifiedDateTime || null,
+        odata_type: sanitizeText(attachment['@odata.type']),
+        last_modified_date_time: sanitizeText(attachment.lastModifiedDateTime),
         text_extraction: contentText ? 'text_like_attachment' : 'metadata_only',
-        message_subject: message.subject || null,
+        message_subject: sanitizeText(message.subject),
       },
       updated_at: new Date().toISOString(),
     }, {
