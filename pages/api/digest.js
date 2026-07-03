@@ -331,12 +331,17 @@ function parseJsonObject(text) {
 }
 
 function parseJsonArray(text) {
+  const normalizedText = text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(normalizedText);
     return Array.isArray(parsed) ? parsed : null;
   } catch {}
 
-  const match = text.match(/\[[\s\S]*\]/);
+  const match = normalizedText.match(/\[[\s\S]*\]/);
   if (!match) return null;
 
   try {
@@ -443,39 +448,46 @@ async function saveEntityMention(entityCandidate) {
   return entity;
 }
 
-async function extractEntitiesFromEmails(anthropic, emails) {
-  const maxEmailsForExtraction = 20;
-  const emailsForExtraction = emails.slice(0, maxEmailsForExtraction);
-  if (emailsForExtraction.length === 0) return [];
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
 
-  const extractionInput = emailsForExtraction.map((email, index) => (
-    `${index + 1}. graph_message_id: ${email.id}\n` +
+async function extractEntityCandidatesBatch(anthropic, emails) {
+  if (emails.length === 0) return [];
+
+  const extractionInput = emails.map((email, index) => (
+    `${index + 1}. source_index: ${index}\n` +
+    `graph_message_id: ${email.id}\n` +
     `conversation_id: ${email.conversationId || ''}\n` +
     `from: ${email.from?.emailAddress?.name || ''} <${email.from?.emailAddress?.address || ''}>\n` +
     `subject: ${email.subject || ''}\n` +
-    `preview: ${(email.bodyPreview || '').slice(0, 500)}`
+    `importance: ${email.importance || ''}\n` +
+    `has_attachments: ${email.hasAttachments ?? ''}\n` +
+    `preview: ${(email.bodyPreview || '').slice(0, 600)}`
   )).join('\n\n');
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 1200,
+    max_tokens: 2500,
     system: `Extract durable business entities from Outlook email previews for Grant Carlson at Milestone Properties.
 
 Return ONLY a valid JSON array. Each item must have:
 {
   "entity_type": "property" | "person" | "vendor" | "tenant" | "invoice" | "deadline" | "insurance" | "financial_statement" | "project" | "legal_issue" | "maintenance_issue" | "leasing_issue" | "system" | "other",
   "name": "specific entity name",
-  "graph_message_id": "message id copied exactly from input",
-  "graph_conversation_id": "conversation id copied exactly from input when present",
-  "subject": "email subject",
+  "source_index": 0,
   "context": "brief reason this entity matters",
   "confidence": 0.0
 }
 
-Be conservative. Do not invent names. Prefer specific property names, vendor/company names, tenant/person names, invoice/deadline references, insurance items, financial statement requests or reports, projects, and issue types that will be useful for future retrieval.`,
+Be conservative but useful. Prefer specific property names, vendor/company names, tenant/person names, invoice/deadline references, insurance items, financial statement requests or reports, projects, and issue types that will help future retrieval.`,
     messages: [{
       role: 'user',
-      content: `Extract entities from these email previews:\n\n${extractionInput}`,
+      content: `Extract at most 8 entities from these email previews. Return raw JSON only, with no markdown fences:\n\n${extractionInput}`,
     }],
   });
 
@@ -491,8 +503,35 @@ Be conservative. Do not invent names. Prefer specific property names, vendor/com
     return [];
   }
 
+  return parsed.map(candidate => {
+    const sourceIndex = Number(candidate.source_index);
+    const email = Number.isInteger(sourceIndex) ? emails[sourceIndex] : null;
+    return {
+      ...candidate,
+      graph_message_id: email?.id || null,
+      graph_conversation_id: email?.conversationId || null,
+      subject: email?.subject || null
+    };
+  });
+}
+
+async function extractEntitiesFromEmails(anthropic, emails) {
+  const maxEmailsForExtraction = 20;
+  const emailsForExtraction = emails.slice(0, maxEmailsForExtraction);
+  if (emailsForExtraction.length === 0) return [];
+
+  const candidates = [];
+  for (const batch of chunkArray(emailsForExtraction, 4)) {
+    try {
+      const batchCandidates = await extractEntityCandidatesBatch(anthropic, batch);
+      candidates.push(...batchCandidates);
+    } catch (error) {
+      console.error('Entity extraction batch failed:', { error });
+    }
+  }
+
   const savedEntities = [];
-  for (const entityCandidate of parsed) {
+  for (const entityCandidate of candidates) {
     try {
       const saved = await saveEntityMention(entityCandidate);
       if (saved) savedEntities.push(saved);
