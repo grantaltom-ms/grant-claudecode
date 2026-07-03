@@ -116,7 +116,8 @@ async function extractEntityCandidatesBatch(anthropic, messages) {
   if (messages.length === 0) return [];
 
   const extractionInput = messages.map((message, index) => (
-    `${index + 1}. graph_message_id: ${message.graph_message_id}\n` +
+    `${index + 1}. source_index: ${index}\n` +
+    `graph_message_id: ${message.graph_message_id}\n` +
     `conversation_id: ${message.graph_conversation_id || ''}\n` +
     `from: ${message.sender_name || ''} <${message.sender_email || ''}>\n` +
     `subject: ${message.subject || ''}\n` +
@@ -134,9 +135,7 @@ Return ONLY a valid JSON array. Each item must have:
 {
   "entity_type": "property" | "person" | "vendor" | "tenant" | "invoice" | "deadline" | "insurance" | "financial_statement" | "project" | "legal_issue" | "maintenance_issue" | "leasing_issue" | "system" | "other",
   "name": "specific entity name",
-  "graph_message_id": "message id copied exactly from input",
-  "graph_conversation_id": "conversation id copied exactly from input when present",
-  "subject": "email subject",
+  "source_index": 0,
   "context": "brief reason this entity matters",
   "confidence": 0.0
 }
@@ -158,7 +157,16 @@ Be conservative but useful. Prefer specific property names, vendor/company names
     throw new Error(`Entity extraction returned non-JSON output: ${text.slice(0, 500)}`);
   }
 
-  return parsed;
+  return parsed.map(candidate => {
+    const sourceIndex = Number(candidate.source_index);
+    const message = Number.isInteger(sourceIndex) ? messages[sourceIndex] : null;
+    return {
+      ...candidate,
+      graph_message_id: message?.graph_message_id || null,
+      graph_conversation_id: message?.graph_conversation_id || null,
+      subject: message?.subject || null
+    };
+  });
 }
 
 async function extractEntityCandidates(anthropic, messages) {
