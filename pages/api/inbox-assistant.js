@@ -343,6 +343,67 @@ async function logRetrieval({ query, toolName, resultCount, usedEmbedding, metad
   }
 }
 
+function jsonForLog(value, max = 12000) {
+  try {
+    const json = JSON.stringify(value ?? {});
+    if (json.length <= max) return value ?? {};
+    return {
+      truncated: true,
+      original_length: json.length,
+      preview: json.slice(0, max),
+    };
+  } catch (error) {
+    return {
+      unserializable: true,
+      error: error.message,
+    };
+  }
+}
+
+function firstString(...values) {
+  return values.find(value => typeof value === 'string' && value.trim()) || null;
+}
+
+async function logAgentAction({
+  status,
+  toolName,
+  slackThreadTs,
+  input,
+  result = {},
+  errorMessage = null,
+}) {
+  const { error } = await supabase
+    .from('agent_actions')
+    .insert({
+      owner_email: OWNER_EMAIL,
+      action_type: 'tool_call',
+      status,
+      tool_name: toolName,
+      slack_thread_ts: slackThreadTs || null,
+      graph_message_id: firstString(
+        input?.message_id,
+        input?.id,
+        input?.draft_id,
+        result?.message_id,
+        result?.draft_id,
+        result?.id
+      ),
+      graph_conversation_id: firstString(
+        input?.conversation_id,
+        result?.conversation_id,
+        result?.digest_item?.graph_conversation_id,
+        result?.email?.graph_conversation_id
+      ),
+      input: jsonForLog(input),
+      result: jsonForLog(result),
+      error_message: errorMessage,
+    });
+
+  if (error) {
+    console.error('Agent action log write failed:', { toolName, status, error });
+  }
+}
+
 function buildEntityTypeFilter(entityType) {
   const allowedTypes = new Set([
     'property',
@@ -565,7 +626,7 @@ async function getEntityContext(input) {
   };
 }
 
-async function executeTool(name, input, token, threadTs) {
+async function executeToolInternal(name, input, token, threadTs) {
   const base = `/users/${OWNER_EMAIL}`;
 
   switch (name) {
@@ -720,6 +781,29 @@ async function executeTool(name, input, token, threadTs) {
 
     default:
       throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+async function executeTool(name, input, token, threadTs) {
+  try {
+    const result = await executeToolInternal(name, input, token, threadTs);
+    await logAgentAction({
+      status: 'succeeded',
+      toolName: name,
+      slackThreadTs: threadTs,
+      input,
+      result,
+    });
+    return result;
+  } catch (error) {
+    await logAgentAction({
+      status: 'failed',
+      toolName: name,
+      slackThreadTs: threadTs,
+      input,
+      errorMessage: error.message,
+    });
+    throw error;
   }
 }
 
