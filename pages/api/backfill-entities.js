@@ -104,7 +104,15 @@ async function loadMessages({ days, maxMessages }) {
   return data || [];
 }
 
-async function extractEntityCandidates(anthropic, messages) {
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function extractEntityCandidatesBatch(anthropic, messages) {
   if (messages.length === 0) return [];
 
   const extractionInput = messages.map((message, index) => (
@@ -119,7 +127,7 @@ async function extractEntityCandidates(anthropic, messages) {
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 4000,
+    max_tokens: 2500,
     system: `Extract durable business entities from saved Outlook email previews for Grant Carlson at Milestone Properties.
 
 Return ONLY a valid JSON array. Each item must have:
@@ -136,7 +144,7 @@ Return ONLY a valid JSON array. Each item must have:
 Be conservative but useful. Prefer specific property names, vendor/company names, tenant/person names, invoice/deadline references, insurance items, financial statement requests or reports, projects, and issue types that will help future retrieval.`,
     messages: [{
       role: 'user',
-      content: `Extract at most 25 entities from these saved email previews. Return raw JSON only, with no markdown fences:\n\n${extractionInput}`,
+      content: `Extract at most 8 entities from these saved email previews. Return raw JSON only, with no markdown fences:\n\n${extractionInput}`,
     }],
   });
 
@@ -151,6 +159,15 @@ Be conservative but useful. Prefer specific property names, vendor/company names
   }
 
   return parsed;
+}
+
+async function extractEntityCandidates(anthropic, messages) {
+  const allCandidates = [];
+  for (const batch of chunkArray(messages, 4)) {
+    const candidates = await extractEntityCandidatesBatch(anthropic, batch);
+    allCandidates.push(...candidates);
+  }
+  return allCandidates;
 }
 
 async function saveEntityMention(entityCandidate) {
