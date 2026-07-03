@@ -6,7 +6,9 @@ const TABLES = [
   'digest_runs',
   'digest_items',
   'entities',
-  'entity_mentions'
+  'entity_mentions',
+  'memory_chunks',
+  'retrieval_logs'
 ];
 
 const supabase = createClient(

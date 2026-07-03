@@ -8,6 +8,7 @@ export const config = { api: { bodyParser: false } };
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -214,6 +215,18 @@ const EMAIL_TOOLS = [
     },
   },
   {
+    name: 'search_memory',
+    description: 'Hybrid search across durable memory chunks from email previews/bodies, thread summaries, entities, projects, tasks, decisions, and open loops. Use this first for broad memory questions.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search text, e.g. "Delmont ButterflyMX internet" or "financial statements insurance".' },
+        limit: { type: 'number', description: 'Maximum number of results. Default 8, max 15.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'search_memory_entities',
     description: 'Search durable inbox memory entities such as properties, people, vendors, tenants, invoices, deadlines, insurance, financial statements, projects, and issue types.',
     input_schema: {
@@ -273,6 +286,61 @@ function boundedLimit(limit, fallback = 8, max = 15) {
   const numericLimit = Number(limit);
   if (!Number.isFinite(numericLimit) || numericLimit <= 0) return fallback;
   return Math.min(Math.floor(numericLimit), max);
+}
+
+function truncateText(text, max = 7000) {
+  const normalized = (text || '').replace(/\s+/g, ' ').trim();
+  return normalized.length > max ? normalized.slice(0, max) : normalized;
+}
+
+function embeddingToSqlVector(embedding) {
+  return embedding?.length ? `[${embedding.join(',')}]` : null;
+}
+
+async function createEmbedding(text) {
+  if (!process.env.OPENAI_API_KEY) return null;
+  const input = truncateText(text);
+  if (!input) return null;
+
+  const response = await fetch('https://api.openai.com/v1/embeddings', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: EMBEDDING_MODEL,
+      input,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    console.error('Memory search embedding failed:', {
+      status: response.status,
+      error: data?.error?.message || data,
+    });
+    return null;
+  }
+
+  return data.data?.[0]?.embedding || null;
+}
+
+async function logRetrieval({ query, toolName, resultCount, usedEmbedding, metadata = {} }) {
+  const { error } = await supabase
+    .from('retrieval_logs')
+    .insert({
+      owner_email: OWNER_EMAIL,
+      query,
+      tool_name: toolName,
+      result_count: resultCount,
+      used_embedding: usedEmbedding,
+      metadata,
+    });
+
+  if (error) {
+    console.error('Retrieval log write failed:', { query, toolName, error });
+  }
 }
 
 function buildEntityTypeFilter(entityType) {
@@ -388,6 +456,39 @@ async function searchMemoryEntities(input) {
     query,
     entity_type: entityType,
     results: data || [],
+  };
+}
+
+async function searchMemory(input) {
+  const query = normalizeSearchTerm(input.query);
+  if (!query) throw new Error('Search query is required.');
+
+  const limit = boundedLimit(input.limit);
+  const embedding = await createEmbedding(query);
+  const { data, error } = await supabase.rpc('search_memory_chunks', {
+    p_owner_email: OWNER_EMAIL,
+    p_query: query,
+    p_query_embedding: embeddingToSqlVector(embedding),
+    p_match_count: limit,
+  });
+
+  if (error) throw new Error(`Hybrid memory search failed: ${error.message}`);
+
+  const results = data || [];
+  await logRetrieval({
+    query,
+    toolName: 'search_memory',
+    resultCount: results.length,
+    usedEmbedding: Boolean(embedding),
+    metadata: {
+      embedding_model: embedding ? EMBEDDING_MODEL : null,
+    },
+  });
+
+  return {
+    query,
+    mode: embedding ? 'hybrid_vector_keyword' : 'keyword_full_text',
+    results,
   };
 }
 
@@ -601,6 +702,10 @@ async function executeTool(name, input, token, threadTs) {
       return updateDigestItemStatus(threadTs, input.item_number, input.action_status);
     }
 
+    case 'search_memory': {
+      return searchMemory(input);
+    }
+
     case 'search_memory_entities': {
       return searchMemoryEntities(input);
     }
@@ -682,7 +787,7 @@ RULES:
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
 - When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules
-- For questions about prior context, latest status, open items, properties, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search memory first using search_memory_entities and/or search_thread_memory.
+- For questions about prior context, latest status, open items, properties, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_memory first. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
 - When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
 
