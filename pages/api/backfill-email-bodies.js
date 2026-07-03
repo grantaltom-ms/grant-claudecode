@@ -106,7 +106,7 @@ function extractBodyFields(email) {
 async function loadMessagesNeedingBodies(maxMessages) {
   const { data, error } = await supabase
     .from('email_messages')
-    .select('id, graph_message_id, subject, received_at')
+    .select('id, graph_message_id, subject, received_at, body_preview')
     .eq('owner_email', OWNER_EMAIL)
     .is('body_text', null)
     .order('received_at', { ascending: false })
@@ -134,6 +134,23 @@ async function saveBodyFields(memoryMessage, graphMessage) {
 
   if (error) return { ok: false, error };
   return { ok: true, saved_body: Boolean(bodyFields.body_text || bodyFields.body_html) };
+}
+
+async function markBodyUnavailable(memoryMessage, reason) {
+  const { error } = await supabase
+    .from('email_messages')
+    .update({
+      body_text: memoryMessage.body_preview || '[Body unavailable from Microsoft Graph]',
+      raw_graph_payload: {
+        body_unavailable_at: new Date().toISOString(),
+        body_unavailable_reason: reason,
+      },
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', memoryMessage.id);
+
+  if (error) return { ok: false, error };
+  return { ok: true };
 }
 
 export default async function handler(req, res) {
@@ -168,11 +185,25 @@ export default async function handler(req, res) {
           });
         }
       } catch (error) {
-        errors.push({
-          graph_message_id: memoryMessage.graph_message_id,
-          subject: memoryMessage.subject,
-          message: error.message,
-        });
+        if (error.message.includes('object was not found in the store')) {
+          const marked = await markBodyUnavailable(memoryMessage, error.message);
+          if (marked.ok) {
+            updated += 1;
+          } else {
+            errors.push({
+              graph_message_id: memoryMessage.graph_message_id,
+              subject: memoryMessage.subject,
+              message: marked.error?.message,
+              code: marked.error?.code,
+            });
+          }
+        } else {
+          errors.push({
+            graph_message_id: memoryMessage.graph_message_id,
+            subject: memoryMessage.subject,
+            message: error.message,
+          });
+        }
       }
     }
 
