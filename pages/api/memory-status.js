@@ -9,7 +9,12 @@ const TABLES = [
   'entity_mentions',
   'email_attachments',
   'memory_chunks',
-  'retrieval_logs'
+  'retrieval_logs',
+  'memory_projects',
+  'decisions',
+  'commitments',
+  'open_loops',
+  'agent_actions'
 ];
 
 const supabase = createClient(
