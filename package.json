@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "smoke:memory": "node scripts/smoke-memory-status.mjs",
     "start": "next start"
   },
   "dependencies": {

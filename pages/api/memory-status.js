@@ -52,6 +52,56 @@ async function tableCount(table) {
   return { table, ok: true, count };
 }
 
+async function scalarStatus() {
+  const [
+    bodyCounts,
+    attachmentCounts,
+    chunkCounts,
+    latestDigest,
+    latestOperationalCounts
+  ] = await Promise.all([
+    supabase
+      .from('email_messages')
+      .select('id, body_text, body_html', { count: 'exact' })
+      .not('body_text', 'is', null),
+    supabase
+      .from('email_attachments')
+      .select('id, content_text', { count: 'exact' })
+      .not('content_text', 'is', null),
+    supabase
+      .from('memory_chunks')
+      .select('id, embedding', { count: 'exact' })
+      .not('embedding', 'is', null),
+    supabase
+      .from('digest_runs')
+      .select('run_started_at, run_completed_at, total_emails, saved_emails, included_count, archived_count, status, metadata')
+      .order('run_started_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    Promise.all([
+      supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
+      supabase.from('decisions').select('id', { count: 'exact', head: true }),
+      supabase.from('commitments').select('id', { count: 'exact', head: true }).eq('status', 'open'),
+      supabase.from('open_loops').select('id', { count: 'exact', head: true }).in('status', ['open', 'waiting']),
+    ])
+  ]);
+
+  return {
+    embeddings_enabled: Boolean(process.env.OPENAI_API_KEY),
+    auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
+    messages_with_body_text: bodyCounts.count || 0,
+    attachments_with_text: attachmentCounts.count || 0,
+    embedded_memory_chunks: chunkCounts.count || 0,
+    latest_digest: latestDigest.data || null,
+    operational_memory: {
+      projects: latestOperationalCounts[0].count || 0,
+      decisions: latestOperationalCounts[1].count || 0,
+      open_commitments: latestOperationalCounts[2].count || 0,
+      open_loops: latestOperationalCounts[3].count || 0,
+    }
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).end();
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
@@ -62,11 +112,15 @@ export default async function handler(req, res) {
     });
   }
 
-  const tables = await Promise.all(TABLES.map(tableCount));
+  const [tables, health] = await Promise.all([
+    Promise.all(TABLES.map(tableCount)),
+    scalarStatus()
+  ]);
 
   return res.status(200).json({
     ok: true,
     supabase_project_ref: projectRefFromUrl(),
-    tables
+    tables,
+    health
   });
 }
