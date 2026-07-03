@@ -791,16 +791,20 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   });
 
   let archivedCount = 0;
+  let filteredSpamCount = 0;
   let filteredEmails = emails;
   try {
     const spamIndices = JSON.parse(spamResponse.content[0].text.trim());
     if (Array.isArray(spamIndices) && spamIndices.length > 0) {
-      const archivePromises = spamIndices.map(i => {
-        if (emails[i]) return archiveEmail(token, emails[i].id);
-        return Promise.resolve(false);
-      });
-      const results = await Promise.all(archivePromises);
-      archivedCount = results.filter(Boolean).length;
+      filteredSpamCount = spamIndices.filter(i => emails[i]).length;
+      if (process.env.AUTO_ARCHIVE_SPAM === 'true') {
+        const archivePromises = spamIndices.map(i => {
+          if (emails[i]) return archiveEmail(token, emails[i].id);
+          return Promise.resolve(false);
+        });
+        const results = await Promise.all(archivePromises);
+        archivedCount = results.filter(Boolean).length;
+      }
       const spamSet = new Set(spamIndices);
       filteredEmails = emails.filter((_, i) => !spamSet.has(i));
     }
@@ -809,7 +813,11 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   }
 
   if (filteredEmails.length === 0) {
-    const archivedNote = archivedCount > 0 ? ` (${archivedCount} spam emails auto-archived)` : '';
+    const archivedNote = archivedCount > 0
+      ? ` (${archivedCount} spam emails auto-archived)`
+      : filteredSpamCount > 0
+        ? ` (${filteredSpamCount} suspected spam/noise emails filtered but not archived)`
+        : '';
     const digestTs = await slackPost(`*Morning Digest* — No actionable emails in the last 24 hours.${archivedNote} ✅`);
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
@@ -817,7 +825,11 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
       included_count: 0,
       actionable_count: 0,
       archived_count: archivedCount,
-      status: 'no_actionable'
+      status: 'no_actionable',
+      metadata: {
+        filtered_spam_count: filteredSpamCount,
+        auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true'
+      }
     });
     return;
   }
@@ -903,6 +915,8 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
 
   if (archivedCount > 0) {
     digest += `\n_🗑️ ${archivedCount} spam email${archivedCount > 1 ? 's' : ''} auto-archived_`;
+  } else if (filteredSpamCount > 0) {
+    digest += `\n_🧹 ${filteredSpamCount} suspected spam/noise email${filteredSpamCount > 1 ? 's' : ''} filtered from this digest; not archived_`;
   }
 
   const digestTs = await slackPost(digest);
@@ -911,7 +925,11 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     run_completed_at: new Date().toISOString(),
     included_count: filteredEmails.length,
     archived_count: archivedCount,
-    status: 'posted'
+    status: 'posted',
+    metadata: {
+      filtered_spam_count: filteredSpamCount,
+      auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true'
+    }
   });
 
   await slackPost(
