@@ -257,13 +257,13 @@ async function loadEntityChunks(limit) {
   }));
 }
 
-async function loadEmailPreviewChunks(limit) {
+async function loadEmailPreviewChunks(limit, offset = 0) {
   const { data, error } = await supabase
     .from('email_messages')
     .select('id, graph_message_id, graph_conversation_id, subject, sender_name, sender_email, received_at, body_preview, body_text, importance, has_attachments, updated_at')
     .eq('owner_email', OWNER_EMAIL)
     .order('received_at', { ascending: false })
-    .limit(limit);
+    .range(offset, offset + limit - 1);
 
   if (error) throw new Error(`Email chunk load failed: ${error.message}`);
 
@@ -317,12 +317,20 @@ export default async function handler(req, res) {
 
   try {
     const missingLimit = boundedInteger(req.query.missing, 0, 500);
+    const scope = req.query.scope || 'all';
+    const emailOffset = boundedInteger(req.query.email_offset, 0, 10000);
     const chunks = missingLimit > 0
       ? await loadMissingEmbeddingChunks(missingLimit)
       : [
-        ...await loadThreadChunks(boundedInteger(req.query.threads, 50, 500)),
-        ...await loadEntityChunks(boundedInteger(req.query.entities, 100, 1000)),
-        ...await loadEmailPreviewChunks(boundedInteger(req.query.emails, 50, 500)),
+        ...(scope === 'all' || scope === 'threads'
+          ? await loadThreadChunks(boundedInteger(req.query.threads, 50, 500))
+          : []),
+        ...(scope === 'all' || scope === 'entities'
+          ? await loadEntityChunks(boundedInteger(req.query.entities, 100, 1000))
+          : []),
+        ...(scope === 'all' || scope === 'emails'
+          ? await loadEmailPreviewChunks(boundedInteger(req.query.emails, 50, 500), emailOffset)
+          : []),
       ];
 
     const writeChunk = missingLimit > 0 ? embedExistingChunk : upsertChunk;
@@ -362,6 +370,8 @@ export default async function handler(req, res) {
       ok: errors.length === 0,
       supabase_project_ref: projectRefFromUrl(),
       mode: missingLimit > 0 ? 'missing_embeddings' : 'source_rebuild',
+      scope: missingLimit > 0 ? null : scope,
+      email_offset: scope === 'all' || scope === 'emails' ? emailOffset : null,
       chunks_considered: chunks.length,
       saved_chunks: saved,
       embedded_chunks: embedded,
