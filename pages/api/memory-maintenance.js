@@ -41,25 +41,54 @@ async function callTask(req, task) {
   };
 }
 
+const TASKS = [
+  { name: 'backfill_inbox', path: '/api/backfill-inbox?days=3&max=50' },
+  { name: 'email_bodies', path: '/api/backfill-email-bodies?max=50' },
+  { name: 'attachments', path: '/api/backfill-attachments?max=25' },
+  { name: 'entities', path: '/api/backfill-entities?days=7&max=10' },
+  { name: 'operational_memory', path: '/api/backfill-operational-memory?threads=5' },
+  { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
+];
+
+function dayOfYear(date = new Date()) {
+  const start = Date.UTC(date.getUTCFullYear(), 0, 0);
+  const today = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+  return Math.floor((today - start) / 86_400_000);
+}
+
+function selectedTasks(req) {
+  if (req.query.all === '1') return TASKS;
+
+  const requestedTask = req.query.task;
+  if (requestedTask) {
+    const task = TASKS.find(candidate => candidate.name === requestedTask);
+    return task ? [task] : [];
+  }
+
+  return [TASKS[dayOfYear() % TASKS.length]];
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
 
-  const tasks = [
-    { name: 'backfill_inbox', path: '/api/backfill-inbox?days=3&max=75' },
-    { name: 'email_bodies', path: '/api/backfill-email-bodies?max=100' },
-    { name: 'attachments', path: '/api/backfill-attachments?max=50' },
-    { name: 'entities', path: '/api/backfill-entities?days=7&max=20' },
-    { name: 'operational_memory', path: '/api/backfill-operational-memory?threads=12' },
-    { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
-  ];
+  const tasks = selectedTasks(req);
+  if (!tasks.length) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Unknown maintenance task.',
+      available_tasks: TASKS.map(task => task.name),
+    });
+  }
 
   if (req.query.dry_run === '1') {
     return res.status(200).json({
       ok: true,
       dry_run: true,
       supabase_project_ref: projectRefFromUrl(),
+      mode: req.query.all === '1' ? 'all' : (req.query.task ? 'single' : 'rotating_daily'),
       tasks,
+      available_tasks: TASKS.map(task => task.name),
     });
   }
 
@@ -82,6 +111,7 @@ export default async function handler(req, res) {
   return res.status(200).json({
     ok: results.every(result => result.ok),
     supabase_project_ref: projectRefFromUrl(),
+    mode: req.query.all === '1' ? 'all' : (req.query.task ? 'single' : 'rotating_daily'),
     results,
   });
 }
