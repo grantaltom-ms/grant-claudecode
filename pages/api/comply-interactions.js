@@ -1,9 +1,6 @@
 // pages/api/comply-interactions.js
-// Handles Slack Block Kit interactive button payloads for the Comply-or-Vacate bot.
-// Slack sends these as application/x-www-form-urlencoded with a JSON "payload" field.
-//
-// Interactions URL to set in Slack App config:
-//   https://inbox-assistant-one.vercel.app/api/comply-interactions
+// Handles Slack Block Kit interaction payloads (button clicks) for the Comply-or-Vacate bot.
+// Slack sends application/x-www-form-urlencoded with a `payload` JSON field.
 
 import { waitUntil } from '@vercel/functions';
 import {
@@ -13,19 +10,14 @@ import {
   slackUpdateMessage,
   getThreadHistory,
   getBotUserId,
+  generateNoticePdf,
+  uploadPdfToSlack,
   loadState,
   saveState,
   runAgent,
-  generateNoticePdf,
-  uploadPdfToSlack,
 } from '../../lib/comply-agent.js';
-import {
-  buildChoiceBlocks,
-  buildApprovalBlocks,
-  buildConversationHistory,
-} from '../../lib/comply-blocks.js';
+import { buildChoiceBlocks, buildApprovalBlocks, buildConversationHistory } from '../../lib/comply-blocks.js';
 
-// Disable Next.js body parser — we need the raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
 
 async function getRawBody(req) {
@@ -37,13 +29,37 @@ async function getRawBody(req) {
   });
 }
 
-// Shared helper: rebuild history, run agent, post response with blocks
-async function handleAgentRun({ channelId, threadTs, userChoice, skipMessageTs }) {
-  const botUserId = await getBotUserId();
-  const state = await loadState(threadTs);
-  const threadMessages = await getThreadHistory(COMPLY_CHANNEL_ID, threadTs);
+function parseJson(value, fallback = {}) {
+  try {
+    return JSON.parse(value || '{}');
+  } catch {
+    return fallback;
+  }
+}
+
+async function maybeUploadCompletedNotice(state, threadTs) {
+  if (!state?.section1 || !state?.section2 || !state?.section3) return;
+
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const lastName = (state.tenantName || 'Tenant').split(/[\s,]+/).filter(Boolean).pop();
+    const pdfFilename = `${today} - ${state.propertyName || 'Property'} Unit ${state.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
+    const pdfBuffer = await generateNoticePdf(state);
+    await uploadPdfToSlack(pdfBuffer, pdfFilename, threadTs);
+  } catch (pdfErr) {
+    console.error('PDF error in comply-interactions:', pdfErr);
+  }
+}
+
+async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
+  const [botUserId, state, threadMessages] = await Promise.all([
+    getBotUserId(),
+    loadState(threadTs),
+    getThreadHistory(COMPLY_CHANNEL_ID, threadTs),
+  ]);
 
   const conversationHistory = buildConversationHistory(threadMessages, botUserId, skipMessageTs);
+  await slackPost(COMPLY_CHANNEL_ID, '_On it..._', threadTs);
 
   const { text: agentResponse, tenantData, sectionApprovals } = await runAgent(
     userChoice,
@@ -51,13 +67,11 @@ async function handleAgentRun({ channelId, threadTs, userChoice, skipMessageTs }
     state
   );
 
-  let newState = state || {};
+  const newState = state || {};
   if (tenantData) Object.assign(newState, tenantData);
   for (const { section_number, content } of sectionApprovals) {
     newState[`section${section_number}`] = content;
   }
-
-  const allSectionsApproved = newState.section1 && newState.section2 && newState.section3;
 
   const blocks =
     buildApprovalBlocks(agentResponse, threadTs) ??
@@ -68,17 +82,7 @@ async function handleAgentRun({ channelId, threadTs, userChoice, skipMessageTs }
     saveState(threadTs, newState),
   ]);
 
-  if (allSectionsApproved) {
-    try {
-      const today = new Date().toISOString().split('T')[0];
-      const lastName = (newState.tenantName || 'Tenant').split(/[\s,]+/).filter(Boolean).pop();
-      const pdfFilename = `${today} - ${newState.propertyName || 'Property'} Unit ${newState.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
-      const pdfBuffer = await generateNoticePdf(newState);
-      await uploadPdfToSlack(pdfBuffer, pdfFilename, threadTs);
-    } catch (pdfErr) {
-      console.error('comply-interactions PDF error:', pdfErr);
-    }
-  }
+  await maybeUploadCompletedNotice(newState, threadTs);
 }
 
 export default async function handler(req, res) {
@@ -90,102 +94,73 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
-  // Slack sends payload as url-encoded JSON string
-  const payload = JSON.parse(new URLSearchParams(rawBody).get('payload') || '{}');
+  const payload = parseJson(new URLSearchParams(rawBody).get('payload'));
 
   if (payload.type !== 'block_actions') return res.status(200).end();
 
   const action = payload.actions?.[0];
   if (!action) return res.status(200).end();
 
-  // Acknowledge immediately — Slack requires a response within 3 seconds
+  // Acknowledge immediately — Slack requires a 200 within 3 seconds
   res.status(200).end();
-
-  const channelId = payload.channel?.id;
-  const messageTs = payload.message?.ts;
-  const threadTs = payload.message?.thread_ts || messageTs;
-  const userName = payload.user?.name || payload.user?.username || 'manager';
 
   waitUntil(
     (async () => {
       try {
+        const channelId = payload.channel?.id;
+        const messageTs = payload.message?.ts;
+        const threadTs = payload.message?.thread_ts || messageTs;
+        const userName = payload.user?.name || payload.user?.username || 'manager';
+
+        // ── comply_choice: manager clicked a numbered option button ────────────
         if (action.action_id === 'comply_choice') {
-          // ── User clicked a choice button ──────────────────────────────────
-          const { choiceText, threadTs: payloadThread } = JSON.parse(action.value || '{}');
-          const resolvedThread = payloadThread || threadTs;
+          const { choiceText, threadTs: payloadThreadTs } = parseJson(action.value);
+          const resolvedThread = payloadThreadTs || threadTs;
 
-          // Collapse buttons and show what was selected
-          await slackUpdateMessage(
-            channelId,
-            messageTs,
-            `✅ *${userName}* selected: _${choiceText}_`
-          );
-
-          // Post a [USER_CHOICE] marker so future history rebuilds treat this as a user message
+          await slackUpdateMessage(channelId, messageTs, `✅ *${userName}* selected: ${choiceText}`, null);
           await slackPost(COMPLY_CHANNEL_ID, `[USER_CHOICE] ${choiceText}`, resolvedThread);
 
-          await slackPost(COMPLY_CHANNEL_ID, '_On it..._', resolvedThread);
-
           await handleAgentRun({
-            channelId,
             threadTs: resolvedThread,
             userChoice: choiceText,
             skipMessageTs: messageTs,
           });
 
+        // ── comply_approve: manager approved a section draft ──────────────────
         } else if (action.action_id === 'comply_approve') {
-          // ── User clicked Approve on a section draft ───────────────────────
-          const { threadTs: payloadThread } = JSON.parse(action.value || '{}');
-          const resolvedThread = payloadThread || threadTs;
+          const { threadTs: payloadThreadTs } = parseJson(action.value);
+          const resolvedThread = payloadThreadTs || threadTs;
 
-          // Collapse buttons and mark as approved
-          await slackUpdateMessage(
-            channelId,
-            messageTs,
-            `✅ *${userName}* approved this section.`
-          );
-
-          // Post [USER_CHOICE] marker for history
-          await slackPost(COMPLY_CHANNEL_ID, '[USER_CHOICE] ✅ Approved', resolvedThread);
-
-          await slackPost(COMPLY_CHANNEL_ID, '_On it..._', resolvedThread);
+          await slackUpdateMessage(channelId, messageTs, `✅ *${userName}* approved this section.`, null);
+          await slackPost(COMPLY_CHANNEL_ID, `[USER_CHOICE] ✅ Approved`, resolvedThread);
 
           await handleAgentRun({
-            channelId,
             threadTs: resolvedThread,
             userChoice: '✅ Approved',
             skipMessageTs: messageTs,
           });
 
+        // ── comply_revise: manager wants to request changes ──────────────────
         } else if (action.action_id === 'comply_revise') {
-          // ── User clicked Request changes ──────────────────────────────────
-          const { threadTs: payloadThread } = JSON.parse(action.value || '{}');
-          const resolvedThread = payloadThread || threadTs;
+          const { threadTs: payloadThreadTs } = parseJson(action.value);
+          const resolvedThread = payloadThreadTs || threadTs;
 
-          // Collapse buttons
-          await slackUpdateMessage(
-            channelId,
-            messageTs,
-            `✏️ *${userName}* is requesting changes.`
-          );
-
-          // Prompt the user to type their changes — no agent run needed
+          await slackUpdateMessage(channelId, messageTs, `✏️ *${userName}* is requesting changes.`, null);
           await slackPost(
             COMPLY_CHANNEL_ID,
-            '✏️ Sure — please type your requested changes directly in this thread and I\'ll revise the section.',
+            `✏️ Sure — please type your requested changes directly in this thread.`,
             resolvedThread
           );
         }
       } catch (err) {
         console.error('comply-interactions error:', err);
-        try {
+        const fallbackThreadTs = payload.message?.thread_ts || payload.message?.ts;
+        if (fallbackThreadTs) {
           await slackPost(
             COMPLY_CHANNEL_ID,
             `⚠️ Something went wrong handling that action: ${err.message}`,
-            threadTs
+            fallbackThreadTs
           );
-        } catch (_) {
-          // ignore secondary error
         }
       }
     })()
