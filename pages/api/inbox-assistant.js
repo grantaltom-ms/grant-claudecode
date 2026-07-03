@@ -297,6 +297,31 @@ function embeddingToSqlVector(embedding) {
   return embedding?.length ? `[${embedding.join(',')}]` : null;
 }
 
+function isMissingRpcError(error) {
+  return error?.code === 'PGRST202';
+}
+
+function memorySearchTerms(query) {
+  return normalizeSearchTerm(query)
+    .toLowerCase()
+    .split(/\s+/)
+    .map(term => term.replace(/[^a-z0-9@.-]/g, ''))
+    .filter(term => term.length > 2)
+    .slice(0, 8);
+}
+
+function scoreMemoryChunk(row, terms) {
+  const title = (row.title || '').toLowerCase();
+  const text = (row.chunk_text || '').toLowerCase();
+  const summary = (row.chunk_summary || '').toLowerCase();
+  return terms.reduce((score, term) => {
+    if (title.includes(term)) return score + 3;
+    if (summary.includes(term)) return score + 2;
+    if (text.includes(term)) return score + 1;
+    return score;
+  }, 0);
+}
+
 async function createEmbedding(text) {
   if (!process.env.OPENAI_API_KEY) return null;
   const input = truncateText(text);
@@ -526,31 +551,71 @@ async function searchMemory(input) {
 
   const limit = boundedLimit(input.limit);
   const embedding = await createEmbedding(query);
-  const { data, error } = await supabase.rpc('search_memory_chunks', {
+  const { data, error } = await supabase.rpc('search_memory_chunks_api', {
     p_owner_email: OWNER_EMAIL,
     p_query: query,
-    p_query_embedding: embeddingToSqlVector(embedding),
+    p_query_embedding_text: embeddingToSqlVector(embedding),
     p_match_count: limit,
   });
 
-  if (error) throw new Error(`Hybrid memory search failed: ${error.message}`);
+  if (error && !isMissingRpcError(error)) {
+    throw new Error(`Hybrid memory search failed: ${error.message}`);
+  }
 
-  const results = data || [];
+  const fallbackResults = error ? await searchMemoryByKeyword(query, limit) : null;
+  const results = fallbackResults || data || [];
+
   await logRetrieval({
     query,
     toolName: 'search_memory',
     resultCount: results.length,
-    usedEmbedding: Boolean(embedding),
+    usedEmbedding: Boolean(embedding && !fallbackResults),
     metadata: {
-      embedding_model: embedding ? EMBEDDING_MODEL : null,
+      embedding_model: embedding && !fallbackResults ? EMBEDDING_MODEL : null,
+      mode: fallbackResults ? 'direct_keyword_fallback' : 'rpc',
     },
   });
 
   return {
     query,
-    mode: embedding ? 'hybrid_vector_keyword' : 'keyword_full_text',
+    mode: fallbackResults
+      ? 'direct_keyword_fallback'
+      : (embedding ? 'hybrid_vector_keyword' : 'keyword_full_text'),
     results,
   };
+}
+
+async function searchMemoryByKeyword(query, limit) {
+  const terms = memorySearchTerms(query);
+  if (!terms.length) return [];
+
+  let memoryQuery = supabase
+    .from('memory_chunks')
+    .select('id, source_type, source_table, source_pk, graph_message_id, graph_conversation_id, title, chunk_text, chunk_summary, metadata, created_at, updated_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .limit(Math.max(limit * 6, 30));
+
+  for (const term of terms.slice(0, 5)) {
+    const escapedTerm = escapeIlike(term);
+    memoryQuery = memoryQuery.or(`title.ilike.%${escapedTerm}%,chunk_text.ilike.%${escapedTerm}%,chunk_summary.ilike.%${escapedTerm}%`);
+  }
+
+  const { data, error } = await memoryQuery;
+  if (error) throw new Error(`Direct memory search failed: ${error.message}`);
+
+  return (data || [])
+    .map(row => ({
+      ...row,
+      keyword_score: scoreMemoryChunk(row, terms),
+      vector_score: null,
+      combined_score: scoreMemoryChunk(row, terms),
+    }))
+    .filter(row => row.combined_score > 0)
+    .sort((a, b) => {
+      if (b.combined_score !== a.combined_score) return b.combined_score - a.combined_score;
+      return new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at);
+    })
+    .slice(0, limit);
 }
 
 async function searchThreadMemory(input) {
