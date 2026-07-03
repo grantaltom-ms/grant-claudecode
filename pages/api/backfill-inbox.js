@@ -56,6 +56,42 @@ async function graph(token, pathOrUrl) {
   return json;
 }
 
+function htmlToText(html = '') {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractBodyFields(email) {
+  const body = email.body || {};
+  const content = body.content || null;
+  const contentType = (body.contentType || '').toLowerCase();
+
+  if (!content) return { body_text: null, body_html: null };
+  if (contentType === 'html') {
+    return {
+      body_text: htmlToText(content),
+      body_html: content
+    };
+  }
+
+  return {
+    body_text: content,
+    body_html: null
+  };
+}
+
 function collectEmailAddresses(recipients = []) {
   return recipients
     .map(recipient => recipient.emailAddress?.address)
@@ -70,6 +106,7 @@ function collectEmailNames(recipients = []) {
 
 async function saveEmailToMemory(email) {
   const sender = email.from?.emailAddress || {};
+  const bodyFields = extractBodyFields(email);
 
   const { data, error } = await supabase
     .from('email_messages')
@@ -90,6 +127,8 @@ async function saveEmailToMemory(email) {
       is_read: email.isRead ?? null,
       has_attachments: email.hasAttachments ?? false,
       body_preview: email.bodyPreview || null,
+      body_text: bodyFields.body_text,
+      body_html: bodyFields.body_html,
       raw_graph_payload: email,
       updated_at: new Date().toISOString()
     }, {
@@ -250,7 +289,7 @@ export default async function handler(req, res) {
   const maxMessages = boundedInteger(req.query.max, 250, 1000);
   const token = await getGraphToken();
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const select = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,bodyPreview,importance,hasAttachments';
+  const select = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments';
 
   let url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
     + `?$top=50`

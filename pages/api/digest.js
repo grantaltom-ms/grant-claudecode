@@ -88,8 +88,45 @@ async function slackPost(text, threadTs = null) {
 
 // --- Digest logic ---
 
+function htmlToText(html = '') {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractBodyFields(email) {
+  const body = email.body || {};
+  const content = body.content || null;
+  const contentType = (body.contentType || '').toLowerCase();
+
+  if (!content) return { body_text: null, body_html: null };
+  if (contentType === 'html') {
+    return {
+      body_text: htmlToText(content),
+      body_html: content
+    };
+  }
+
+  return {
+    body_text: content,
+    body_html: null
+  };
+}
+
 async function saveEmailToMemory(email) {
   const sender = email.from?.emailAddress || {};
+  const bodyFields = extractBodyFields(email);
 
   const { data, error } = await supabase
     .from('email_messages')
@@ -116,6 +153,8 @@ async function saveEmailToMemory(email) {
       has_attachments: email.hasAttachments ?? false,
 
       body_preview: email.bodyPreview || null,
+      body_text: bodyFields.body_text,
+      body_html: bodyFields.body_html,
       raw_graph_payload: email,
       updated_at: new Date().toISOString()
     }, {
@@ -673,7 +712,7 @@ async function runDigest() {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
     + `?$top=50`
-    + `&$select=id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,bodyPreview,importance,hasAttachments`
+    + `&$select=id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments`
     + `&$filter=receivedDateTime ge ${since}`
     + `&$orderby=receivedDateTime desc`;
 
