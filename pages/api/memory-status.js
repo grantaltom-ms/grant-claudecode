@@ -58,6 +58,9 @@ async function scalarStatus() {
     attachmentCounts,
     chunkCounts,
     latestDigest,
+    latestRetrieval,
+    latestAgentAction,
+    latestFailedAgentAction,
     latestOperationalCounts
   ] = await Promise.all([
     supabase
@@ -78,6 +81,25 @@ async function scalarStatus() {
       .order('run_started_at', { ascending: false })
       .limit(1)
       .maybeSingle(),
+    supabase
+      .from('retrieval_logs')
+      .select('created_at, query, tool_name, result_count, used_embedding, metadata')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from('agent_actions')
+      .select('created_at, action_type, status, tool_name, slack_thread_ts, graph_message_id, graph_conversation_id, error_message')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from('agent_actions')
+      .select('created_at, action_type, status, tool_name, slack_thread_ts, error_message')
+      .eq('status', 'failed')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
     Promise.all([
       supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
       supabase.from('decisions').select('id', { count: 'exact', head: true }),
@@ -93,6 +115,9 @@ async function scalarStatus() {
     attachments_with_text: attachmentCounts.count || 0,
     embedded_memory_chunks: chunkCounts.count || 0,
     latest_digest: latestDigest.data || null,
+    latest_retrieval: latestRetrieval.data || null,
+    latest_agent_action: latestAgentAction.data || null,
+    latest_failed_agent_action: latestFailedAgentAction.data || null,
     operational_memory: {
       projects: latestOperationalCounts[0].count || 0,
       decisions: latestOperationalCounts[1].count || 0,

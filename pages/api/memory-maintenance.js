@@ -1,0 +1,87 @@
+function verifyCronRequest(req) {
+  return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
+}
+
+function projectRefFromUrl() {
+  try {
+    return new URL(process.env.SUPABASE_URL).hostname.split('.')[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function baseUrl(req) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  return `${proto}://${host}`;
+}
+
+async function callTask(req, task) {
+  const startedAt = Date.now();
+  const response = await fetch(`${baseUrl(req)}${task.path}`, {
+    headers: {
+      Authorization: `Bearer ${process.env.CRON_SECRET}`,
+    },
+  });
+  const text = await response.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { raw: text.slice(0, 1000) };
+  }
+
+  return {
+    name: task.name,
+    path: task.path,
+    ok: response.ok && body?.ok !== false,
+    status: response.status,
+    duration_ms: Date.now() - startedAt,
+    body,
+  };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
+  if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+
+  const tasks = [
+    { name: 'backfill_inbox', path: '/api/backfill-inbox?days=3&max=75' },
+    { name: 'email_bodies', path: '/api/backfill-email-bodies?max=100' },
+    { name: 'attachments', path: '/api/backfill-attachments?max=50' },
+    { name: 'entities', path: '/api/backfill-entities?days=7&max=20' },
+    { name: 'operational_memory', path: '/api/backfill-operational-memory?threads=12' },
+    { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
+  ];
+
+  if (req.query.dry_run === '1') {
+    return res.status(200).json({
+      ok: true,
+      dry_run: true,
+      supabase_project_ref: projectRefFromUrl(),
+      tasks,
+    });
+  }
+
+  const results = [];
+  for (const task of tasks) {
+    try {
+      results.push(await callTask(req, task));
+    } catch (error) {
+      results.push({
+        name: task.name,
+        path: task.path,
+        ok: false,
+        status: null,
+        duration_ms: null,
+        error: error.message,
+      });
+    }
+  }
+
+  return res.status(200).json({
+    ok: results.every(result => result.ok),
+    supabase_project_ref: projectRefFromUrl(),
+    results,
+  });
+}
