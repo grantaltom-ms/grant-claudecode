@@ -115,9 +115,26 @@ async function loadMessagesWithAttachments(maxMessages) {
   return data || [];
 }
 
-async function saveAttachment(message, attachment) {
-  const shouldExtractText = isTextLikeAttachment(attachment) && (attachment.size || 0) <= 250_000;
-  const contentText = shouldExtractText ? decodeBase64Text(attachment.contentBytes) : null;
+async function loadAttachmentContent(token, message, attachment) {
+  if (!isTextLikeAttachment(attachment) || (attachment.size || 0) > 250_000) return null;
+
+  try {
+    const fullAttachment = await graph(
+      token,
+      `/users/${OWNER_EMAIL}/messages/${message.graph_message_id}/attachments/${attachment.id}`
+    );
+    return decodeBase64Text(fullAttachment.contentBytes);
+  } catch (error) {
+    console.error('Attachment content extraction failed:', {
+      graph_message_id: message.graph_message_id,
+      attachment_id: attachment.id,
+      error,
+    });
+    return null;
+  }
+}
+
+async function saveAttachment(message, attachment, contentText) {
   const { data, error } = await supabase
     .from('email_attachments')
     .upsert({
@@ -197,11 +214,12 @@ export default async function handler(req, res) {
       try {
         const result = await graph(
           token,
-          `/users/${OWNER_EMAIL}/messages/${message.graph_message_id}/attachments?$top=50&$select=id,name,contentType,size,isInline,lastModifiedDateTime,contentBytes`
+          `/users/${OWNER_EMAIL}/messages/${message.graph_message_id}/attachments?$top=50&$select=id,name,contentType,size,isInline,lastModifiedDateTime`
         );
         for (const attachment of result.value || []) {
           attachmentsSeen += 1;
-          const saved = await saveAttachment(message, attachment);
+          const contentText = await loadAttachmentContent(token, message, attachment);
+          const saved = await saveAttachment(message, attachment, contentText);
           if (!saved.ok) {
             errors.push({
               graph_message_id: message.graph_message_id,
