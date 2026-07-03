@@ -67,14 +67,23 @@ async function createEmbedding(text) {
       status: response.status,
       error: data?.error?.message || data,
     });
-    return null;
+    return {
+      embedding: null,
+      error: data?.error?.message || `OpenAI embedding request failed with status ${response.status}`,
+      status: response.status,
+    };
   }
 
-  return data.data?.[0]?.embedding || null;
+  return {
+    embedding: data.data?.[0]?.embedding || null,
+    error: null,
+    status: response.status,
+  };
 }
 
 async function upsertChunk(chunk) {
-  const embedding = await createEmbedding(`${chunk.title || ''}\n${chunk.chunk_summary || ''}\n${chunk.chunk_text || ''}`);
+  const embeddingResult = await createEmbedding(`${chunk.title || ''}\n${chunk.chunk_summary || ''}\n${chunk.chunk_text || ''}`);
+  const embedding = embeddingResult?.embedding || null;
   const now = new Date().toISOString();
 
   const { error } = await supabase
@@ -103,7 +112,12 @@ async function upsertChunk(chunk) {
     });
 
   if (error) return { ok: false, source_type: chunk.source_type, source_pk: chunk.source_pk, error };
-  return { ok: true, embedded: Boolean(embedding) };
+  return {
+    ok: true,
+    embedded: Boolean(embedding),
+    embedding_error: embeddingResult?.error || null,
+    embedding_status: embeddingResult?.status || null,
+  };
 }
 
 async function loadThreadChunks(limit) {
@@ -232,12 +246,25 @@ export default async function handler(req, res) {
 
     let saved = 0;
     let embedded = 0;
+    let embeddingFailures = 0;
     const errors = [];
+    const embeddingErrors = [];
     for (const chunk of chunks) {
       const result = await upsertChunk(chunk);
       if (result.ok) {
         saved += 1;
         if (result.embedded) embedded += 1;
+        if (result.embedding_error) {
+          embeddingFailures += 1;
+          if (embeddingErrors.length < 5) {
+            embeddingErrors.push({
+              source_type: chunk.source_type,
+              source_pk: chunk.source_pk,
+              status: result.embedding_status,
+              message: result.embedding_error,
+            });
+          }
+        }
       } else {
         errors.push({
           source_type: result.source_type,
@@ -255,6 +282,8 @@ export default async function handler(req, res) {
       saved_chunks: saved,
       embedded_chunks: embedded,
       embeddings_enabled: Boolean(process.env.OPENAI_API_KEY),
+      embedding_failure_count: embeddingFailures,
+      embedding_errors: embeddingErrors,
       error_count: errors.length,
       errors: errors.slice(0, 10),
     });
