@@ -120,6 +120,46 @@ async function upsertChunk(chunk) {
   };
 }
 
+async function embedExistingChunk(chunk) {
+  const embeddingResult = await createEmbedding(`${chunk.title || ''}\n${chunk.chunk_summary || ''}\n${chunk.chunk_text || ''}`);
+  const embedding = embeddingResult?.embedding || null;
+  if (!embedding) {
+    return {
+      ok: true,
+      embedded: false,
+      embedding_error: embeddingResult?.error || 'Embedding response did not include a vector.',
+      embedding_status: embeddingResult?.status || null,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from('memory_chunks')
+    .update({
+      embedding: embeddingToSqlVector(embedding),
+      embedding_model: EMBEDDING_MODEL,
+      embedded_at: now,
+      updated_at: now,
+    })
+    .eq('id', chunk.id);
+
+  if (error) return { ok: false, source_type: chunk.source_type, source_pk: chunk.source_pk, error };
+  return { ok: true, embedded: true, embedding_error: null, embedding_status: embeddingResult?.status || null };
+}
+
+async function loadMissingEmbeddingChunks(limit) {
+  const { data, error } = await supabase
+    .from('memory_chunks')
+    .select('id, source_type, source_pk, title, chunk_text, chunk_summary, created_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .is('embedded_at', null)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (error) throw new Error(`Missing embedding chunk load failed: ${error.message}`);
+  return data || [];
+}
+
 async function loadThreadChunks(limit) {
   const { data, error } = await supabase
     .from('email_threads')
@@ -235,14 +275,16 @@ export default async function handler(req, res) {
   }
 
   try {
-    const maxThreads = boundedInteger(req.query.threads, 50, 500);
-    const maxEntities = boundedInteger(req.query.entities, 100, 1000);
-    const maxEmails = boundedInteger(req.query.emails, 50, 500);
-    const chunks = [
-      ...await loadThreadChunks(maxThreads),
-      ...await loadEntityChunks(maxEntities),
-      ...await loadEmailPreviewChunks(maxEmails),
-    ];
+    const missingLimit = boundedInteger(req.query.missing, 0, 500);
+    const chunks = missingLimit > 0
+      ? await loadMissingEmbeddingChunks(missingLimit)
+      : [
+        ...await loadThreadChunks(boundedInteger(req.query.threads, 50, 500)),
+        ...await loadEntityChunks(boundedInteger(req.query.entities, 100, 1000)),
+        ...await loadEmailPreviewChunks(boundedInteger(req.query.emails, 50, 500)),
+      ];
+
+    const writeChunk = missingLimit > 0 ? embedExistingChunk : upsertChunk;
 
     let saved = 0;
     let embedded = 0;
@@ -250,7 +292,7 @@ export default async function handler(req, res) {
     const errors = [];
     const embeddingErrors = [];
     for (const chunk of chunks) {
-      const result = await upsertChunk(chunk);
+      const result = await writeChunk(chunk);
       if (result.ok) {
         saved += 1;
         if (result.embedded) embedded += 1;
@@ -278,6 +320,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: errors.length === 0,
       supabase_project_ref: projectRefFromUrl(),
+      mode: missingLimit > 0 ? 'missing_embeddings' : 'source_rebuild',
       chunks_considered: chunks.length,
       saved_chunks: saved,
       embedded_chunks: embedded,
