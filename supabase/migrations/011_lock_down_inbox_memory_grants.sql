@@ -1,0 +1,32 @@
+revoke all on table public.email_messages from anon, authenticated;
+revoke all on table public.email_threads from anon, authenticated;
+revoke all on table public.digest_runs from anon, authenticated;
+revoke all on table public.digest_items from anon, authenticated;
+revoke all on table public.entities from anon, authenticated;
+revoke all on table public.entity_mentions from anon, authenticated;
+revoke all on table public.email_attachments from anon, authenticated;
+revoke all on table public.memory_chunks from anon, authenticated;
+revoke all on table public.retrieval_logs from anon, authenticated;
+revoke all on table public.memory_projects from anon, authenticated;
+revoke all on table public.decisions from anon, authenticated;
+revoke all on table public.commitments from anon, authenticated;
+revoke all on table public.open_loops from anon, authenticated;
+revoke all on table public.agent_actions from anon, authenticated;
+
+grant all on table public.email_messages to service_role;
+grant all on table public.email_threads to service_role;
+grant all on table public.digest_runs to service_role;
+grant all on table public.digest_items to service_role;
+grant all on table public.entities to service_role;
+grant all on table public.entity_mentions to service_role;
+grant all on table public.email_attachments to service_role;
+grant all on table public.memory_chunks to service_role;
+grant all on table public.retrieval_logs to service_role;
+grant all on table public.memory_projects to service_role;
+grant all on table public.decisions to service_role;
+grant all on table public.commitments to service_role;
+grant all on table public.open_loops to service_role;
+grant all on table public.agent_actions to service_role;
+
+revoke execute on function public.search_memory_chunks(text, text, vector, integer) from anon, authenticated;
+grant execute on function public.search_memory_chunks(text, text, vector, integer) to service_role;
