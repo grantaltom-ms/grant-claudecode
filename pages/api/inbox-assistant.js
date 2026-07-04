@@ -833,6 +833,55 @@ async function resolveDraftResponseCandidate(input) {
   };
 }
 
+async function markDraftCandidateDrafted(graphMessageId, draftId, draftBody) {
+  const { data, error } = await supabase
+    .from('draft_response_candidates')
+    .update({
+      status: 'drafted',
+      draft_graph_message_id: draftId,
+      draft_body: draftBody || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('graph_message_id', graphMessageId)
+    .in('status', ['candidate', 'drafted'])
+    .select('id, status, graph_message_id, draft_graph_message_id, subject, sender_email')
+    .maybeSingle();
+
+  if (error) {
+    console.error('Draft candidate drafted status update failed:', {
+      graphMessageId,
+      draftId,
+      error,
+    });
+  }
+
+  return data || null;
+}
+
+async function markDraftCandidateByDraftId(draftId, status) {
+  const { data, error } = await supabase
+    .from('draft_response_candidates')
+    .update({
+      status,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('draft_graph_message_id', draftId)
+    .select('id, status, graph_message_id, draft_graph_message_id, subject, sender_email')
+    .maybeSingle();
+
+  if (error) {
+    console.error('Draft candidate lifecycle status update failed:', {
+      draftId,
+      status,
+      error,
+    });
+  }
+
+  return data || null;
+}
+
 async function recordDraftFeedback(input) {
   const { data: candidate, error: candidateError } = input.candidate_id
     ? await supabase
@@ -952,8 +1001,14 @@ async function executeToolInternal(name, input, token, threadTs) {
         comment: htmlComment,
         ...(ccRecipients.length && { message: { ccRecipients } }),
       });
+      const candidate = await markDraftCandidateDrafted(input.message_id, draft.id, input.body);
 
-      return { draft_id: draft.id, subject: draft.subject, message: 'Draft saved. Awaiting approval.' };
+      return {
+        draft_id: draft.id,
+        subject: draft.subject,
+        candidate,
+        message: 'Draft saved. Awaiting approval.',
+      };
     }
 
     case 'get_recent_drafts': {
@@ -980,7 +1035,8 @@ async function executeToolInternal(name, input, token, threadTs) {
 
     case 'send_draft': {
       await graph(token, `${base}/messages/${input.draft_id}/send`, 'POST', {});
-      return { success: true, message: 'Email sent.' };
+      const candidate = await markDraftCandidateByDraftId(input.draft_id, 'sent');
+      return { success: true, candidate, message: 'Email sent.' };
     }
 
     case 'update_triage_rules': {
@@ -1036,7 +1092,8 @@ async function executeToolInternal(name, input, token, threadTs) {
 
     case 'delete_draft': {
       await graph(token, `${base}/messages/${input.draft_id}`, 'DELETE');
-      return { success: true, message: 'Draft deleted.' };
+      const candidate = await markDraftCandidateByDraftId(input.draft_id, 'dismissed');
+      return { success: true, candidate, message: 'Draft deleted.' };
     }
 
     case 'update_digest_item_status': {
