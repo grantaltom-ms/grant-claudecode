@@ -65,6 +65,7 @@ async function scalarStatus() {
     latestFailedAgentAction,
     draftCandidateCounts,
     ownerInvestorCounts,
+    sourceMemoryCounts,
     latestOperationalCounts
   ] = await Promise.all([
     supabase
@@ -121,6 +122,12 @@ async function scalarStatus() {
         .eq('source_type', 'owner_investor'),
     ]),
     Promise.all([
+      supabase.from('memory_chunks').select('id', { count: 'exact', head: true }).eq('source_type', 'property_profile'),
+      supabase.from('memory_chunks').select('id', { count: 'exact', head: true }).eq('source_type', 'team_member'),
+      supabase.from('memory_chunks').select('id', { count: 'exact', head: true }).eq('source_type', 'agent_context'),
+      supabase.from('memory_chunks').select('id', { count: 'exact', head: true }).eq('source_type', 'real_estate_schedule'),
+    ]),
+    Promise.all([
       supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
       supabase.from('decisions').select('id', { count: 'exact', head: true }),
       supabase.from('commitments').select('id', { count: 'exact', head: true }).eq('status', 'open'),
@@ -146,6 +153,12 @@ async function scalarStatus() {
     owner_investor_memory: {
       entities: ownerInvestorCounts[0].count || 0,
       chunks: ownerInvestorCounts[1].count || 0,
+    },
+    source_memory: {
+      property_profiles: sourceMemoryCounts[0].count || 0,
+      team_members: sourceMemoryCounts[1].count || 0,
+      agent_context: sourceMemoryCounts[2].count || 0,
+      real_estate_schedule: sourceMemoryCounts[3].count || 0,
     },
     operational_memory: {
       projects: latestOperationalCounts[0].count || 0,
