@@ -7,6 +7,10 @@
     {
       "path": "/api/memory-maintenance",
       "schedule": "0 19 * * *"
+    },
+    {
+      "path": "/api/weekday-one-priority",
+      "schedule": "0 16 * * 1-5"
     }
   ]
 }

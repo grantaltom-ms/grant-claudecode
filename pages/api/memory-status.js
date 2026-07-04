@@ -16,7 +16,8 @@ const TABLES = [
   'open_loops',
   'agent_actions',
   'draft_response_candidates',
-  'draft_feedback'
+  'draft_feedback',
+  'daily_priority_suggestions'
 ];
 
 const supabase = createClient(
@@ -66,6 +67,8 @@ async function scalarStatus() {
     draftCandidateCounts,
     ownerInvestorCounts,
     sourceMemoryCounts,
+    latestDailyPriority,
+    dailyPriorityCounts,
     latestOperationalCounts
   ] = await Promise.all([
     supabase
@@ -127,6 +130,17 @@ async function scalarStatus() {
       supabase.from('memory_chunks').select('id', { count: 'exact', head: true }).eq('source_type', 'agent_context'),
       supabase.from('memory_chunks').select('id', { count: 'exact', head: true }).eq('source_type', 'real_estate_schedule'),
     ]),
+    supabase
+      .from('daily_priority_suggestions')
+      .select('suggestion_date, status, title, activity, slack_message_ts, created_at')
+      .eq('owner_email', 'grant@milestoneproperties.net')
+      .order('suggestion_date', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    Promise.all([
+      supabase.from('daily_priority_suggestions').select('id', { count: 'exact', head: true }),
+      supabase.from('daily_priority_suggestions').select('id', { count: 'exact', head: true }).eq('status', 'suggested'),
+    ]),
     Promise.all([
       supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
       supabase.from('decisions').select('id', { count: 'exact', head: true }),
@@ -159,6 +173,11 @@ async function scalarStatus() {
       team_members: sourceMemoryCounts[1].count || 0,
       agent_context: sourceMemoryCounts[2].count || 0,
       real_estate_schedule: sourceMemoryCounts[3].count || 0,
+    },
+    daily_priority: {
+      suggestions: dailyPriorityCounts[0].count || 0,
+      active_suggestions: dailyPriorityCounts[1].count || 0,
+      latest: latestDailyPriority.data || null,
     },
     operational_memory: {
       projects: latestOperationalCounts[0].count || 0,
