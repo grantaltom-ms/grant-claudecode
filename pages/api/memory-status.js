@@ -64,6 +64,7 @@ async function scalarStatus() {
     latestAgentAction,
     latestFailedAgentAction,
     draftCandidateCounts,
+    ownerInvestorCounts,
     latestOperationalCounts
   ] = await Promise.all([
     supabase
@@ -109,6 +110,17 @@ async function scalarStatus() {
       supabase.from('draft_feedback').select('id', { count: 'exact', head: true }),
     ]),
     Promise.all([
+      supabase
+        .from('entities')
+        .select('id', { count: 'exact', head: true })
+        .eq('entity_type', 'person')
+        .contains('metadata', { role: 'owner_investor' }),
+      supabase
+        .from('memory_chunks')
+        .select('id', { count: 'exact', head: true })
+        .eq('source_type', 'owner_investor'),
+    ]),
+    Promise.all([
       supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
       supabase.from('decisions').select('id', { count: 'exact', head: true }),
       supabase.from('commitments').select('id', { count: 'exact', head: true }).eq('status', 'open'),
@@ -130,6 +142,10 @@ async function scalarStatus() {
       candidates: draftCandidateCounts[0].count || 0,
       drafted: draftCandidateCounts[1].count || 0,
       feedback_items: draftCandidateCounts[2].count || 0,
+    },
+    owner_investor_memory: {
+      entities: ownerInvestorCounts[0].count || 0,
+      chunks: ownerInvestorCounts[1].count || 0,
     },
     operational_memory: {
       projects: latestOperationalCounts[0].count || 0,

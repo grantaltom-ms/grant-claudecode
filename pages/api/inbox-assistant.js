@@ -228,7 +228,7 @@ const EMAIL_TOOLS = [
   },
   {
     name: 'search_memory_entities',
-    description: 'Search durable inbox memory entities such as properties, people, vendors, tenants, invoices, deadlines, insurance, financial statements, projects, and issue types.',
+    description: 'Search durable inbox memory entities such as properties, people, owners/investors, vendors, tenants, invoices, deadlines, insurance, financial statements, projects, and issue types.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1220,7 +1220,7 @@ RULES:
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
 - When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules
-- For questions about prior context, latest status, open items, properties, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_memory first. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
+- For questions about prior context, latest status, open items, properties, owners/investors, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_memory first. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
 - When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
 - Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.
