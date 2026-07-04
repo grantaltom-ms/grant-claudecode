@@ -101,46 +101,38 @@ function qualifies(stats) {
 }
 
 const RESPONSE_REQUEST_PATTERNS = [
-  /\?/,
-  /\b(can|could|would|will|do|did|are|is|should)\s+(you|we|i)\b/,
-  /\bplease\b/,
-  /\blet me know\b/,
-  /\bconfirm\b/,
-  /\breview\b/,
-  /\bapprove\b/,
-  /\bsend\b/,
-  /\bprovide\b/,
-  /\bshare\b/,
-  /\bneed(?:ed|s)?\b/,
-  /\bwaiting\b/,
-  /\bfollow(?:ing)? up\b/,
-  /\bthoughts\b/,
-  /\bavailable\b/,
-  /\bwhen\b/,
-  /\bwhat\b/,
-  /\bhow\b/,
-  /\bwhich\b/,
-  /\bwhether\b/,
-  /\bdirection\b/,
-  /\bdecision\b/,
-  /\bnext step\b/,
+  { label: 'question_mark', pattern: /\?/ },
+  { label: 'direct_question', pattern: /\b(can|could|would|will|do|did|are|is|should)\s+(you|we|i)\b/ },
+  { label: 'please', pattern: /\bplease\b/ },
+  { label: 'let_me_know', pattern: /\blet me know\b/ },
+  { label: 'confirm', pattern: /\bconfirm\b/ },
+  { label: 'review', pattern: /\breview\b/ },
+  { label: 'approve', pattern: /\bapprove\b/ },
+  { label: 'send_request', pattern: /\b(send|provide|share)\s+(me|us|over|the|a|an|any|updated|current)\b/ },
+  { label: 'need_from_you', pattern: /\bneed\s+(you|your|from you|to know|approval|confirmation|input|direction)\b/ },
+  { label: 'waiting', pattern: /\bwaiting\b/ },
+  { label: 'following_up', pattern: /\bfollow(?:ing)? up\b/ },
+  { label: 'thoughts', pattern: /\bthoughts\b/ },
+  { label: 'availability', pattern: /\bavailable\b/ },
+  { label: 'direction_or_decision', pattern: /\b(direction|decision)\b/ },
+  { label: 'next_step', pattern: /\bnext step\b/ },
 ];
 
 const NON_RESPONSE_PATTERNS = [
-  /\bno (action|response) required\b/,
-  /\bdoes not require (a )?response\b/,
-  /\bfor your records\b/,
-  /\bfor awareness\b/,
-  /\bjust (letting|wanted to let) you know\b/,
-  /\bfyi\b/,
-  /\breceipt\b/,
-  /\bauto(?:mated)? notification\b/,
-  /\bdaily delinquency report\b/,
-  /\bweekly report\b/,
-  /\bmonthly statement\b/,
-  /\bnewsletter\b/,
-  /\bstatement available\b/,
-  /\bpayment confirmation\b/,
+  { label: 'no_action_required', pattern: /\bno (action|response) required\b/ },
+  { label: 'does_not_require_response', pattern: /\bdoes not require (a )?response\b/ },
+  { label: 'for_your_records', pattern: /\bfor your records\b/ },
+  { label: 'for_awareness', pattern: /\bfor awareness\b/ },
+  { label: 'just_letting_you_know', pattern: /\bjust (letting|wanted to let) you know\b/ },
+  { label: 'fyi', pattern: /\bfyi\b/ },
+  { label: 'receipt', pattern: /\breceipt\b/ },
+  { label: 'automated_notification', pattern: /\bauto(?:mated)? notification\b/ },
+  { label: 'daily_report', pattern: /\bdaily delinquency report\b/ },
+  { label: 'weekly_report', pattern: /\bweekly report\b/ },
+  { label: 'monthly_statement', pattern: /\bmonthly statement\b/ },
+  { label: 'newsletter', pattern: /\bnewsletter\b/ },
+  { label: 'statement_available', pattern: /\bstatement available\b/ },
+  { label: 'payment_confirmation', pattern: /\bpayment confirmation\b/ },
 ];
 
 function textForIntent(message) {
@@ -155,11 +147,11 @@ function seemsToNeedResponse(message) {
   const sender = normalizeEmail(message.sender_email);
   const text = textForIntent(message);
   const matchedNonResponse = NON_RESPONSE_PATTERNS
-    .filter(pattern => pattern.test(text))
-    .map(pattern => pattern.source);
+    .filter(({ pattern }) => pattern.test(text))
+    .map(({ label }) => label);
   const matchedRequest = RESPONSE_REQUEST_PATTERNS
-    .filter(pattern => pattern.test(text))
-    .map(pattern => pattern.source);
+    .filter(({ pattern }) => pattern.test(text))
+    .map(({ label }) => label);
 
   if (sender.includes('no-reply') || sender.includes('noreply')) {
     return {
