@@ -97,10 +97,7 @@ function buildContactStats(messages) {
 
 function qualifies(stats) {
   if (!stats) return false;
-  return (
-    stats.back_and_forth_thread_count >= 2
-    || (stats.inbound_count >= 2 && stats.outbound_count >= 2)
-  );
+  return stats.back_and_forth_thread_count >= 2;
 }
 
 async function loadContactHistory(days, maxMessages) {
