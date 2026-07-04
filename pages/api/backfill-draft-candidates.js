@@ -1,0 +1,260 @@
+import { createClient } from '@supabase/supabase-js';
+
+const OWNER_EMAIL = 'grant@milestoneproperties.net';
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+function verifyCronRequest(req) {
+  return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
+}
+
+function boundedInteger(value, fallback, max) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function projectRefFromUrl() {
+  try {
+    return new URL(process.env.SUPABASE_URL).hostname.split('.')[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeEmail(value) {
+  return (value || '').trim().toLowerCase();
+}
+
+function recipientAddresses(message) {
+  return [...(message.recipients || []), ...(message.cc_recipients || [])]
+    .map(recipient => normalizeEmail(recipient?.emailAddress?.address || recipient?.address))
+    .filter(Boolean);
+}
+
+function isExternalContact(email) {
+  const normalized = normalizeEmail(email);
+  return normalized && normalized !== OWNER_EMAIL && !normalized.endsWith('@milestoneproperties.net');
+}
+
+function buildContactStats(messages) {
+  const stats = new Map();
+
+  function ensure(email) {
+    const normalized = normalizeEmail(email);
+    if (!stats.has(normalized)) {
+      stats.set(normalized, {
+        email: normalized,
+        inbound_count: 0,
+        outbound_count: 0,
+        conversations: new Map(),
+      });
+    }
+    return stats.get(normalized);
+  }
+
+  function markConversation(contactStats, conversationId, direction) {
+    if (!conversationId) return;
+    const current = contactStats.conversations.get(conversationId) || { inbound: 0, outbound: 0 };
+    current[direction] += 1;
+    contactStats.conversations.set(conversationId, current);
+  }
+
+  for (const message of messages) {
+    const folder = message.folder;
+    const conversationId = message.graph_conversation_id || message.graph_message_id;
+
+    if (folder === 'Inbox' && isExternalContact(message.sender_email)) {
+      const contactStats = ensure(message.sender_email);
+      contactStats.inbound_count += 1;
+      markConversation(contactStats, conversationId, 'inbound');
+    }
+
+    if (folder === 'SentItems') {
+      for (const recipient of recipientAddresses(message)) {
+        if (!isExternalContact(recipient)) continue;
+        const contactStats = ensure(recipient);
+        contactStats.outbound_count += 1;
+        markConversation(contactStats, conversationId, 'outbound');
+      }
+    }
+  }
+
+  for (const contactStats of stats.values()) {
+    contactStats.back_and_forth_thread_count = [...contactStats.conversations.values()]
+      .filter(conversation => conversation.inbound > 0 && conversation.outbound > 0)
+      .length;
+    contactStats.known_contact_score =
+      contactStats.back_and_forth_thread_count * 10
+      + Math.min(contactStats.inbound_count, 10)
+      + Math.min(contactStats.outbound_count, 10);
+  }
+
+  return stats;
+}
+
+function qualifies(stats) {
+  if (!stats) return false;
+  return (
+    stats.back_and_forth_thread_count >= 2
+    || (stats.inbound_count >= 2 && stats.outbound_count >= 2)
+  );
+}
+
+async function loadContactHistory(days, maxMessages) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('email_messages')
+    .select('id, graph_message_id, graph_conversation_id, folder, sender_email, recipients, cc_recipients, received_at, sent_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .or(`received_at.gte.${since},sent_at.gte.${since}`)
+    .order('received_at', { ascending: false, nullsFirst: false })
+    .limit(maxMessages);
+
+  if (error) throw new Error(`Contact history load failed: ${error.message}`);
+  return data || [];
+}
+
+async function loadRecentInbound(days, maxMessages) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('email_messages')
+    .select('id, graph_message_id, graph_conversation_id, subject, sender_name, sender_email, received_at, body_preview, is_read')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('folder', 'Inbox')
+    .gte('received_at', since)
+    .order('received_at', { ascending: false })
+    .limit(maxMessages);
+
+  if (error) throw new Error(`Recent inbound load failed: ${error.message}`);
+  return data || [];
+}
+
+async function existingCandidateIds(messageIds) {
+  if (!messageIds.length) return new Set();
+  const { data, error } = await supabase
+    .from('draft_response_candidates')
+    .select('graph_message_id')
+    .eq('owner_email', OWNER_EMAIL)
+    .in('graph_message_id', messageIds);
+
+  if (error) throw new Error(`Existing candidate lookup failed: ${error.message}`);
+  return new Set((data || []).map(row => row.graph_message_id));
+}
+
+async function upsertCandidate(message, stats) {
+  const reason = `Known contact: ${stats.back_and_forth_thread_count} prior back-and-forth thread(s), ${stats.inbound_count} inbound, ${stats.outbound_count} outbound.`;
+  const { data, error } = await supabase
+    .from('draft_response_candidates')
+    .upsert({
+      owner_email: OWNER_EMAIL,
+      status: 'candidate',
+      graph_message_id: message.graph_message_id,
+      graph_conversation_id: message.graph_conversation_id || null,
+      message_id: message.id,
+      sender_email: normalizeEmail(message.sender_email),
+      sender_name: message.sender_name || null,
+      subject: message.subject || null,
+      received_at: message.received_at || null,
+      known_contact_score: stats.known_contact_score,
+      inbound_count: stats.inbound_count,
+      outbound_count: stats.outbound_count,
+      back_and_forth_thread_count: stats.back_and_forth_thread_count,
+      reason,
+      context_summary: message.body_preview || null,
+      metadata: {
+        is_read: message.is_read,
+        gate: 'requires_more_than_one_prior_back_and_forth',
+      },
+      updated_at: new Date().toISOString(),
+    }, {
+      onConflict: 'owner_email,graph_message_id',
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(`Candidate upsert failed: ${error.message}`);
+  return data;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST' && req.method !== 'GET') return res.status(405).end();
+  if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const candidateDays = boundedInteger(req.query.days, 14, 60);
+    const historyDays = boundedInteger(req.query.history_days, 365, 730);
+    const maxCandidates = boundedInteger(req.query.max, 50, 200);
+    const maxHistory = boundedInteger(req.query.history_max, 2000, 5000);
+
+    const [history, inboundMessages] = await Promise.all([
+      loadContactHistory(historyDays, maxHistory),
+      loadRecentInbound(candidateDays, maxCandidates),
+    ]);
+    const stats = buildContactStats(history);
+    const existingIds = await existingCandidateIds(inboundMessages.map(message => message.graph_message_id));
+
+    let considered = 0;
+    let qualified = 0;
+    let saved = 0;
+    const skipped = {
+      existing: 0,
+      internal_or_unknown: 0,
+      insufficient_back_and_forth: 0,
+    };
+    const candidates = [];
+
+    for (const message of inboundMessages) {
+      considered += 1;
+      const sender = normalizeEmail(message.sender_email);
+      if (existingIds.has(message.graph_message_id)) {
+        skipped.existing += 1;
+        continue;
+      }
+      if (!isExternalContact(sender)) {
+        skipped.internal_or_unknown += 1;
+        continue;
+      }
+
+      const contactStats = stats.get(sender);
+      if (!qualifies(contactStats)) {
+        skipped.insufficient_back_and_forth += 1;
+        continue;
+      }
+
+      qualified += 1;
+      const candidate = await upsertCandidate(message, contactStats);
+      saved += 1;
+      candidates.push({
+        id: candidate.id,
+        sender_email: candidate.sender_email,
+        subject: candidate.subject,
+        received_at: candidate.received_at,
+        reason: candidate.reason,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      supabase_project_ref: projectRefFromUrl(),
+      candidate_days: candidateDays,
+      history_days: historyDays,
+      history_messages: history.length,
+      inbound_messages: inboundMessages.length,
+      considered,
+      qualified,
+      saved_candidates: saved,
+      skipped,
+      candidates: candidates.slice(0, 20),
+    });
+  } catch (error) {
+    console.error('Draft candidate backfill failed:', error);
+    return res.status(500).json({
+      ok: false,
+      supabase_project_ref: projectRefFromUrl(),
+      error: error.message,
+    });
+  }
+}

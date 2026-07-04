@@ -43,10 +43,12 @@ async function callTask(req, task) {
 
 const TASKS = [
   { name: 'backfill_inbox', path: '/api/backfill-inbox?days=3&max=50' },
+  { name: 'backfill_sent_mail', path: '/api/backfill-sent-mail?days=180&max=100' },
   { name: 'email_bodies', path: '/api/backfill-email-bodies?max=50' },
   { name: 'attachments', path: '/api/backfill-attachments?max=25' },
   { name: 'entities', path: '/api/backfill-entities?days=7&max=10' },
   { name: 'operational_memory', path: '/api/backfill-operational-memory?threads=5' },
+  { name: 'draft_candidates', path: '/api/backfill-draft-candidates?days=14&history_days=365&max=50&history_max=2500' },
   { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
 ];
 

@@ -14,7 +14,9 @@ const TABLES = [
   'decisions',
   'commitments',
   'open_loops',
-  'agent_actions'
+  'agent_actions',
+  'draft_response_candidates',
+  'draft_feedback'
 ];
 
 const supabase = createClient(
@@ -61,6 +63,7 @@ async function scalarStatus() {
     latestRetrieval,
     latestAgentAction,
     latestFailedAgentAction,
+    draftCandidateCounts,
     latestOperationalCounts
   ] = await Promise.all([
     supabase
@@ -101,6 +104,11 @@ async function scalarStatus() {
       .limit(1)
       .maybeSingle(),
     Promise.all([
+      supabase.from('draft_response_candidates').select('id', { count: 'exact', head: true }).eq('status', 'candidate'),
+      supabase.from('draft_response_candidates').select('id', { count: 'exact', head: true }).eq('status', 'drafted'),
+      supabase.from('draft_feedback').select('id', { count: 'exact', head: true }),
+    ]),
+    Promise.all([
       supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
       supabase.from('decisions').select('id', { count: 'exact', head: true }),
       supabase.from('commitments').select('id', { count: 'exact', head: true }).eq('status', 'open'),
@@ -118,6 +126,11 @@ async function scalarStatus() {
     latest_retrieval: latestRetrieval.data || null,
     latest_agent_action: latestAgentAction.data || null,
     latest_failed_agent_action: latestFailedAgentAction.data || null,
+    draft_responses: {
+      candidates: draftCandidateCounts[0].count || 0,
+      drafted: draftCandidateCounts[1].count || 0,
+      feedback_items: draftCandidateCounts[2].count || 0,
+    },
     operational_memory: {
       projects: latestOperationalCounts[0].count || 0,
       decisions: latestOperationalCounts[1].count || 0,

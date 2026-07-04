@@ -267,6 +267,38 @@ const EMAIL_TOOLS = [
       required: ['entity_id'],
     },
   },
+  {
+    name: 'list_draft_response_candidates',
+    description: 'List recent emails that are candidates for suggested draft replies. Candidates are limited to known contacts with more than one prior back-and-forth exchange.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['candidate', 'drafted', 'dismissed', 'sent'],
+          description: 'Candidate status to list. Default: candidate.',
+        },
+        limit: { type: 'number', description: 'Maximum number of candidates. Default 8, max 15.' },
+      },
+    },
+  },
+  {
+    name: 'record_draft_feedback',
+    description: 'Store Grant correction context for a draft response so future drafts for that contact/topic can use it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        candidate_id: { type: 'string', description: 'Optional draft_response_candidates UUID if known.' },
+        message_id: { type: 'string', description: 'Optional Outlook/Graph message ID for the original email.' },
+        sender_email: { type: 'string', description: 'Sender/contact email address, if known.' },
+        original_draft: { type: 'string', description: 'The draft text Grant corrected, if available.' },
+        user_feedback: { type: 'string', description: 'Grant correction or preference, e.g. "Do not mention BECU; ask for insurance cert by Friday."' },
+        revised_draft: { type: 'string', description: 'Revised draft text, if already produced.' },
+        extracted_guidance: { type: 'string', description: 'Reusable guidance distilled from Grant feedback.' },
+      },
+      required: ['user_feedback'],
+    },
+  },
 ];
 
 // --- Tool execution ---
@@ -691,6 +723,94 @@ async function getEntityContext(input) {
   };
 }
 
+async function listDraftResponseCandidates(input) {
+  const limit = boundedLimit(input.limit);
+  const status = input.status || 'candidate';
+  const { data, error } = await supabase
+    .from('draft_response_candidates')
+    .select('id, status, graph_message_id, graph_conversation_id, sender_email, sender_name, subject, received_at, known_contact_score, inbound_count, outbound_count, back_and_forth_thread_count, reason, context_summary, draft_graph_message_id, created_at, updated_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('status', status)
+    .order('received_at', { ascending: false })
+    .limit(limit);
+
+  if (error) throw new Error(`Draft candidate lookup failed: ${error.message}`);
+  return { status, results: data || [] };
+}
+
+async function recordDraftFeedback(input) {
+  const { data: candidate, error: candidateError } = input.candidate_id
+    ? await supabase
+      .from('draft_response_candidates')
+      .select('id, graph_message_id, graph_conversation_id, sender_email')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('id', input.candidate_id)
+      .maybeSingle()
+    : { data: null, error: null };
+
+  if (candidateError) throw new Error(`Draft candidate feedback lookup failed: ${candidateError.message}`);
+
+  const senderEmail = input.sender_email || candidate?.sender_email || null;
+  const graphMessageId = input.message_id || candidate?.graph_message_id || null;
+  const graphConversationId = candidate?.graph_conversation_id || null;
+
+  const { data, error } = await supabase
+    .from('draft_feedback')
+    .insert({
+      owner_email: OWNER_EMAIL,
+      candidate_id: candidate?.id || input.candidate_id || null,
+      graph_message_id: graphMessageId,
+      graph_conversation_id: graphConversationId,
+      sender_email: senderEmail,
+      original_draft: input.original_draft || null,
+      user_feedback: input.user_feedback,
+      revised_draft: input.revised_draft || null,
+      final_status: 'noted',
+      extracted_guidance: input.extracted_guidance || input.user_feedback,
+      metadata: {
+        source: 'slack_assistant',
+      },
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(`Draft feedback save failed: ${error.message}`);
+
+  if (data?.id && data.extracted_guidance) {
+    const { error: chunkError } = await supabase
+      .from('memory_chunks')
+      .upsert({
+        owner_email: OWNER_EMAIL,
+        source_type: 'draft_feedback',
+        source_table: 'draft_feedback',
+        source_pk: data.id,
+        source_id: data.id,
+        graph_message_id: graphMessageId,
+        graph_conversation_id: graphConversationId,
+        title: senderEmail ? `Draft feedback for ${senderEmail}` : 'Draft feedback',
+        chunk_summary: data.extracted_guidance,
+        chunk_text: [
+          senderEmail ? `Contact: ${senderEmail}` : '',
+          input.original_draft ? `Original draft: ${input.original_draft}` : '',
+          `Grant feedback: ${input.user_feedback}`,
+          input.revised_draft ? `Revised draft: ${input.revised_draft}` : '',
+          `Reusable guidance: ${data.extracted_guidance}`,
+        ].filter(Boolean).join('\n'),
+        metadata: {
+          sender_email: senderEmail,
+          candidate_id: candidate?.id || null,
+        },
+        updated_at: new Date().toISOString(),
+      }, {
+        onConflict: 'owner_email,source_type,source_pk',
+      });
+
+    if (chunkError) console.error('Draft feedback memory chunk write failed:', chunkError);
+  }
+
+  return { saved: true, feedback: data };
+}
+
 async function executeToolInternal(name, input, token, threadTs) {
   const base = `/users/${OWNER_EMAIL}`;
 
@@ -844,6 +964,14 @@ async function executeToolInternal(name, input, token, threadTs) {
       return getEntityContext(input);
     }
 
+    case 'list_draft_response_candidates': {
+      return listDraftResponseCandidates(input);
+    }
+
+    case 'record_draft_feedback': {
+      return recordDraftFeedback(input);
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -939,6 +1067,10 @@ RULES:
 - For questions about prior context, latest status, open items, properties, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_memory first. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
 - When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
+- Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange.
+- When Grant asks "what should I respond to?" or asks for draft suggestions, call list_draft_response_candidates first. For a chosen candidate, gather the email, thread, memory, contact/entity context, and prior draft_feedback before drafting.
+- Draft suggestions are suggestions only. Save an Outlook draft only when Grant asks you to draft it or approves the suggested direction.
+- When Grant corrects a draft or says the tone/content is wrong, call record_draft_feedback with the correction and a reusable guidance sentence before or while revising.
 
 COMPANY CONTEXT:
 - Uses AppFolio for property management, Grasshopper for texting
