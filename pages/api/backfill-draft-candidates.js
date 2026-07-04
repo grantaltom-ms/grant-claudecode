@@ -289,6 +289,7 @@ export default async function handler(req, res) {
     ]);
     const stats = buildContactStats(history);
     const existingIds = await existingCandidateIds(inboundMessages.map(message => message.graph_message_id));
+    const seenConversationIds = new Set();
 
     let considered = 0;
     let qualified = 0;
@@ -296,6 +297,7 @@ export default async function handler(req, res) {
     const skipped = {
       existing: 0,
       internal_or_unknown: 0,
+      duplicate_thread: 0,
       insufficient_back_and_forth: 0,
       does_not_seek_response: 0,
     };
@@ -312,6 +314,13 @@ export default async function handler(req, res) {
         skipped.internal_or_unknown += 1;
         continue;
       }
+
+      const conversationKey = message.graph_conversation_id || message.graph_message_id;
+      if (seenConversationIds.has(conversationKey)) {
+        skipped.duplicate_thread += 1;
+        continue;
+      }
+      seenConversationIds.add(conversationKey);
 
       const contactStats = stats.get(sender);
       if (!qualifies(contactStats)) {
