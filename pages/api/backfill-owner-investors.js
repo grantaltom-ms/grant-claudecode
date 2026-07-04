@@ -191,7 +191,7 @@ async function upsertOwnerMemory(owner, sourceProjectRef) {
       source_type: 'owner_investor',
       source_table: 'owners',
       source_pk: String(owner.id),
-      source_id: String(owner.id),
+      source_id: null,
       entity_id: entity.id,
       title: `Owner/investor: ${owner.name}`,
       chunk_summary: summary,
