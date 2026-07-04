@@ -269,7 +269,7 @@ const EMAIL_TOOLS = [
   },
   {
     name: 'list_draft_response_candidates',
-    description: 'List recent emails that are candidates for suggested draft replies. Candidates are limited to known contacts with more than one prior back-and-forth exchange.',
+    description: 'List recent emails that are candidates for suggested draft replies. Candidates are limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.',
     input_schema: {
       type: 'object',
       properties: {
@@ -279,6 +279,23 @@ const EMAIL_TOOLS = [
           description: 'Candidate status to list. Default: candidate.',
         },
         limit: { type: 'number', description: 'Maximum number of candidates. Default 8, max 15.' },
+      },
+    },
+  },
+  {
+    name: 'resolve_draft_response_candidate',
+    description: 'Resolve a draft response candidate by candidate UUID or list rank, then load its original email, thread memory, and prior draft feedback. Use this before drafting a chosen candidate such as "draft candidate #1".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        candidate_id: { type: 'string', description: 'Optional draft_response_candidates UUID.' },
+        rank: { type: 'number', description: 'Optional 1-based rank from the latest candidate list, e.g. 1 for the newest candidate shown first.' },
+        status: {
+          type: 'string',
+          enum: ['candidate', 'drafted', 'dismissed', 'sent'],
+          description: 'Candidate status to resolve by rank. Default: candidate.',
+        },
+        limit: { type: 'number', description: 'How many ordered candidates to consider when resolving by rank. Default 15, max 25.' },
       },
     },
   },
@@ -728,7 +745,7 @@ async function listDraftResponseCandidates(input) {
   const status = input.status || 'candidate';
   const { data, error } = await supabase
     .from('draft_response_candidates')
-    .select('id, status, graph_message_id, graph_conversation_id, sender_email, sender_name, subject, received_at, known_contact_score, inbound_count, outbound_count, back_and_forth_thread_count, reason, context_summary, draft_graph_message_id, created_at, updated_at')
+    .select('id, status, graph_message_id, graph_conversation_id, sender_email, sender_name, subject, received_at, known_contact_score, inbound_count, outbound_count, back_and_forth_thread_count, reason, context_summary, draft_graph_message_id, metadata, created_at, updated_at')
     .eq('owner_email', OWNER_EMAIL)
     .eq('status', status)
     .order('received_at', { ascending: false })
@@ -736,6 +753,84 @@ async function listDraftResponseCandidates(input) {
 
   if (error) throw new Error(`Draft candidate lookup failed: ${error.message}`);
   return { status, results: data || [] };
+}
+
+async function resolveDraftResponseCandidate(input) {
+  const status = input.status || 'candidate';
+  const rank = Number(input.rank || 0);
+  let candidate = null;
+  let orderedCandidates = [];
+
+  if (input.candidate_id) {
+    const { data, error } = await supabase
+      .from('draft_response_candidates')
+      .select('id, status, graph_message_id, graph_conversation_id, sender_email, sender_name, subject, received_at, known_contact_score, inbound_count, outbound_count, back_and_forth_thread_count, reason, context_summary, draft_graph_message_id, metadata, created_at, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('id', input.candidate_id)
+      .maybeSingle();
+
+    if (error) throw new Error(`Draft candidate lookup failed: ${error.message}`);
+    candidate = data;
+  } else {
+    if (!Number.isFinite(rank) || rank < 1) {
+      throw new Error('Provide candidate_id or a 1-based rank from the candidate list.');
+    }
+
+    const limit = boundedLimit(input.limit, 15, 25);
+    const { data, error } = await supabase
+      .from('draft_response_candidates')
+      .select('id, status, graph_message_id, graph_conversation_id, sender_email, sender_name, subject, received_at, known_contact_score, inbound_count, outbound_count, back_and_forth_thread_count, reason, context_summary, draft_graph_message_id, metadata, created_at, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('status', status)
+      .order('received_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw new Error(`Draft candidate rank lookup failed: ${error.message}`);
+    orderedCandidates = data || [];
+    candidate = orderedCandidates[rank - 1] || null;
+  }
+
+  if (!candidate) throw new Error('No matching draft response candidate found.');
+
+  const { data: email, error: emailError } = await supabase
+    .from('email_messages')
+    .select('id, graph_message_id, graph_conversation_id, folder, subject, sender_name, sender_email, recipients, cc_recipients, received_at, sent_at, body_preview, body_text, importance, is_read, has_attachments')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('graph_message_id', candidate.graph_message_id)
+    .maybeSingle();
+
+  if (emailError) throw new Error(`Candidate email lookup failed: ${emailError.message}`);
+
+  const { data: thread, error: threadError } = candidate.graph_conversation_id
+    ? await supabase
+      .from('email_threads')
+      .select('id, graph_conversation_id, latest_subject, participant_emails, participant_names, first_message_at, last_message_at, last_graph_message_id, message_count, current_summary, open_items, status, summary_updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('graph_conversation_id', candidate.graph_conversation_id)
+      .maybeSingle()
+    : { data: null, error: null };
+
+  if (threadError) throw new Error(`Candidate thread lookup failed: ${threadError.message}`);
+
+  const { data: feedback, error: feedbackError } = await supabase
+    .from('draft_feedback')
+    .select('id, sender_email, graph_message_id, graph_conversation_id, user_feedback, revised_draft, extracted_guidance, final_status, created_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('sender_email', candidate.sender_email)
+    .order('created_at', { ascending: false })
+    .limit(5);
+
+  if (feedbackError) throw new Error(`Draft feedback lookup failed: ${feedbackError.message}`);
+
+  return {
+    resolved_by: input.candidate_id ? 'candidate_id' : 'rank',
+    rank: input.candidate_id ? null : rank,
+    candidate,
+    email,
+    thread,
+    prior_feedback: feedback || [],
+    memory_query_suggestion: [candidate.sender_email, candidate.subject].filter(Boolean).join(' '),
+  };
 }
 
 async function recordDraftFeedback(input) {
@@ -968,6 +1063,10 @@ async function executeToolInternal(name, input, token, threadTs) {
       return listDraftResponseCandidates(input);
     }
 
+    case 'resolve_draft_response_candidate': {
+      return resolveDraftResponseCandidate(input);
+    }
+
     case 'record_draft_feedback': {
       return recordDraftFeedback(input);
     }
@@ -1067,8 +1166,10 @@ RULES:
 - For questions about prior context, latest status, open items, properties, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_memory first. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
 - When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
-- Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange.
+- Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.
 - When Grant asks "what should I respond to?" or asks for draft suggestions, call list_draft_response_candidates first. For a chosen candidate, gather the email, thread, memory, contact/entity context, and prior draft_feedback before drafting.
+- When Grant refers to a draft candidate by number, such as "candidate #1", "draft #1", or "first one", call resolve_draft_response_candidate first. Use its original email body, thread memory, and prior_feedback before drafting.
+- Do not start a manual candidate triage or button-selection process unless Grant explicitly asks for it. Keep candidate lists lightweight.
 - Draft suggestions are suggestions only. Save an Outlook draft only when Grant asks you to draft it or approves the suggested direction.
 - When Grant corrects a draft or says the tone/content is wrong, call record_draft_feedback with the correction and a reusable guidance sentence before or while revising.
 

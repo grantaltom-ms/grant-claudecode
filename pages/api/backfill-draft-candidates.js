@@ -100,6 +100,90 @@ function qualifies(stats) {
   return stats.back_and_forth_thread_count >= 2;
 }
 
+const RESPONSE_REQUEST_PATTERNS = [
+  /\?/,
+  /\b(can|could|would|will|do|did|are|is|should)\s+(you|we|i)\b/,
+  /\bplease\b/,
+  /\blet me know\b/,
+  /\bconfirm\b/,
+  /\breview\b/,
+  /\bapprove\b/,
+  /\bsend\b/,
+  /\bprovide\b/,
+  /\bshare\b/,
+  /\bneed(?:ed|s)?\b/,
+  /\bwaiting\b/,
+  /\bfollow(?:ing)? up\b/,
+  /\bthoughts\b/,
+  /\bavailable\b/,
+  /\bwhen\b/,
+  /\bwhat\b/,
+  /\bhow\b/,
+  /\bwhich\b/,
+  /\bwhether\b/,
+  /\bdirection\b/,
+  /\bdecision\b/,
+  /\bnext step\b/,
+];
+
+const NON_RESPONSE_PATTERNS = [
+  /\bno (action|response) required\b/,
+  /\bdoes not require (a )?response\b/,
+  /\bfor your records\b/,
+  /\bfor awareness\b/,
+  /\bjust (letting|wanted to let) you know\b/,
+  /\bfyi\b/,
+  /\breceipt\b/,
+  /\bauto(?:mated)? notification\b/,
+  /\bdaily delinquency report\b/,
+  /\bweekly report\b/,
+  /\bmonthly statement\b/,
+  /\bnewsletter\b/,
+  /\bstatement available\b/,
+  /\bpayment confirmation\b/,
+];
+
+function textForIntent(message) {
+  return [
+    message.subject,
+    message.body_preview,
+    message.body_text,
+  ].filter(Boolean).join('\n').toLowerCase();
+}
+
+function seemsToNeedResponse(message) {
+  const sender = normalizeEmail(message.sender_email);
+  const text = textForIntent(message);
+  const matchedNonResponse = NON_RESPONSE_PATTERNS
+    .filter(pattern => pattern.test(text))
+    .map(pattern => pattern.source);
+  const matchedRequest = RESPONSE_REQUEST_PATTERNS
+    .filter(pattern => pattern.test(text))
+    .map(pattern => pattern.source);
+
+  if (sender.includes('no-reply') || sender.includes('noreply')) {
+    return {
+      seeks_response: false,
+      matched_request_terms: matchedRequest,
+      matched_non_response_terms: ['noreply_sender', ...matchedNonResponse],
+    };
+  }
+
+  if (matchedNonResponse.length && !matchedRequest.length) {
+    return {
+      seeks_response: false,
+      matched_request_terms: matchedRequest,
+      matched_non_response_terms: matchedNonResponse,
+    };
+  }
+
+  return {
+    seeks_response: matchedRequest.length > 0,
+    matched_request_terms: matchedRequest,
+    matched_non_response_terms: matchedNonResponse,
+  };
+}
+
 async function loadContactHistory(days, maxMessages) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await supabase
@@ -118,7 +202,7 @@ async function loadRecentInbound(days, maxMessages) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await supabase
     .from('email_messages')
-    .select('id, graph_message_id, graph_conversation_id, subject, sender_name, sender_email, received_at, body_preview, is_read')
+    .select('id, graph_message_id, graph_conversation_id, subject, sender_name, sender_email, received_at, body_preview, body_text, is_read')
     .eq('owner_email', OWNER_EMAIL)
     .eq('folder', 'Inbox')
     .gte('received_at', since)
@@ -127,6 +211,18 @@ async function loadRecentInbound(days, maxMessages) {
 
   if (error) throw new Error(`Recent inbound load failed: ${error.message}`);
   return data || [];
+}
+
+async function refreshCandidateWindow(days) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { error } = await supabase
+    .from('draft_response_candidates')
+    .delete()
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('status', 'candidate')
+    .gte('received_at', since);
+
+  if (error) throw new Error(`Candidate refresh failed: ${error.message}`);
 }
 
 async function existingCandidateIds(messageIds) {
@@ -141,8 +237,11 @@ async function existingCandidateIds(messageIds) {
   return new Set((data || []).map(row => row.graph_message_id));
 }
 
-async function upsertCandidate(message, stats) {
-  const reason = `Known contact: ${stats.back_and_forth_thread_count} prior back-and-forth thread(s), ${stats.inbound_count} inbound, ${stats.outbound_count} outbound.`;
+async function upsertCandidate(message, stats, responseIntent) {
+  const reason = [
+    `Known contact: ${stats.back_and_forth_thread_count} prior back-and-forth thread(s), ${stats.inbound_count} inbound, ${stats.outbound_count} outbound.`,
+    `Response intent: ${responseIntent.matched_request_terms.slice(0, 3).join(', ') || 'request-like language detected'}.`,
+  ].join(' ');
   const { data, error } = await supabase
     .from('draft_response_candidates')
     .upsert({
@@ -163,7 +262,8 @@ async function upsertCandidate(message, stats) {
       context_summary: message.body_preview || null,
       metadata: {
         is_read: message.is_read,
-        gate: 'requires_more_than_one_prior_back_and_forth',
+        gate: 'requires_two_prior_back_and_forth_threads_and_response_intent',
+        response_intent: responseIntent,
       },
       updated_at: new Date().toISOString(),
     }, {
@@ -185,6 +285,11 @@ export default async function handler(req, res) {
     const historyDays = boundedInteger(req.query.history_days, 365, 730);
     const maxCandidates = boundedInteger(req.query.max, 50, 200);
     const maxHistory = boundedInteger(req.query.history_max, 2000, 5000);
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+
+    if (refresh) {
+      await refreshCandidateWindow(candidateDays);
+    }
 
     const [history, inboundMessages] = await Promise.all([
       loadContactHistory(historyDays, maxHistory),
@@ -200,6 +305,7 @@ export default async function handler(req, res) {
       existing: 0,
       internal_or_unknown: 0,
       insufficient_back_and_forth: 0,
+      does_not_seek_response: 0,
     };
     const candidates = [];
 
@@ -221,8 +327,14 @@ export default async function handler(req, res) {
         continue;
       }
 
+      const responseIntent = seemsToNeedResponse(message);
+      if (!responseIntent.seeks_response) {
+        skipped.does_not_seek_response += 1;
+        continue;
+      }
+
       qualified += 1;
-      const candidate = await upsertCandidate(message, contactStats);
+      const candidate = await upsertCandidate(message, contactStats, responseIntent);
       saved += 1;
       candidates.push({
         id: candidate.id,
@@ -238,6 +350,7 @@ export default async function handler(req, res) {
       supabase_project_ref: projectRefFromUrl(),
       candidate_days: candidateDays,
       history_days: historyDays,
+      refreshed_candidate_window: refresh,
       history_messages: history.length,
       inbound_messages: inboundMessages.length,
       considered,

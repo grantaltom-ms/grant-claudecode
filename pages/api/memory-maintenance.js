@@ -48,7 +48,7 @@ const TASKS = [
   { name: 'attachments', path: '/api/backfill-attachments?max=25' },
   { name: 'entities', path: '/api/backfill-entities?days=7&max=10' },
   { name: 'operational_memory', path: '/api/backfill-operational-memory?threads=5' },
-  { name: 'draft_candidates', path: '/api/backfill-draft-candidates?days=14&history_days=365&max=50&history_max=2500' },
+  { name: 'draft_candidates', path: '/api/backfill-draft-candidates?days=14&history_days=365&max=50&history_max=2500&refresh=1' },
   { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
 ];
 
