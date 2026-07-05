@@ -280,22 +280,12 @@ ${JSON.stringify(compact, null, 2)}`,
 }
 
 function formatSlackMessage(suggestion, suggestionDate) {
-  const evidence = safeArray(suggestion.evidence).slice(0, 4);
-  const runnersUp = safeArray(suggestion.runners_up).slice(0, 2);
-
   return [
-    `*Today's One Priority* (${suggestionDate})`,
-    '',
-    `*${suggestion.title || 'Highest-leverage activity'}*`,
-    suggestion.activity || '',
-    '',
-    `*Why this matters:* ${suggestion.why_this_matters || ''}`,
-    `*First step:* ${suggestion.first_step || ''}`,
-    `*Suggested time block:* ${suggestion.suggested_time_block || '60-90 minutes'}`,
-    evidence.length ? '\n*Evidence:*' : null,
-    ...evidence.map(item => `- ${item.label || item.source || 'Source'}: ${item.detail || ''}`),
-    runnersUp.length ? '\n*Considered but not chosen:*' : null,
-    ...runnersUp.map(item => `- ${item.title || 'Runner-up'}: ${item.why_not_chosen || ''}`),
+    `*One Priority* (${suggestionDate})`,
+    `*${truncate(suggestion.title || 'Highest-leverage activity', 80)}*`,
+    truncate(suggestion.activity, 220),
+    suggestion.first_step ? `*Start:* ${truncate(suggestion.first_step, 140)}` : null,
+    `*Block:* ${truncate(suggestion.suggested_time_block || '60-90 minutes', 60)}`,
   ].filter(Boolean).join('\n');
 }
 
