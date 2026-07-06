@@ -61,13 +61,14 @@ async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
   const conversationHistory = buildConversationHistory(threadMessages, botUserId, skipMessageTs);
   await slackPost(COMPLY_CHANNEL_ID, '_On it..._', threadTs);
 
-  const { text: agentResponse, tenantData, sectionApprovals } = await runAgent(
+  const { text: agentResponse, tenantData, managerName, sectionApprovals } = await runAgent(
     userChoice,
     conversationHistory,
     state
   );
 
   const newState = state || {};
+  if (managerName) newState.managerName = managerName;
   if (tenantData) Object.assign(newState, tenantData);
   for (const { section_number, content } of sectionApprovals) {
     newState[`section${section_number}`] = content;
