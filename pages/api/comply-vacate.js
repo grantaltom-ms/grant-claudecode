@@ -10,6 +10,7 @@ import {
   slackPost,
   getThreadHistory,
   getBotUserId,
+  getSlackUserName,
   loadState,
   saveState,
   runAgent,
@@ -52,7 +53,10 @@ export default async function handler(req, res) {
 
         await slackPost(COMPLY_CHANNEL_ID, '_On it..._', thread_ts);
 
-        const state = await loadState(thread_ts);
+        const [state, managerName] = await Promise.all([
+          loadState(thread_ts),
+          isNewThread ? getSlackUserName(event.user) : Promise.resolve(null),
+        ]);
         let conversationHistory = [];
 
         if (!isNewThread) {
@@ -68,6 +72,7 @@ export default async function handler(req, res) {
         );
 
         let newState = state || {};
+        if (managerName && !newState.managerName) newState.managerName = managerName;
         if (tenantData) Object.assign(newState, tenantData);
         for (const { section_number, content } of sectionApprovals) {
           newState[`section${section_number}`] = content;
