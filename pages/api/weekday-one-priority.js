@@ -71,6 +71,12 @@ function parseJsonObject(text) {
   }
 }
 
+function isMissingTableError(error) {
+  return error?.code === '42P01'
+    || error?.code === 'PGRST205'
+    || /could not find the table|relation .* does not exist/i.test(error?.message || '');
+}
+
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -80,6 +86,40 @@ function truncate(value, max = 1200) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+function fallbackCardFromChunk(item) {
+  return {
+    card_type: item.source_type,
+    title: item.title,
+    summary: item.chunk_summary || item.chunk_text,
+    importance: 'normal',
+    facts: item.metadata || {},
+  };
+}
+
+async function loadChunkFallback(memoryLimit) {
+  const [sourceMemory, ownerMemory] = await Promise.all([
+    supabase
+      .from('memory_chunks')
+      .select('id, source_type, source_table, source_pk, title, chunk_summary, chunk_text, metadata, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .in('source_type', ['property_profile', 'team_member', 'agent_context', 'real_estate_schedule'])
+      .order('updated_at', { ascending: false })
+      .limit(memoryLimit),
+    supabase
+      .from('memory_chunks')
+      .select('id, source_type, source_table, source_pk, title, chunk_summary, chunk_text, metadata, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('source_type', 'owner_investor')
+      .order('updated_at', { ascending: false })
+      .limit(30),
+  ]);
+
+  const errors = [sourceMemory.error, ownerMemory.error].filter(Boolean);
+  if (errors.length) throw new Error(`Priority chunk fallback load failed: ${errors[0].message}`);
+
+  return [...(sourceMemory.data || []), ...(ownerMemory.data || [])].map(fallbackCardFromChunk);
+}
+
 async function loadPriorityContext({ emailLimit, memoryLimit }) {
   const [
     openLoops,
@@ -87,8 +127,7 @@ async function loadPriorityContext({ emailLimit, memoryLimit }) {
     draftCandidates,
     digestItems,
     recentEmails,
-    sourceMemory,
-    ownerMemory,
+    contextCards,
     operationalProjects,
   ] = await Promise.all([
     supabase
@@ -126,19 +165,13 @@ async function loadPriorityContext({ emailLimit, memoryLimit }) {
       .order('received_at', { ascending: false })
       .limit(emailLimit),
     supabase
-      .from('memory_chunks')
-      .select('id, source_type, source_table, source_pk, title, chunk_summary, chunk_text, metadata, updated_at')
+      .from('context_cards')
+      .select('id, card_type, card_key, title, summary, facts, status, importance, last_seen_at, source_updated_at, updated_at')
       .eq('owner_email', OWNER_EMAIL)
-      .in('source_type', ['property_profile', 'team_member', 'agent_context', 'real_estate_schedule'])
+      .eq('status', 'active')
+      .in('card_type', ['property', 'investment_profile', 'owner_investor', 'team_member', 'operating_context', 'project', 'open_loop', 'commitment', 'organization'])
       .order('updated_at', { ascending: false })
       .limit(memoryLimit),
-    supabase
-      .from('memory_chunks')
-      .select('id, source_type, source_table, source_pk, title, chunk_summary, chunk_text, metadata, updated_at')
-      .eq('owner_email', OWNER_EMAIL)
-      .eq('source_type', 'owner_investor')
-      .order('updated_at', { ascending: false })
-      .limit(30),
     supabase
       .from('memory_projects')
       .select('id, name, status, summary, metadata, last_seen_at')
@@ -154,11 +187,19 @@ async function loadPriorityContext({ emailLimit, memoryLimit }) {
     draftCandidates.error,
     digestItems.error,
     recentEmails.error,
-    sourceMemory.error,
-    ownerMemory.error,
     operationalProjects.error,
   ].filter(Boolean);
   if (errors.length) throw new Error(`Priority context load failed: ${errors[0].message}`);
+
+  let cardRows = contextCards.data || [];
+  let contextCardMode = 'context_cards';
+  if (contextCards.error) {
+    if (!isMissingTableError(contextCards.error)) {
+      throw new Error(`Priority context card load failed: ${contextCards.error.message}`);
+    }
+    cardRows = await loadChunkFallback(memoryLimit);
+    contextCardMode = 'chunk_fallback';
+  }
 
   return {
     open_loops: openLoops.data || [],
@@ -166,8 +207,8 @@ async function loadPriorityContext({ emailLimit, memoryLimit }) {
     draft_candidates: draftCandidates.data || [],
     digest_items: digestItems.data || [],
     recent_emails: recentEmails.data || [],
-    source_memory: sourceMemory.data || [],
-    owner_memory: ownerMemory.data || [],
+    context_cards: cardRows,
+    context_card_mode: contextCardMode,
     operational_projects: operationalProjects.data || [],
   };
 }
@@ -215,16 +256,12 @@ function compactContext(context) {
       has_attachments: item.has_attachments,
       preview: truncate(item.body_preview, 350),
     })),
-    source_memory: context.source_memory.map(item => ({
-      source_type: item.source_type,
+    context_cards: context.context_cards.map(item => ({
+      card_type: item.card_type,
       title: item.title,
-      summary: truncate(item.chunk_summary || item.chunk_text, 650),
-      metadata: item.metadata,
-    })),
-    owner_memory: context.owner_memory.map(item => ({
-      title: item.title,
-      summary: truncate(item.chunk_summary || item.chunk_text, 550),
-      properties: item.metadata?.property_names || item.metadata?.properties || [],
+      summary: truncate(item.summary, 550),
+      importance: item.importance,
+      facts: item.facts,
     })),
     operational_projects: context.operational_projects.map(item => ({
       name: item.name,
@@ -232,6 +269,7 @@ function compactContext(context) {
       summary: truncate(item.summary, 550),
       source_subject: item.metadata?.source_subject || null,
     })),
+    context_card_mode: context.context_card_mode,
   };
 }
 

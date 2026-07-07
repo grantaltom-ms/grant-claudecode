@@ -215,8 +215,25 @@ const EMAIL_TOOLS = [
     },
   },
   {
+    name: 'search_context_cards',
+    description: 'Search compact durable context cards for people, properties, owner/investors, projects, operating context, commitments, and open loops. Use this before search_memory when a compact summary may answer the question.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search text, e.g. "Willow Lake owner" or "BECU financial statements".' },
+        card_type: {
+          type: 'string',
+          enum: ['property', 'investment_profile', 'owner_investor', 'team_member', 'operating_context', 'project', 'decision', 'commitment', 'open_loop', 'draft_feedback', 'organization'],
+          description: 'Optional context card type filter.',
+        },
+        limit: { type: 'number', description: 'Maximum number of results. Default 8, max 12.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'search_memory',
-    description: 'Hybrid search across durable memory chunks from email previews/bodies, thread summaries, entities, projects, tasks, decisions, and open loops. Use this first for broad memory questions.',
+    description: 'Hybrid search across durable memory chunks from email previews/bodies, thread summaries, entities, projects, tasks, decisions, and open loops. Use this when context cards are missing, too thin, or the user needs underlying source detail.',
     input_schema: {
       type: 'object',
       properties: {
@@ -350,6 +367,12 @@ function isMissingRpcError(error) {
   return error?.code === 'PGRST202';
 }
 
+function isMissingTableError(error) {
+  return error?.code === '42P01'
+    || error?.code === 'PGRST205'
+    || /could not find the table|relation .* does not exist/i.test(error?.message || '');
+}
+
 function memorySearchTerms(query) {
   return normalizeSearchTerm(query)
     .toLowerCase()
@@ -367,6 +390,35 @@ function scoreMemoryChunk(row, terms) {
     if (title.includes(term)) return score + 3;
     if (summary.includes(term)) return score + 2;
     if (text.includes(term)) return score + 1;
+    return score;
+  }, 0);
+}
+
+function buildCardTypeFilter(cardType) {
+  const allowedTypes = new Set([
+    'property',
+    'investment_profile',
+    'owner_investor',
+    'team_member',
+    'operating_context',
+    'project',
+    'decision',
+    'commitment',
+    'open_loop',
+    'draft_feedback',
+    'organization'
+  ]);
+  return allowedTypes.has(cardType) ? cardType : null;
+}
+
+function scoreContextCard(row, terms) {
+  const title = (row.title || '').toLowerCase();
+  const summary = (row.summary || '').toLowerCase();
+  const facts = JSON.stringify(row.facts || {}).toLowerCase();
+  return terms.reduce((score, term) => {
+    if (title.includes(term)) return score + 4;
+    if (summary.includes(term)) return score + 2;
+    if (facts.includes(term)) return score + 1;
     return score;
   }, 0);
 }
@@ -591,6 +643,73 @@ async function searchMemoryEntities(input) {
     query,
     entity_type: entityType,
     results: data || [],
+  };
+}
+
+async function searchContextCards(input) {
+  const query = normalizeSearchTerm(input.query);
+  if (!query) throw new Error('Search query is required.');
+
+  const limit = boundedLimit(input.limit, 8, 12);
+  const terms = memorySearchTerms(query);
+  const anchor = terms[0] || query;
+  const escapedAnchor = escapeIlike(anchor);
+  const cardType = buildCardTypeFilter(input.card_type);
+
+  let cardQuery = supabase
+    .from('context_cards')
+    .select('id, card_type, card_key, title, summary, facts, source_refs, status, importance, last_seen_at, source_updated_at, updated_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('status', 'active')
+    .or(`title.ilike.%${escapedAnchor}%,summary.ilike.%${escapedAnchor}%,card_key.ilike.%${escapedAnchor}%`)
+    .order('updated_at', { ascending: false })
+    .limit(Math.max(limit * 6, 30));
+
+  if (cardType) cardQuery = cardQuery.eq('card_type', cardType);
+
+  const { data, error } = await cardQuery;
+  if (error) {
+    if (isMissingTableError(error)) {
+      const fallback = await searchMemory(input);
+      return {
+        query,
+        card_type: cardType,
+        mode: 'context_cards_missing_memory_fallback',
+        results: fallback.results,
+      };
+    }
+    throw new Error(`Context card search failed: ${error.message}`);
+  }
+
+  const results = (data || [])
+    .map(row => ({
+      ...row,
+      card_score: scoreContextCard(row, terms),
+    }))
+    .filter(row => row.card_score > 0 || !terms.length)
+    .sort((a, b) => {
+      if (b.card_score !== a.card_score) return b.card_score - a.card_score;
+      if (a.importance !== b.importance) return a.importance === 'high' ? -1 : 1;
+      return new Date(b.updated_at || b.last_seen_at) - new Date(a.updated_at || a.last_seen_at);
+    })
+    .slice(0, limit);
+
+  await logRetrieval({
+    query,
+    toolName: 'search_context_cards',
+    resultCount: results.length,
+    usedEmbedding: false,
+    metadata: {
+      mode: 'context_card_keyword',
+      card_type: cardType,
+    },
+  });
+
+  return {
+    query,
+    card_type: cardType,
+    mode: 'context_card_keyword',
+    results,
   };
 }
 
@@ -1100,6 +1219,10 @@ async function executeToolInternal(name, input, token, threadTs) {
       return updateDigestItemStatus(threadTs, input.item_number, input.action_status);
     }
 
+    case 'search_context_cards': {
+      return searchContextCards(input);
+    }
+
     case 'search_memory': {
       return searchMemory(input);
     }
@@ -1220,7 +1343,7 @@ RULES:
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
 - When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules
-- For questions about prior context, latest status, open items, properties, property aliases, owners/investors, team members, real estate schedule/investment profile, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_memory first. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
+- For questions about prior context, latest status, open items, properties, property aliases, owners/investors, team members, real estate schedule/investment profile, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_context_cards first. If cards are missing, thin, or source details are needed, then use search_memory. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
 - When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
 - Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.

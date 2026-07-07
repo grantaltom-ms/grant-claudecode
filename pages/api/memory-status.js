@@ -17,7 +17,8 @@ const TABLES = [
   'agent_actions',
   'draft_response_candidates',
   'draft_feedback',
-  'daily_priority_suggestions'
+  'daily_priority_suggestions',
+  'context_cards'
 ];
 
 const supabase = createClient(
@@ -69,6 +70,8 @@ async function scalarStatus() {
     sourceMemoryCounts,
     latestDailyPriority,
     dailyPriorityCounts,
+    contextCardCounts,
+    latestContextCard,
     latestOperationalCounts
   ] = await Promise.all([
     supabase
@@ -142,6 +145,23 @@ async function scalarStatus() {
       supabase.from('daily_priority_suggestions').select('id', { count: 'exact', head: true }).eq('status', 'suggested'),
     ]),
     Promise.all([
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('status', 'active'),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('card_type', 'property'),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('card_type', 'investment_profile'),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('card_type', 'owner_investor'),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('card_type', 'project'),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('card_type', 'open_loop'),
+      supabase.from('context_cards').select('id', { count: 'exact', head: true }).eq('card_type', 'commitment'),
+    ]),
+    supabase
+      .from('context_cards')
+      .select('card_type, title, summary, status, updated_at')
+      .eq('owner_email', 'grant@milestoneproperties.net')
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    Promise.all([
       supabase.from('memory_projects').select('id', { count: 'exact', head: true }),
       supabase.from('decisions').select('id', { count: 'exact', head: true }),
       supabase.from('commitments').select('id', { count: 'exact', head: true }).eq('status', 'open'),
@@ -178,6 +198,17 @@ async function scalarStatus() {
       suggestions: dailyPriorityCounts[0].count || 0,
       active_suggestions: dailyPriorityCounts[1].count || 0,
       latest: latestDailyPriority.data || null,
+    },
+    context_cards: {
+      total: contextCardCounts[0].count || 0,
+      active: contextCardCounts[1].count || 0,
+      property: contextCardCounts[2].count || 0,
+      investment_profile: contextCardCounts[3].count || 0,
+      owner_investor: contextCardCounts[4].count || 0,
+      project: contextCardCounts[5].count || 0,
+      open_loop: contextCardCounts[6].count || 0,
+      commitment: contextCardCounts[7].count || 0,
+      latest: latestContextCard.data || null,
     },
     operational_memory: {
       projects: latestOperationalCounts[0].count || 0,

@@ -41,6 +41,8 @@ async function callTask(req, task) {
   };
 }
 
+const CONTEXT_CARD_TASK = { name: 'context_cards', path: '/api/backfill-context-cards?max_chunks=500&max_records=250' };
+
 const TASKS = [
   { name: 'backfill_inbox', path: '/api/backfill-inbox?days=3&max=50' },
   { name: 'backfill_sent_mail', path: '/api/backfill-sent-mail?days=180&max=100' },
@@ -51,6 +53,7 @@ const TASKS = [
   { name: 'source_memory', path: '/api/backfill-source-memory?scope=all&properties=500&schedule=500' },
   { name: 'operational_memory', path: '/api/backfill-operational-memory?threads=5' },
   { name: 'draft_candidates', path: '/api/backfill-draft-candidates?days=14&history_days=365&max=50&history_max=2500&refresh=1' },
+  CONTEXT_CARD_TASK,
   { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
 ];
 
@@ -72,11 +75,18 @@ function selectedTasks(req) {
   return [TASKS[dayOfYear() % TASKS.length]];
 }
 
+function tasksForRun(req) {
+  const tasks = selectedTasks(req);
+  if (req.query.skip_context_cards === '1') return tasks;
+  if (!tasks.length || tasks.some(task => task.name === CONTEXT_CARD_TASK.name)) return tasks;
+  return [...tasks, CONTEXT_CARD_TASK];
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
 
-  const tasks = selectedTasks(req);
+  const tasks = tasksForRun(req);
   if (!tasks.length) {
     return res.status(400).json({
       ok: false,

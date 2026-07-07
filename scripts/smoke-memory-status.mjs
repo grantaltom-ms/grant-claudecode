@@ -28,7 +28,8 @@ const requiredTables = [
   'memory_chunks',
   'email_attachments',
   'memory_projects',
-  'open_loops'
+  'open_loops',
+  'context_cards'
 ];
 
 for (const table of requiredTables) {
