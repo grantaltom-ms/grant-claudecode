@@ -51,6 +51,25 @@ The memory stack is intentionally layered to control token cost:
 
 Assistant operations should start with the summary and active layers, then drill into `memory_chunks` or raw email/document records only when the compact context is insufficient.
 
+## Trust Layer
+
+Memory-backed answers should include enough trust context to keep the assistant useful without making Slack noisy:
+
+- Treat raw records as evidence and compact records as business memory. Email bodies, attachments, WhatsApp exports, Slack messages, AppFolio reports, and deployment logs should remain source evidence; `context_cards`, `open_loops`, `commitments`, and related records are the operational interpretation.
+- Search compact memory first. Use `context_cards` for known people, properties, projects, owner/investor facts, and open operating context; use `memory_chunks` or raw records only when source-level detail is needed.
+- Carry confidence metadata through retrieval. Tool results should expose source systems, evidence count, last verified date, confidence hint, and missing source-of-truth checks when possible.
+- Keep Slack short. Slack should show the answer, next action, and a concise evidence/confidence note; richer details belong in Supabase logs, memory records, or follow-up retrieval.
+
+Source-of-truth roles:
+
+- AppFolio: current property, tenant, accounting, and ledger status.
+- Email: conversation history, requests, promises, and attachments.
+- WhatsApp: informal work conversation history for approved work contacts.
+- Slack: team communication, approvals, and bot workflow state.
+- Supabase: assistant memory, summaries, open loops, commitments, context cards, and run logs.
+- GitHub: code and repository history.
+- Vercel: deployed app and runtime configuration state.
+
 ## Safety Defaults
 
 The digest no longer archives model-classified spam by default. It filters suspected spam/noise from the digest and records that behavior in digest metadata. Set `AUTO_ARCHIVE_SPAM=true` only if direct archive behavior is explicitly desired.

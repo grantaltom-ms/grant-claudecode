@@ -86,6 +86,39 @@ function truncate(value, max = 1200) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+function sourceSystemFromValue(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return null;
+  if (text.includes('appfolio')) return 'appfolio';
+  if (text.includes('whatsapp')) return 'whatsapp';
+  if (text.includes('slack') || text.includes('digest')) return 'slack';
+  if (text.includes('github')) return 'github';
+  if (text.includes('vercel')) return 'vercel';
+  if (
+    text.includes('email')
+    || text.includes('outlook')
+    || text.includes('graph')
+    || text.includes('message')
+    || text.includes('thread')
+  ) {
+    return 'email';
+  }
+  return 'supabase_memory';
+}
+
+function sourceTruthRole(sourceSystem) {
+  const roles = {
+    appfolio: 'current property, tenant, accounting, and ledger status',
+    email: 'conversation history, requests, promises, and attachments',
+    whatsapp: 'informal work conversation history',
+    slack: 'team communication, approvals, and bot workflow state',
+    supabase_memory: 'assistant memory, summaries, open loops, commitments, and context cards',
+    github: 'code and repository history',
+    vercel: 'deployed app and runtime configuration state',
+  };
+  return roles[sourceSystem] || 'supporting memory';
+}
+
 function fallbackCardFromChunk(item) {
   return {
     card_type: item.source_type,
@@ -93,6 +126,7 @@ function fallbackCardFromChunk(item) {
     summary: item.chunk_summary || item.chunk_text,
     importance: 'normal',
     facts: item.metadata || {},
+    source_system: sourceSystemFromValue(item.source_table || item.source_type),
   };
 }
 
@@ -222,6 +256,7 @@ function compactContext(context) {
       due_at: item.due_at,
       status: item.status,
       source_subject: item.metadata?.source_subject || null,
+      source_system: 'supabase_memory',
     })),
     commitments: context.commitments.map(item => ({
       title: item.title,
@@ -230,6 +265,7 @@ function compactContext(context) {
       due_at: item.due_at,
       status: item.status,
       source_subject: item.metadata?.source_subject || null,
+      source_system: 'supabase_memory',
     })),
     draft_candidates: context.draft_candidates.map(item => ({
       sender: item.sender_name || item.sender_email,
@@ -238,6 +274,7 @@ function compactContext(context) {
       reason: item.reason,
       preview: truncate(item.context_summary, 450),
       known_contact_score: item.known_contact_score,
+      source_system: 'email',
     })),
     digest_items: context.digest_items.map(item => ({
       item_number: item.item_number,
@@ -247,6 +284,7 @@ function compactContext(context) {
       classification: item.classification,
       action_status: item.action_status,
       preview: truncate(item.raw_digest_input?.body_preview || item.raw_digest_input?.preview, 350),
+      source_system: 'slack',
     })),
     recent_emails: context.recent_emails.map(item => ({
       sender: item.sender_name || item.sender_email,
@@ -255,6 +293,7 @@ function compactContext(context) {
       importance: item.importance,
       has_attachments: item.has_attachments,
       preview: truncate(item.body_preview, 350),
+      source_system: 'email',
     })),
     context_cards: context.context_cards.map(item => ({
       card_type: item.card_type,
@@ -262,12 +301,15 @@ function compactContext(context) {
       summary: truncate(item.summary, 550),
       importance: item.importance,
       facts: item.facts,
+      source_system: item.source_system || sourceSystemFromValue(item.card_type),
+      source_truth_role: sourceTruthRole(item.source_system || sourceSystemFromValue(item.card_type)),
     })),
     operational_projects: context.operational_projects.map(item => ({
       name: item.name,
       status: item.status,
       summary: truncate(item.summary, 550),
       source_subject: item.metadata?.source_subject || null,
+      source_system: 'supabase_memory',
     })),
     context_card_mode: context.context_card_mode,
   };
@@ -297,7 +339,8 @@ Return ONLY valid JSON with this shape:
   "why_this_matters": "organization-level reason",
   "first_step": "10-30 minute starting action",
   "suggested_time_block": "calendar-sized block",
-  "evidence": [{"source": "email|memory|open_loop|commitment|digest", "label": "", "detail": ""}],
+  "evidence": [{"source": "email|appfolio|whatsapp|slack|supabase_memory|open_loop|commitment|digest", "label": "", "detail": ""}],
+  "confidence_note": "short note on how strong the evidence is and what source of truth is missing, if any",
   "runners_up": [{"title": "", "why_not_chosen": ""}],
   "scoring": {"impact": 1, "urgency": 1, "leverage": 1, "relationship_importance": 1, "confidence": 1, "effort_penalty": 1, "total": 1}
 }
@@ -318,12 +361,16 @@ ${JSON.stringify(compact, null, 2)}`,
 }
 
 function formatSlackMessage(suggestion, suggestionDate) {
+  const confidence = suggestion.scoring?.confidence
+    ? `*Confidence:* ${suggestion.scoring.confidence}/5`
+    : null;
   return [
     `*One Priority* (${suggestionDate})`,
     `*${truncate(suggestion.title || 'Highest-leverage activity', 80)}*`,
     truncate(suggestion.activity, 220),
     suggestion.first_step ? `*Start:* ${truncate(suggestion.first_step, 140)}` : null,
     `*Block:* ${truncate(suggestion.suggested_time_block || '60-90 minutes', 60)}`,
+    confidence,
   ].filter(Boolean).join('\n');
 }
 
@@ -361,6 +408,7 @@ async function saveSuggestion({ suggestion, suggestionDate, slackTs = null, rawC
       scoring: suggestion.scoring || {},
       raw_model_output: {
         suggestion,
+        confidence_note: suggestion.confidence_note || null,
         context_counts: rawContextCounts,
       },
       slack_channel_id: slackTs ? CHANNEL_ID : null,

@@ -423,6 +423,164 @@ function scoreContextCard(row, terms) {
   }, 0);
 }
 
+function uniqueArray(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function sourceSystemFromValue(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return null;
+  if (text.includes('appfolio')) return 'appfolio';
+  if (text.includes('whatsapp')) return 'whatsapp';
+  if (text.includes('slack') || text.includes('digest')) return 'slack';
+  if (text.includes('github')) return 'github';
+  if (text.includes('vercel')) return 'vercel';
+  if (
+    text.includes('email')
+    || text.includes('outlook')
+    || text.includes('graph')
+    || text.includes('message')
+    || text.includes('thread')
+  ) {
+    return 'email';
+  }
+  if (
+    text.includes('memory')
+    || text.includes('entity')
+    || text.includes('context')
+    || text.includes('property_profile')
+    || text.includes('owner_investor')
+    || text.includes('real_estate_schedule')
+  ) {
+    return 'supabase_memory';
+  }
+  return null;
+}
+
+function sourceSystemNote(sourceSystem) {
+  const notes = {
+    appfolio: 'current property, tenant, accounting, and ledger status',
+    email: 'conversation history, requests, promises, and attachments',
+    whatsapp: 'informal work conversation history',
+    slack: 'team communication, approvals, and bot workflow state',
+    supabase_memory: 'assistant memory, summaries, open loops, commitments, and context cards',
+    github: 'code and repository history',
+    vercel: 'deployed app and runtime configuration state',
+  };
+  return notes[sourceSystem] || 'supporting memory';
+}
+
+function sourceSystemsForContextCard(row) {
+  const refs = Array.isArray(row.source_refs) ? row.source_refs : [];
+  const fromRefs = refs.flatMap(ref => [
+    sourceSystemFromValue(ref.table),
+    sourceSystemFromValue(ref.source_type),
+  ]);
+  const fromFacts = [
+    sourceSystemFromValue(row.card_type),
+    sourceSystemFromValue(row.facts?.source_type),
+    sourceSystemFromValue(row.facts?.source_table),
+  ];
+  return uniqueArray([...fromRefs, ...fromFacts, 'supabase_memory']);
+}
+
+function sourceSystemForMemoryChunk(row) {
+  return sourceSystemFromValue(row.source_table)
+    || sourceSystemFromValue(row.source_type)
+    || 'supabase_memory';
+}
+
+function daysSince(value) {
+  if (!value) return null;
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return null;
+  return Math.floor((Date.now() - time) / 86_400_000);
+}
+
+function confidenceHint({ evidenceCount = 0, lastVerifiedAt = null, sourceSystems = [], thin = false }) {
+  const ageDays = daysSince(lastVerifiedAt);
+  if (thin || evidenceCount <= 0) return 'low';
+  if (sourceSystems.includes('appfolio') && ageDays !== null && ageDays <= 30) return 'high';
+  if (evidenceCount >= 3 && (ageDays === null || ageDays <= 120)) return 'high';
+  if (evidenceCount >= 1 && (ageDays === null || ageDays <= 240)) return 'medium';
+  return 'low';
+}
+
+function evidenceCountFromRefs(sourceRefs) {
+  if (!Array.isArray(sourceRefs)) return 0;
+  return sourceRefs.filter(ref => ref && (ref.pk || ref.table || ref.source_type)).length;
+}
+
+function attachContextCardTrust(row) {
+  const sourceSystems = sourceSystemsForContextCard(row);
+  const evidenceCount = Math.max(1, evidenceCountFromRefs(row.source_refs));
+  const lastVerifiedAt = row.source_updated_at || row.last_seen_at || row.updated_at || null;
+  return {
+    ...row,
+    trust: {
+      source_systems: sourceSystems,
+      source_of_truth: sourceSystems.map(system => ({
+        system,
+        role: sourceSystemNote(system),
+      })),
+      evidence_count: evidenceCount,
+      last_verified_at: lastVerifiedAt,
+      confidence_hint: confidenceHint({ evidenceCount, lastVerifiedAt, sourceSystems }),
+      missing_information: sourceSystems.includes('appfolio') ? [] : ['current AppFolio status not verified by this result'],
+    },
+  };
+}
+
+function attachMemoryChunkTrust(row) {
+  const sourceSystem = sourceSystemForMemoryChunk(row);
+  const thin = ['email_preview', 'attachment_metadata'].includes(row.source_type);
+  const lastVerifiedAt = row.updated_at || row.created_at || null;
+  return {
+    ...row,
+    trust: {
+      source_systems: [sourceSystem],
+      source_of_truth: [{
+        system: sourceSystem,
+        role: sourceSystemNote(sourceSystem),
+      }],
+      evidence_count: 1,
+      last_verified_at: lastVerifiedAt,
+      confidence_hint: confidenceHint({
+        evidenceCount: 1,
+        lastVerifiedAt,
+        sourceSystems: [sourceSystem],
+        thin,
+      }),
+      missing_information: thin ? ['result may be based on preview or metadata only'] : [],
+    },
+  };
+}
+
+function buildTrustSummary(results) {
+  const rows = Array.isArray(results) ? results : [];
+  const sourceSystems = uniqueArray(rows.flatMap(row => row.trust?.source_systems || []));
+  const confidenceRank = { low: 1, medium: 2, high: 3 };
+  const lowestConfidence = rows.reduce((lowest, row) => {
+    const current = row.trust?.confidence_hint || 'low';
+    return confidenceRank[current] < confidenceRank[lowest] ? current : lowest;
+  }, rows.length ? 'high' : 'low');
+
+  return {
+    source_systems: sourceSystems,
+    source_of_truth: sourceSystems.map(system => ({
+      system,
+      role: sourceSystemNote(system),
+    })),
+    evidence_count: rows.reduce((sum, row) => sum + (row.trust?.evidence_count || 0), 0),
+    confidence_hint: lowestConfidence,
+    last_verified_at: rows
+      .map(row => row.trust?.last_verified_at)
+      .filter(Boolean)
+      .sort()
+      .at(-1) || null,
+  };
+}
+
 async function createEmbedding(text) {
   if (!process.env.OPENAI_API_KEY) return null;
   const input = truncateText(text);
@@ -675,6 +833,7 @@ async function searchContextCards(input) {
         query,
         card_type: cardType,
         mode: 'context_cards_missing_memory_fallback',
+        trust_summary: fallback.trust_summary,
         results: fallback.results,
       };
     }
@@ -692,7 +851,8 @@ async function searchContextCards(input) {
       if (a.importance !== b.importance) return a.importance === 'high' ? -1 : 1;
       return new Date(b.updated_at || b.last_seen_at) - new Date(a.updated_at || a.last_seen_at);
     })
-    .slice(0, limit);
+    .slice(0, limit)
+    .map(attachContextCardTrust);
 
   await logRetrieval({
     query,
@@ -709,6 +869,7 @@ async function searchContextCards(input) {
     query,
     card_type: cardType,
     mode: 'context_card_keyword',
+    trust_summary: buildTrustSummary(results),
     results,
   };
 }
@@ -731,7 +892,7 @@ async function searchMemory(input) {
   }
 
   const fallbackResults = error ? await searchMemoryByKeyword(query, limit) : null;
-  const results = fallbackResults || data || [];
+  const results = (fallbackResults || data || []).map(attachMemoryChunkTrust);
 
   await logRetrieval({
     query,
@@ -749,6 +910,7 @@ async function searchMemory(input) {
     mode: fallbackResults
       ? 'direct_keyword_fallback'
       : (embedding ? 'hybrid_vector_keyword' : 'keyword_full_text'),
+    trust_summary: buildTrustSummary(results),
     results,
   };
 }
@@ -783,7 +945,8 @@ async function searchMemoryByKeyword(query, limit) {
       if (b.combined_score !== a.combined_score) return b.combined_score - a.combined_score;
       return new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at);
     })
-    .slice(0, limit);
+    .slice(0, limit)
+    .map(attachMemoryChunkTrust);
 }
 
 async function searchThreadMemory(input) {
@@ -1345,6 +1508,10 @@ RULES:
 - When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules
 - For questions about prior context, latest status, open items, properties, property aliases, owners/investors, team members, real estate schedule/investment profile, vendors, insurance, financial statements, invoices, deadlines, projects, or "what happened with X", search_context_cards first. If cards are missing, thin, or source details are needed, then use search_memory. Then use search_memory_entities, search_thread_memory, or get_entity_context for narrower follow-up.
 - When search_memory_entities returns a promising entity and Grant asks for details, call get_entity_context before answering.
+- Treat sources differently: AppFolio is current property/tenant/accounting status; email is conversation history and promises; WhatsApp is informal work conversation history; Slack is team communication and approvals; Supabase is assistant memory/workflow state; GitHub is code source of truth; Vercel is deployed runtime/configuration state.
+- When answering operational memory questions, use this short shape when it fits: what matters, who owns it, what happened last, what should happen next, and what evidence supports it.
+- Use the trust fields returned by memory tools. If confidence is low or medium, say so briefly. If AppFolio or another source of truth has not been checked, say the answer is not verified there.
+- Keep Slack replies short. Include only the most useful evidence inline; do not paste long source dumps unless Grant asks for detail.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
 - Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.
 - When Grant asks "what should I respond to?" or asks for draft suggestions, call list_draft_response_candidates first. For a chosen candidate, gather the email, thread, memory, contact/entity context, and prior draft_feedback before drafting.
