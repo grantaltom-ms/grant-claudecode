@@ -300,6 +300,17 @@ const EMAIL_TOOLS = [
     },
   },
   {
+    name: 'list_forgotten_items',
+    description: 'Find operational items Grant may be forgetting: stale open loops, waiting commitments, unresolved digest items, draft reply candidates, and active context-card signals. Use when Grant asks "what am I forgetting?", "what slipped?", "what loose ends are there?", or similar.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days_stale: { type: 'number', description: 'How many days old before an open item is considered stale. Default 7, max 60.' },
+        limit: { type: 'number', description: 'Maximum total ranked items to return. Default 8, max 15.' },
+      },
+    },
+  },
+  {
     name: 'resolve_draft_response_candidate',
     description: 'Resolve a draft response candidate by candidate UUID or list rank, then load its original email, thread memory, and prior draft feedback. Use this before drafting a chosen candidate such as "draft candidate #1".',
     input_schema: {
@@ -1115,6 +1126,287 @@ async function resolveDraftResponseCandidate(input) {
   };
 }
 
+function boundedDays(value, fallback = 7, max = 60) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
+  return Math.min(Math.floor(numeric), max);
+}
+
+function compactForgottenText(value, max = 420) {
+  return truncateText(value, max);
+}
+
+function latestTimestamp(...values) {
+  return values
+    .filter(Boolean)
+    .sort()
+    .at(-1) || null;
+}
+
+function forgottenAgeDays(item) {
+  return daysSince(latestTimestamp(item.updated_at, item.received_at, item.due_at, item.last_seen_at, item.source_updated_at));
+}
+
+function forgottenItemScore(item, staleDays) {
+  const age = forgottenAgeDays(item) || 0;
+  let score = Math.min(age, 60);
+  if (item.due_at && Date.parse(item.due_at) < Date.now()) score += 35;
+  if (item.priority === 'high') score += 25;
+  if (item.status === 'waiting') score += 15;
+  if (item.kind === 'draft_candidate') score += 18;
+  if (item.kind === 'digest_item') score += 12;
+  if (age >= staleDays) score += 10;
+  return score;
+}
+
+function forgottenTrust({ sourceSystem = 'supabase_memory', evidenceCount = 1, lastVerifiedAt = null, missingInformation = [] }) {
+  return {
+    source_systems: [sourceSystem],
+    source_of_truth: [{
+      system: sourceSystem,
+      role: sourceSystemNote(sourceSystem),
+    }],
+    evidence_count: evidenceCount,
+    last_verified_at: lastVerifiedAt,
+    confidence_hint: confidenceHint({
+      evidenceCount,
+      lastVerifiedAt,
+      sourceSystems: [sourceSystem],
+    }),
+    missing_information: missingInformation,
+  };
+}
+
+function forgottenFromOpenLoop(item, staleDays) {
+  const lastVerifiedAt = latestTimestamp(item.updated_at, item.due_at);
+  return {
+    kind: 'open_loop',
+    id: item.id,
+    title: item.title,
+    status: item.status,
+    priority: item.priority,
+    due_at: item.due_at,
+    last_seen_at: item.updated_at,
+    age_days: daysSince(item.updated_at),
+    reason: item.due_at && Date.parse(item.due_at) < Date.now()
+      ? 'Open loop is past its due date.'
+      : `Open loop is still ${item.status}${daysSince(item.updated_at) >= staleDays ? ' and stale' : ''}.`,
+    summary: compactForgottenText(item.description || item.metadata?.source_subject || ''),
+    source_label: item.metadata?.source_subject || 'open_loops',
+    suggested_next_action: 'Confirm owner and decide whether to close, delegate, or follow up.',
+    trust: forgottenTrust({ lastVerifiedAt }),
+    raw: item,
+  };
+}
+
+function forgottenFromCommitment(item, staleDays) {
+  const lastVerifiedAt = latestTimestamp(item.updated_at, item.due_at);
+  return {
+    kind: 'commitment',
+    id: item.id,
+    title: item.title,
+    status: item.status,
+    owner_name: item.owner_name,
+    due_at: item.due_at,
+    last_seen_at: item.updated_at,
+    age_days: daysSince(item.updated_at),
+    reason: item.due_at && Date.parse(item.due_at) < Date.now()
+      ? 'Commitment appears overdue.'
+      : `Commitment is still ${item.status}${daysSince(item.updated_at) >= staleDays ? ' and has not moved recently' : ''}.`,
+    summary: compactForgottenText(item.commitment || item.metadata?.source_subject || ''),
+    source_label: item.metadata?.source_subject || 'commitments',
+    suggested_next_action: item.owner_name
+      ? `Ask ${item.owner_name} for a status update or mark it done if complete.`
+      : 'Confirm who owns this and whether it is still active.',
+    trust: forgottenTrust({ lastVerifiedAt }),
+    raw: item,
+  };
+}
+
+function forgottenFromDraftCandidate(item) {
+  const lastVerifiedAt = item.received_at || item.updated_at || item.created_at;
+  return {
+    kind: 'draft_candidate',
+    id: item.id,
+    title: item.subject || `Reply candidate from ${item.sender_name || item.sender_email}`,
+    status: item.status,
+    sender: item.sender_name || item.sender_email,
+    received_at: item.received_at,
+    last_seen_at: lastVerifiedAt,
+    age_days: daysSince(lastVerifiedAt),
+    reason: 'Known contact email appears to be asking for a response and has not been drafted/sent.',
+    summary: compactForgottenText(item.context_summary || item.reason || ''),
+    source_label: `${item.sender_name || item.sender_email}${item.subject ? `: ${item.subject}` : ''}`,
+    suggested_next_action: 'Review whether this needs a short reply or dismissal.',
+    trust: forgottenTrust({ sourceSystem: 'email', lastVerifiedAt }),
+    raw: item,
+  };
+}
+
+function forgottenFromDigestItem(item) {
+  const lastVerifiedAt = item.received_at || item.created_at;
+  return {
+    kind: 'digest_item',
+    id: item.id,
+    title: item.subject || `Digest item #${item.item_number}`,
+    status: item.action_status,
+    sender: item.sender_name || item.sender_email,
+    received_at: item.received_at,
+    last_seen_at: lastVerifiedAt,
+    age_days: daysSince(lastVerifiedAt),
+    reason: `Digest item is still marked ${item.action_status}.`,
+    summary: compactForgottenText(item.raw_digest_input?.body_preview || item.raw_digest_input?.preview || ''),
+    source_label: `Digest #${item.item_number}${item.subject ? `: ${item.subject}` : ''}`,
+    suggested_next_action: 'Handle it, mark it waiting/done, or dismiss it in the digest thread.',
+    trust: forgottenTrust({ sourceSystem: 'slack', lastVerifiedAt }),
+    raw: item,
+  };
+}
+
+function forgottenFromContextCard(item) {
+  const sourceSystems = sourceSystemsForContextCard(item);
+  const lastVerifiedAt = item.source_updated_at || item.last_seen_at || item.updated_at;
+  return {
+    kind: `context_${item.card_type}`,
+    id: item.id,
+    title: item.title,
+    status: item.status,
+    importance: item.importance,
+    last_seen_at: lastVerifiedAt,
+    age_days: daysSince(lastVerifiedAt),
+    reason: `${item.card_type.replace('_', ' ')} context card may indicate an active loose end.`,
+    summary: compactForgottenText(item.summary || ''),
+    source_label: item.title,
+    suggested_next_action: 'Ask for a focused brief if this still looks active.',
+    trust: {
+      source_systems: sourceSystems,
+      source_of_truth: sourceSystems.map(system => ({
+        system,
+        role: sourceSystemNote(system),
+      })),
+      evidence_count: Math.max(1, evidenceCountFromRefs(item.source_refs)),
+      last_verified_at: lastVerifiedAt,
+      confidence_hint: confidenceHint({
+        evidenceCount: Math.max(1, evidenceCountFromRefs(item.source_refs)),
+        lastVerifiedAt,
+        sourceSystems,
+      }),
+      missing_information: sourceSystems.includes('appfolio') ? [] : ['current AppFolio status not verified by this result'],
+    },
+    raw: item,
+  };
+}
+
+async function listForgottenItems(input = {}) {
+  const staleDays = boundedDays(input.days_stale, 7, 60);
+  const limit = boundedLimit(input.limit, 8, 15);
+  const staleCutoff = new Date(Date.now() - staleDays * 86_400_000).toISOString();
+
+  const [
+    openLoops,
+    commitments,
+    draftCandidates,
+    digestItems,
+    contextCards,
+    latestPriority,
+  ] = await Promise.all([
+    supabase
+      .from('open_loops')
+      .select('id, title, description, priority, due_at, status, metadata, created_at, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .in('status', ['open', 'waiting'])
+      .or(`updated_at.lte.${staleCutoff},due_at.lte.${new Date().toISOString()},priority.eq.high`)
+      .order('updated_at', { ascending: true })
+      .limit(30),
+    supabase
+      .from('commitments')
+      .select('id, title, commitment, owner_name, due_at, status, metadata, created_at, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .in('status', ['open', 'waiting'])
+      .or(`updated_at.lte.${staleCutoff},due_at.lte.${new Date().toISOString()}`)
+      .order('updated_at', { ascending: true })
+      .limit(30),
+    supabase
+      .from('draft_response_candidates')
+      .select('id, status, graph_message_id, graph_conversation_id, sender_email, sender_name, subject, received_at, reason, context_summary, known_contact_score, back_and_forth_thread_count, created_at, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('status', 'candidate')
+      .order('received_at', { ascending: true })
+      .limit(20),
+    supabase
+      .from('digest_items')
+      .select('id, item_number, sender_name, sender_email, subject, received_at, classification, action_status, raw_digest_input, created_at')
+      .in('action_status', ['open', 'waiting'])
+      .order('created_at', { ascending: true })
+      .limit(20),
+    supabase
+      .from('context_cards')
+      .select('id, card_type, card_key, title, summary, facts, source_refs, status, importance, last_seen_at, source_updated_at, updated_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('status', 'active')
+      .in('card_type', ['open_loop', 'commitment', 'project'])
+      .or(`last_seen_at.lte.${staleCutoff},updated_at.lte.${staleCutoff},importance.eq.high`)
+      .order('updated_at', { ascending: true })
+      .limit(30),
+    supabase
+      .from('daily_priority_suggestions')
+      .select('suggestion_date, status, title, activity, first_step, evidence, scoring, slack_message_ts, created_at')
+      .eq('owner_email', OWNER_EMAIL)
+      .order('suggestion_date', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  const errors = [
+    openLoops.error,
+    commitments.error,
+    draftCandidates.error,
+    digestItems.error,
+    contextCards.error,
+    latestPriority.error,
+  ].filter(Boolean);
+  if (errors.length) throw new Error(`Forgotten item lookup failed: ${errors[0].message}`);
+
+  const candidates = [
+    ...(openLoops.data || []).map(item => forgottenFromOpenLoop(item, staleDays)),
+    ...(commitments.data || []).map(item => forgottenFromCommitment(item, staleDays)),
+    ...(draftCandidates.data || []).map(forgottenFromDraftCandidate),
+    ...(digestItems.data || []).map(forgottenFromDigestItem),
+    ...(contextCards.data || []).map(forgottenFromContextCard),
+  ].map(item => ({
+    ...item,
+    score: forgottenItemScore(item, staleDays),
+  }));
+
+  const ranked = candidates
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return (b.age_days || 0) - (a.age_days || 0);
+    })
+    .slice(0, limit);
+
+  await logRetrieval({
+    query: 'what am i forgetting',
+    toolName: 'list_forgotten_items',
+    resultCount: ranked.length,
+    usedEmbedding: false,
+    metadata: {
+      stale_days: staleDays,
+      total_candidates: candidates.length,
+      latest_priority_date: latestPriority.data?.suggestion_date || null,
+    },
+  });
+
+  return {
+    stale_days: staleDays,
+    total_candidates: candidates.length,
+    trust_summary: buildTrustSummary(ranked),
+    latest_priority: latestPriority.data || null,
+    results: ranked,
+    guidance: 'Summarize the top 3-6 items in Slack. Keep it short, include why it may be forgotten, next action, and confidence/source caveat when useful.',
+  };
+}
+
 async function markDraftCandidateDrafted(graphMessageId, draftId, draftBody) {
   const { data, error } = await supabase
     .from('draft_response_candidates')
@@ -1406,6 +1698,10 @@ async function executeToolInternal(name, input, token, threadTs) {
       return listDraftResponseCandidates(input);
     }
 
+    case 'list_forgotten_items': {
+      return listForgottenItems(input);
+    }
+
     case 'resolve_draft_response_candidate': {
       return resolveDraftResponseCandidate(input);
     }
@@ -1513,6 +1809,7 @@ RULES:
 - Use the trust fields returned by memory tools. If confidence is low or medium, say so briefly. If AppFolio or another source of truth has not been checked, say the answer is not verified there.
 - Keep Slack replies short. Include only the most useful evidence inline; do not paste long source dumps unless Grant asks for detail.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
+- When Grant asks "what am I forgetting?", "what slipped?", "what loose ends are there?", or similar, call list_forgotten_items first. Return the top 3-6 items, grouped lightly if helpful, with one concrete next action per item.
 - Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.
 - When Grant asks "what should I respond to?" or asks for draft suggestions, call list_draft_response_candidates first. For a chosen candidate, gather the email, thread, memory, contact/entity context, and prior draft_feedback before drafting.
 - When Grant refers to a draft candidate by number, such as "candidate #1", "draft #1", or "first one", call resolve_draft_response_candidate first. Use its original email body, thread memory, and prior_feedback before drafting.

@@ -51,6 +51,16 @@ The memory stack is intentionally layered to control token cost:
 
 Assistant operations should start with the summary and active layers, then drill into `memory_chunks` or raw email/document records only when the compact context is insufficient.
 
+## Slack Operations
+
+The interactive Slack assistant exposes focused operations on top of the memory stack:
+
+- `search_context_cards`: compact lookup for people, properties, projects, owner/investor facts, and operating context.
+- `search_memory`: deeper chunk search for source detail when compact cards are thin.
+- `list_forgotten_items`: "What am I forgetting?" check across stale `open_loops`, waiting `commitments`, unresolved digest items, draft response candidates, and active project/context cards.
+
+`list_forgotten_items` is intentionally read-only. It ranks likely loose ends and returns concise next actions, but it does not send messages, close items, or mutate workflow state.
+
 ## Trust Layer
 
 Memory-backed answers should include enough trust context to keep the assistant useful without making Slack noisy:
