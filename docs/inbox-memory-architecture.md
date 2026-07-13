@@ -58,8 +58,9 @@ The interactive Slack assistant exposes focused operations on top of the memory 
 - `search_context_cards`: compact lookup for people, properties, projects, owner/investor facts, and operating context.
 - `search_memory`: deeper chunk search for source detail when compact cards are thin.
 - `list_forgotten_items`: "What am I forgetting?" check across stale `open_loops`, waiting `commitments`, unresolved digest items, draft response candidates, and active project/context cards.
+- `update_forgotten_item_status`: feedback loop for forgotten-items results. Supports `done`, `dismiss`, `waiting`, `snooze`, `priority`, and `open` against the latest numbered list in a Slack thread.
 
-`list_forgotten_items` is intentionally read-only. It ranks likely loose ends and returns concise next actions, but it does not send messages, close items, or mutate workflow state.
+`list_forgotten_items` is read-only. `update_forgotten_item_status` mutates assistant memory/workflow state only; it does not send messages, change AppFolio, or delete source evidence.
 
 ## Trust Layer
 

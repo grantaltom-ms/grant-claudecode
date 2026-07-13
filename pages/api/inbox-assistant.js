@@ -311,6 +311,26 @@ const EMAIL_TOOLS = [
     },
   },
   {
+    name: 'update_forgotten_item_status',
+    description: 'Update feedback/status for an item returned by list_forgotten_items. Use when Grant says a forgotten item is done, dismissed, waiting, snoozed, important, open, or priority. Resolve numbered references like "#2" against the latest forgotten-items list in the current Slack thread.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        rank: { type: 'number', description: '1-based item number from the latest forgotten-items list, e.g. 2 for #2.' },
+        item_id: { type: 'string', description: 'Optional direct item UUID from list_forgotten_items.' },
+        item_kind: { type: 'string', description: 'Optional direct item kind from list_forgotten_items, e.g. open_loop, commitment, draft_candidate, digest_item, context_project.' },
+        action: {
+          type: 'string',
+          enum: ['done', 'dismiss', 'waiting', 'snooze', 'priority', 'open'],
+          description: 'The feedback/status to apply.',
+        },
+        snooze_days: { type: 'number', description: 'For action=snooze, number of days to hide/deprioritize the item. Default 7, max 90.' },
+        note: { type: 'string', description: 'Optional short note from Grant about why this status changed.' },
+      },
+      required: ['action'],
+    },
+  },
+  {
     name: 'resolve_draft_response_candidate',
     description: 'Resolve a draft response candidate by candidate UUID or list rank, then load its original email, thread memory, and prior draft feedback. Use this before drafting a chosen candidate such as "draft candidate #1".',
     input_schema: {
@@ -1159,6 +1179,13 @@ function forgottenItemScore(item, staleDays) {
   return score;
 }
 
+function isForgottenItemSnoozed(item) {
+  const snoozedUntil = item.raw?.metadata?.forgotten_feedback?.snoozed_until
+    || item.raw?.raw_digest_input?.forgotten_feedback?.snoozed_until
+    || item.raw?.facts?.forgotten_feedback?.snoozed_until;
+  return snoozedUntil && Date.parse(snoozedUntil) > Date.now();
+}
+
 function forgottenTrust({ sourceSystem = 'supabase_memory', evidenceCount = 1, lastVerifiedAt = null, missingInformation = [] }) {
   return {
     source_systems: [sourceSystem],
@@ -1373,10 +1400,12 @@ async function listForgottenItems(input = {}) {
     ...(draftCandidates.data || []).map(forgottenFromDraftCandidate),
     ...(digestItems.data || []).map(forgottenFromDigestItem),
     ...(contextCards.data || []).map(forgottenFromContextCard),
-  ].map(item => ({
-    ...item,
-    score: forgottenItemScore(item, staleDays),
-  }));
+  ]
+    .filter(item => !isForgottenItemSnoozed(item))
+    .map(item => ({
+      ...item,
+      score: forgottenItemScore(item, staleDays),
+    }));
 
   const ranked = candidates
     .sort((a, b) => {
@@ -1404,6 +1433,270 @@ async function listForgottenItems(input = {}) {
     latest_priority: latestPriority.data || null,
     results: ranked,
     guidance: 'Summarize the top 3-6 items in Slack. Keep it short, include why it may be forgotten, next action, and confidence/source caveat when useful.',
+  };
+}
+
+function normalizeForgottenAction(action) {
+  const normalized = String(action || '').toLowerCase().trim();
+  const aliases = {
+    dismissed: 'dismiss',
+    dismissing: 'dismiss',
+    complete: 'done',
+    completed: 'done',
+    closed: 'done',
+    close: 'done',
+    wait: 'waiting',
+    important: 'priority',
+    prioritize: 'priority',
+    prioritized: 'priority',
+    reopen: 'open',
+    opened: 'open',
+  };
+  return aliases[normalized] || normalized;
+}
+
+function updatePayloadForAction({ action, existingMetadata = {}, note = null, snoozeDays = 7 }) {
+  const now = new Date().toISOString();
+  const feedback = {
+    ...(existingMetadata.forgotten_feedback || {}),
+    action,
+    note: note || null,
+    updated_at: now,
+    source: 'slack_assistant',
+  };
+  if (action === 'snooze') {
+    feedback.snoozed_until = new Date(Date.now() + boundedDays(snoozeDays, 7, 90) * 86_400_000).toISOString();
+  } else {
+    delete feedback.snoozed_until;
+  }
+  return {
+    ...existingMetadata,
+    forgotten_feedback: feedback,
+  };
+}
+
+function statusForForgottenAction(action, itemKind) {
+  if (action === 'done') return itemKind === 'draft_candidate' ? 'dismissed' : 'done';
+  if (action === 'dismiss') return 'dismissed';
+  if (action === 'waiting' || action === 'snooze') return 'waiting';
+  if (action === 'open') return itemKind === 'draft_candidate' ? 'candidate' : 'open';
+  return null;
+}
+
+function baseForgottenKind(kind) {
+  const text = String(kind || '');
+  if (text.startsWith('context_')) return 'context_card';
+  return text;
+}
+
+async function resolveForgottenItemReference(input, threadTs) {
+  if (input.item_id && input.item_kind) {
+    return {
+      id: input.item_id,
+      kind: input.item_kind,
+      title: input.title || null,
+      source: 'direct',
+    };
+  }
+
+  const rank = Number(input.rank || 0);
+  if (!Number.isFinite(rank) || rank < 1) {
+    throw new Error('Provide an item number like #2 from the latest forgotten-items list.');
+  }
+
+  let query = supabase
+    .from('agent_actions')
+    .select('id, result, created_at, slack_thread_ts')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('tool_name', 'list_forgotten_items')
+    .eq('status', 'succeeded')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (threadTs) query = query.eq('slack_thread_ts', threadTs);
+
+  const { data, error } = await query.maybeSingle();
+  if (error) throw new Error(`Forgotten item reference lookup failed: ${error.message}`);
+  if (!data && threadTs) {
+    const { data: latestAnyThread, error: latestError } = await supabase
+      .from('agent_actions')
+      .select('id, result, created_at, slack_thread_ts')
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('tool_name', 'list_forgotten_items')
+      .eq('status', 'succeeded')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (latestError) throw new Error(`Forgotten item fallback lookup failed: ${latestError.message}`);
+    if (!latestAnyThread) throw new Error('No previous forgotten-items list found to resolve that item number.');
+    const fallbackItem = latestAnyThread.result?.results?.[rank - 1];
+    if (!fallbackItem) throw new Error(`No forgotten item #${rank} found in the latest list.`);
+    return {
+      ...fallbackItem,
+      source: 'latest_any_thread',
+      list_action_id: latestAnyThread.id,
+      list_created_at: latestAnyThread.created_at,
+    };
+  }
+
+  if (!data) throw new Error('No previous forgotten-items list found to resolve that item number.');
+  const item = data.result?.results?.[rank - 1];
+  if (!item) throw new Error(`No forgotten item #${rank} found in the latest list.`);
+  return {
+    ...item,
+    source: 'thread',
+    list_action_id: data.id,
+    list_created_at: data.created_at,
+  };
+}
+
+async function fetchRowForForgottenItem(table, id, select = 'id, metadata') {
+  const { data, error } = await supabase
+    .from(table)
+    .select(select)
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw new Error(`Forgotten item ${table} lookup failed: ${error.message}`);
+  if (!data) throw new Error(`No ${table} row found for forgotten item.`);
+  return data;
+}
+
+async function updateForgottenItemStatus(input, threadTs) {
+  const action = normalizeForgottenAction(input.action);
+  if (!['done', 'dismiss', 'waiting', 'snooze', 'priority', 'open'].includes(action)) {
+    throw new Error(`Unsupported forgotten item action: ${input.action}`);
+  }
+
+  const item = await resolveForgottenItemReference(input, threadTs);
+  const kind = baseForgottenKind(item.kind || input.item_kind);
+  const now = new Date().toISOString();
+  const note = input.note || null;
+  const snoozeDays = boundedDays(input.snooze_days, 7, 90);
+
+  let updated = null;
+  let table = null;
+  let appliedAction = action;
+
+  if (kind === 'open_loop') {
+    table = 'open_loops';
+    const row = await fetchRowForForgottenItem(table, item.id, 'id, title, status, priority, metadata');
+    const metadata = updatePayloadForAction({ action, existingMetadata: row.metadata || {}, note, snoozeDays });
+    const payload = {
+      metadata,
+      updated_at: now,
+    };
+    const status = statusForForgottenAction(action, kind);
+    if (status) payload.status = status;
+    if (action === 'priority') payload.priority = 'high';
+    const { data, error } = await supabase
+      .from(table)
+      .update(payload)
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('id', item.id)
+      .select('id, title, status, priority, metadata, updated_at')
+      .maybeSingle();
+    if (error) throw new Error(`Open loop update failed: ${error.message}`);
+    updated = data;
+  } else if (kind === 'commitment') {
+    table = 'commitments';
+    const row = await fetchRowForForgottenItem(table, item.id, 'id, title, status, metadata');
+    const metadata = updatePayloadForAction({ action, existingMetadata: row.metadata || {}, note, snoozeDays });
+    if (action === 'priority') metadata.priority = 'high';
+    const payload = {
+      metadata,
+      updated_at: now,
+    };
+    const status = statusForForgottenAction(action, kind);
+    if (status) payload.status = status;
+    const { data, error } = await supabase
+      .from(table)
+      .update(payload)
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('id', item.id)
+      .select('id, title, status, metadata, updated_at')
+      .maybeSingle();
+    if (error) throw new Error(`Commitment update failed: ${error.message}`);
+    updated = data;
+  } else if (kind === 'draft_candidate') {
+    table = 'draft_response_candidates';
+    const row = await fetchRowForForgottenItem(table, item.id, 'id, subject, status, metadata');
+    const metadata = updatePayloadForAction({ action, existingMetadata: row.metadata || {}, note, snoozeDays });
+    if (action === 'priority') metadata.priority = 'high';
+    const payload = {
+      metadata,
+      updated_at: now,
+    };
+    const status = statusForForgottenAction(action, kind);
+    if (status) payload.status = status;
+    const { data, error } = await supabase
+      .from(table)
+      .update(payload)
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('id', item.id)
+      .select('id, subject, status, metadata, updated_at')
+      .maybeSingle();
+    if (error) throw new Error(`Draft candidate update failed: ${error.message}`);
+    updated = data;
+  } else if (kind === 'digest_item') {
+    table = 'digest_items';
+    const row = await fetchRowForForgottenItem(table, item.id, 'id, subject, action_status, raw_digest_input');
+    const rawDigestInput = updatePayloadForAction({
+      action,
+      existingMetadata: row.raw_digest_input || {},
+      note,
+      snoozeDays,
+    });
+    if (action === 'priority') rawDigestInput.priority = 'high';
+    const payload = { raw_digest_input: rawDigestInput };
+    const status = statusForForgottenAction(action, kind);
+    if (status) payload.action_status = status;
+    const { data, error } = await supabase
+      .from(table)
+      .update(payload)
+      .eq('id', item.id)
+      .select('id, subject, action_status, raw_digest_input')
+      .maybeSingle();
+    if (error) throw new Error(`Digest item update failed: ${error.message}`);
+    updated = data;
+  } else if (kind === 'context_card') {
+    table = 'context_cards';
+    const row = await fetchRowForForgottenItem(table, item.id, 'id, title, status, importance, facts');
+    const facts = updatePayloadForAction({ action, existingMetadata: row.facts || {}, note, snoozeDays });
+    const payload = {
+      facts,
+      updated_at: now,
+    };
+    if (action === 'dismiss') payload.status = 'dismissed';
+    if (action === 'done') payload.status = 'done';
+    if (action === 'open') payload.status = 'active';
+    if (action === 'priority') payload.importance = 'high';
+    const { data, error } = await supabase
+      .from(table)
+      .update(payload)
+      .eq('owner_email', OWNER_EMAIL)
+      .eq('id', item.id)
+      .select('id, title, status, importance, facts, updated_at')
+      .maybeSingle();
+    if (error) throw new Error(`Context card update failed: ${error.message}`);
+    updated = data;
+  } else {
+    throw new Error(`Cannot update forgotten item kind: ${item.kind || input.item_kind}`);
+  }
+
+  return {
+    ok: true,
+    action: appliedAction,
+    item: {
+      id: item.id,
+      kind: item.kind,
+      title: item.title || item.source_label || updated?.title || updated?.subject || null,
+      rank: input.rank || null,
+    },
+    table,
+    updated,
+    message: action === 'snooze'
+      ? `Snoozed for ${snoozeDays} day(s).`
+      : `Marked ${action}.`,
   };
 }
 
@@ -1702,6 +1995,10 @@ async function executeToolInternal(name, input, token, threadTs) {
       return listForgottenItems(input);
     }
 
+    case 'update_forgotten_item_status': {
+      return updateForgottenItemStatus(input, threadTs);
+    }
+
     case 'resolve_draft_response_candidate': {
       return resolveDraftResponseCandidate(input);
     }
@@ -1794,6 +2091,7 @@ const SYSTEM_PROMPT = `You are an email assistant for Grant Carlson, Head of Ope
 
 RULES:
 - NEVER send an email without Grant explicitly approving it (e.g. "send it", "looks good", "go ahead")
+- If the current Slack thread contains a forgotten-items list, follow-up references like "#1", "#2", or "number 3" refer to that forgotten-items list unless Grant explicitly says digest item.
 - When Grant refers to a numbered digest item like "#1", "#2", or "number 3", call resolve_digest_item first and use its message_id for any get_email or create_draft_reply call.
 - When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading. Save the draft, show it in Slack, then ask: "Send it, edit it, or discard?"
 - If Grant says a numbered digest item is done, waiting, dismissed, or has a draft prepared, call update_digest_item_status.
@@ -1809,7 +2107,9 @@ RULES:
 - Use the trust fields returned by memory tools. If confidence is low or medium, say so briefly. If AppFolio or another source of truth has not been checked, say the answer is not verified there.
 - Keep Slack replies short. Include only the most useful evidence inline; do not paste long source dumps unless Grant asks for detail.
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
-- When Grant asks "what am I forgetting?", "what slipped?", "what loose ends are there?", or similar, call list_forgotten_items first. Return the top 3-6 items, grouped lightly if helpful, with one concrete next action per item.
+- When Grant asks "what am I forgetting?", "what slipped?", "what loose ends are there?", or similar, call list_forgotten_items first. Return the top 3-6 items as a numbered list, grouped lightly if helpful, with one concrete next action per item.
+- When Grant follows up on a forgotten-items list with "done #2", "dismiss #3", "waiting on #4", "snooze #1", "make #5 priority", or similar, call update_forgotten_item_status. Resolve the number against the latest forgotten-items list in the Slack thread, not the morning digest.
+- For forgotten-items feedback, confirm the update in one short sentence. Do not send emails or change AppFolio.
 - Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.
 - When Grant asks "what should I respond to?" or asks for draft suggestions, call list_draft_response_candidates first. For a chosen candidate, gather the email, thread, memory, contact/entity context, and prior draft_feedback before drafting.
 - When Grant refers to a draft candidate by number, such as "candidate #1", "draft #1", or "first one", call resolve_draft_response_candidate first. Use its original email body, thread memory, and prior_feedback before drafting.
