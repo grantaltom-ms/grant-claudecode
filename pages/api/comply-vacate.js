@@ -16,6 +16,7 @@ import {
   generateNoticePdf,
   uploadPdfToSlack,
 } from '../../lib/comply-agent.js';
+import { claimSlackEvent } from '../../lib/event-dedup';
 import {
   buildChoiceBlocks,
   buildApprovalBlocks,
@@ -44,6 +45,8 @@ export default async function handler(req, res) {
   waitUntil(
     (async () => {
       try {
+        if (!(await claimSlackEvent(req.body.event_id))) return;
+
         const botUserId = await getBotUserId();
         if (event.user === botUserId) return;
 
@@ -52,7 +55,7 @@ export default async function handler(req, res) {
 
         await slackPost(COMPLY_CHANNEL_ID, '_On it..._', thread_ts);
 
-        const state = await loadState(thread_ts);
+        const { state, version } = await loadState(thread_ts);
         let conversationHistory = [];
 
         if (!isNewThread) {
@@ -67,11 +70,12 @@ export default async function handler(req, res) {
           state
         );
 
-        let newState = state || {};
-        if (tenantData) Object.assign(newState, tenantData);
+        const mergeFields = {};
+        if (tenantData) Object.assign(mergeFields, tenantData);
         for (const { section_number, content } of sectionApprovals) {
-          newState[`section${section_number}`] = content;
+          mergeFields[`section${section_number}`] = content;
         }
+        const newState = { ...(state || {}), ...mergeFields };
 
         const allSectionsApproved = newState.section1 && newState.section2 && newState.section3;
 
@@ -82,7 +86,9 @@ export default async function handler(req, res) {
 
         await Promise.all([
           slackPost(COMPLY_CHANNEL_ID, agentResponse, thread_ts, blocks),
-          saveState(thread_ts, newState),
+          Object.keys(mergeFields).length > 0
+            ? saveState(thread_ts, mergeFields, version, state)
+            : Promise.resolve(),
         ]);
 
         if (allSectionsApproved) {

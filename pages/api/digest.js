@@ -619,9 +619,38 @@ async function summarizeThreadMemories(emails) {
   return { threads: summarizedThreads, skippedCount };
 }
 
+// Guards against two overlapping digest runs (e.g. a retriggered run racing
+// a slow one) rather than "only one per calendar day" -- a run that reached
+// a terminal status (posted/no_emails/no_actionable) doesn't block a later
+// same-day retrigger, only a genuinely still-in-progress one does. The
+// 30-minute cutoff keeps a run that crashed without ever reaching a
+// terminal status from permanently blocking every future trigger.
+async function findInFlightDigestRun() {
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('digest_runs')
+    .select('id, run_started_at')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('status', 'started')
+    .gte('run_started_at', cutoff)
+    .limit(1);
+
+  if (error) {
+    console.error('Failed to check for an in-flight digest run:', error);
+    return null; // fail open -- a check-query hiccup shouldn't block a real run
+  }
+  return data?.[0] || null;
+}
+
 export async function runDigest() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Missing Supabase environment variables: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY');
+  }
+
+  const inFlight = await findInFlightDigestRun();
+  if (inFlight) {
+    console.log(`Digest run already in progress (digest_run ${inFlight.id}, started ${inFlight.run_started_at}); skipping duplicate trigger.`);
+    return;
   }
 
   const token = await getGraphToken();

@@ -11,10 +11,6 @@ describe('Phase 6 -- digest pagination (graphAbsolute exists, but digest.js does
   it.todo('digest.js follows @odata.nextLink across multiple pages and all items arrive');
 });
 
-describe('Phase 6 -- concurrency protection (digest_runs has no dedup yet)', () => {
-  it.todo('running the digest twice within the same window produces exactly one digest_runs row');
-});
-
 describe('Phase 7 -- hard approval gate (send_draft is still a callable tool; pages/api/inbox-interactions.js does not exist yet)', () => {
   it.todo('a draft request produces a draft and calls no Graph send endpoint');
   it.todo('clicking Send in Slack sends exactly once');

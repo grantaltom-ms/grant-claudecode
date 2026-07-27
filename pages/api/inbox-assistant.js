@@ -5,6 +5,7 @@ import { getGraphToken, graph } from '../../lib/graph';
 import { slackPost as _slackPost, getThreadHistory as _getThreadHistory } from '../../lib/slack';
 import { callClaude, DEFAULT_MODEL } from '../../lib/claude';
 import { fetchEmbedding } from '../../lib/openai';
+import { claimSlackEvent } from '../../lib/event-dedup';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -2194,6 +2195,8 @@ export default async function handler(req, res) {
 
   waitUntil(
     (async () => {
+      if (!(await claimSlackEvent(body.event_id))) return;
+
       const replyTs = event.thread_ts || event.ts;
       await slackPost('_On it..._', replyTs);
       const history = event.thread_ts
