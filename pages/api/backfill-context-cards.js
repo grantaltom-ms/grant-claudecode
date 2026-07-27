@@ -1,10 +1,6 @@
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 const CHUNK_CARD_TYPES = {
   property_profile: 'property',

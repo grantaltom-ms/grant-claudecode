@@ -1,11 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
+import { callClaude } from '../../lib/claude';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
@@ -75,7 +71,7 @@ async function loadThreadSummaries(limit) {
   return data || [];
 }
 
-async function extractOperationalMemory(anthropic, threads) {
+async function extractOperationalMemory(threads) {
   const input = threads.map((thread, index) => (
     `${index}. source_index: ${index}\n` +
     `subject: ${thread.latest_subject || ''}\n` +
@@ -85,9 +81,8 @@ async function extractOperationalMemory(anthropic, threads) {
     `open_items: ${JSON.stringify(thread.open_items || [])}`
   )).join('\n\n');
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 3500,
+  const response = await callClaude({
+    maxTokens: 3500,
     system: `Extract durable operating memory from email thread summaries for Grant Carlson at Milestone Properties.
 
 Return ONLY valid JSON:
@@ -209,7 +204,7 @@ export default async function handler(req, res) {
   try {
     const limit = boundedInteger(req.query.threads, 20, 50);
     const threads = await loadThreadSummaries(limit);
-    const extracted = await extractOperationalMemory(new Anthropic(), threads);
+    const extracted = await extractOperationalMemory(threads);
 
     const counts = {
       projects: 0,

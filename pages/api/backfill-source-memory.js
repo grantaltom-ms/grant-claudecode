@@ -1,11 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
+import { supabase as targetSupabase } from '../../lib/supabase';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 const DEFAULT_SOURCE_SUPABASE_URL = 'https://augbrysfqwgekfhfokco.supabase.co';
-const targetSupabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
