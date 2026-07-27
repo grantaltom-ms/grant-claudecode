@@ -52,7 +52,7 @@ async function maybeUploadCompletedNotice(state, threadTs) {
 }
 
 async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
-  const [botUserId, state, threadMessages] = await Promise.all([
+  const [botUserId, { state, version }, threadMessages] = await Promise.all([
     getBotUserId(),
     loadState(threadTs),
     getThreadHistory(COMPLY_CHANNEL_ID, threadTs),
@@ -67,11 +67,12 @@ async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
     state
   );
 
-  const newState = state || {};
-  if (tenantData) Object.assign(newState, tenantData);
+  const mergeFields = {};
+  if (tenantData) Object.assign(mergeFields, tenantData);
   for (const { section_number, content } of sectionApprovals) {
-    newState[`section${section_number}`] = content;
+    mergeFields[`section${section_number}`] = content;
   }
+  const newState = { ...(state || {}), ...mergeFields };
 
   const blocks =
     buildApprovalBlocks(agentResponse, threadTs) ??
@@ -79,7 +80,9 @@ async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
 
   await Promise.all([
     slackPost(COMPLY_CHANNEL_ID, agentResponse, threadTs, blocks),
-    saveState(threadTs, newState),
+    Object.keys(mergeFields).length > 0
+      ? saveState(threadTs, mergeFields, version, state)
+      : Promise.resolve(),
   ]);
 
   await maybeUploadCompletedNotice(newState, threadTs);

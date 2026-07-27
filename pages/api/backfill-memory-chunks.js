@@ -1,4 +1,5 @@
 import { supabase } from '../../lib/supabase';
+import { fetchEmbedding } from '../../lib/openai';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
@@ -74,36 +75,13 @@ async function createEmbedding(text) {
   const input = truncateText(text, 7000);
   if (!input) return null;
 
-  const response = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input,
-    }),
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    console.error('Embedding request failed:', {
-      status: response.status,
-      error: data?.error?.message || data,
-    });
-    return {
-      embedding: null,
-      error: data?.error?.message || `OpenAI embedding request failed with status ${response.status}`,
-      status: response.status,
-    };
+  try {
+    const data = await fetchEmbedding(input, EMBEDDING_MODEL);
+    return { embedding: data.data?.[0]?.embedding || null, error: null, status: 200 };
+  } catch (error) {
+    console.error('Embedding request failed:', { status: error.status, error: error.message });
+    return { embedding: null, error: error.message, status: error.status };
   }
-
-  return {
-    embedding: data.data?.[0]?.embedding || null,
-    error: null,
-    status: response.status,
-  };
 }
 
 async function upsertChunk(chunk) {
