@@ -38,7 +38,7 @@ function truncateText(text, max = 6000) {
   return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
 }
 
-function chunkLongText(text, maxLength = EMAIL_BODY_CHUNK_SIZE, overlap = EMAIL_BODY_CHUNK_OVERLAP) {
+export function chunkLongText(text, maxLength = EMAIL_BODY_CHUNK_SIZE, overlap = EMAIL_BODY_CHUNK_OVERLAP) {
   const normalized = (text || '').replace(/\s+/g, ' ').trim();
   if (!normalized) return [''];
   if (normalized.length <= maxLength) return [normalized];

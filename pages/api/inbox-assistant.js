@@ -560,7 +560,7 @@ function buildTrustSummary(results) {
   };
 }
 
-async function createEmbedding(text) {
+export async function createEmbedding(text) {
   if (!process.env.OPENAI_API_KEY) return null;
   const input = truncateText(text);
   if (!input) return null;
@@ -853,7 +853,7 @@ async function searchContextCards(input) {
   };
 }
 
-async function searchMemory(input) {
+export async function searchMemory(input) {
   const query = normalizeSearchTerm(input.query);
   if (!query) throw new Error('Search query is required.');
 
@@ -1994,7 +1994,7 @@ function getRawBody(req) {
   });
 }
 
-function verifySlackSignature(rawBody, headers) {
+export function verifySlackSignature(rawBody, headers) {
   const timestamp = headers['x-slack-request-timestamp'];
   const signature = headers['x-slack-signature'];
   if (!timestamp || !signature) return false;

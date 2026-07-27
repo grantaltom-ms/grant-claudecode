@@ -619,7 +619,7 @@ async function summarizeThreadMemories(emails) {
   return { threads: summarizedThreads, skippedCount };
 }
 
-async function runDigest() {
+export async function runDigest() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Missing Supabase environment variables: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY');
   }
