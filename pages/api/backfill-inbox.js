@@ -1,95 +1,11 @@
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
+import { getGraphToken, graph, graphAbsolute } from '../../lib/graph';
+import { extractBodyFields } from '../../lib/email-parse';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-let cachedToken = null;
-let tokenExpiry = 0;
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
-}
-
-async function getGraphToken() {
-  if (cachedToken && Date.now() < tokenExpiry - 60_000) return cachedToken;
-
-  const res = await fetch(
-    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: process.env.AZURE_CLIENT_ID,
-        client_secret: process.env.AZURE_CLIENT_SECRET,
-        scope: 'https://graph.microsoft.com/.default',
-      }),
-    }
-  );
-
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`Graph auth failed: ${JSON.stringify(data)}`);
-
-  cachedToken = data.access_token;
-  tokenExpiry = Date.now() + data.expires_in * 1000;
-  return cachedToken;
-}
-
-async function graph(token, pathOrUrl) {
-  const url = pathOrUrl.startsWith('https://')
-    ? pathOrUrl
-    : `https://graph.microsoft.com/v1.0${pathOrUrl}`;
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-  });
-  const text = await res.text();
-  if (!text) return { success: true };
-
-  const json = JSON.parse(text);
-  if (json.error) throw new Error(`Graph error: ${json.error.message}`);
-  return json;
-}
-
-function htmlToText(html = '') {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function extractBodyFields(email) {
-  const body = email.body || {};
-  const content = body.content || null;
-  const contentType = (body.contentType || '').toLowerCase();
-
-  if (!content) return { body_text: null, body_html: null };
-  if (contentType === 'html') {
-    return {
-      body_text: htmlToText(content),
-      body_html: content
-    };
-  }
-
-  return {
-    body_text: content,
-    body_html: null
-  };
 }
 
 function collectEmailAddresses(recipients = []) {
@@ -291,19 +207,20 @@ export default async function handler(req, res) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   const select = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments';
 
-  let url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
+  const initialPath = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
     + `?$top=50`
     + `&$select=${select}`
     + `&$filter=receivedDateTime ge ${since}`
     + `&$orderby=receivedDateTime desc`;
+  let nextLink = null;
   let fetched = 0;
   let savedEmails = 0;
   let updatedThreads = 0;
   const errors = [];
   const threadErrors = [];
 
-  while (url && fetched < maxMessages) {
-    const result = await graph(token, url);
+  while (fetched < maxMessages) {
+    const result = nextLink ? await graphAbsolute(token, nextLink) : await graph(token, initialPath);
     const emails = result.value || [];
 
     for (const email of emails) {
@@ -321,7 +238,8 @@ export default async function handler(req, res) {
       if (savedThread) updatedThreads += 1;
     }
 
-    url = result['@odata.nextLink'] || null;
+    nextLink = result['@odata.nextLink'] || null;
+    if (!nextLink) break;
   }
 
   return res.status(200).json({
