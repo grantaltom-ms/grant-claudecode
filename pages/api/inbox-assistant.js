@@ -1,7 +1,9 @@
 import crypto from 'crypto';
-import Anthropic from '@anthropic-ai/sdk';
-import { createClient } from '@supabase/supabase-js';
 import { waitUntil } from '@vercel/functions';
+import { supabase } from '../../lib/supabase';
+import { getGraphToken, graph } from '../../lib/graph';
+import { slackPost as _slackPost, getThreadHistory as _getThreadHistory } from '../../lib/slack';
+import { callClaude, DEFAULT_MODEL } from '../../lib/claude';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -9,60 +11,6 @@ export const config = { api: { bodyParser: false } };
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-// --- Microsoft Graph helpers ---
-
-let cachedToken = null;
-let tokenExpiry = 0;
-
-async function getGraphToken() {
-  if (cachedToken && Date.now() < tokenExpiry - 60_000) return cachedToken;
-
-  const res = await fetch(
-    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: process.env.AZURE_CLIENT_ID,
-        client_secret: process.env.AZURE_CLIENT_SECRET,
-        scope: 'https://graph.microsoft.com/.default',
-      }),
-    }
-  );
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`Graph auth failed: ${JSON.stringify(data)}`);
-
-  cachedToken = data.access_token;
-  tokenExpiry = Date.now() + data.expires_in * 1000;
-  return cachedToken;
-}
-
-async function graph(token, path, method = 'GET', body = null) {
-  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    ...(body && { body: JSON.stringify(body) }),
-  });
-
-  // 202 Accepted = success with no body (e.g. send)
-  if (res.status === 202 || res.status === 204) return { success: true };
-
-  const text = await res.text();
-  if (!text) return { success: true };
-
-  const json = JSON.parse(text);
-  if (json.error) throw new Error(`Graph error: ${json.error.message}`);
-  return json;
-}
 
 // --- Claude tool definitions ---
 
@@ -2061,28 +2009,21 @@ function verifySlackSignature(rawBody, headers) {
   }
 }
 
+// Preserves this file's original fire-and-forget contract (never throws) --
+// lib/slack.js's slackPost throws on API failure, which is a deliberate
+// behavior difference from the Comply bot's stricter needs, not something
+// to introduce here as a side effect of consolidation.
 async function slackPost(text, threadTs = null) {
-  await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      channel: CHANNEL_ID,
-      text,
-      ...(threadTs && { thread_ts: threadTs }),
-    }),
-  });
+  try {
+    return await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, text, threadTs);
+  } catch (err) {
+    console.error('slackPost failed:', err.message);
+    return null;
+  }
 }
 
 async function getThreadHistory(threadTs) {
-  const res = await fetch(
-    `https://slack.com/api/conversations.replies?channel=${CHANNEL_ID}&ts=${threadTs}&limit=20`,
-    { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
-  );
-  const data = await res.json();
-  return data.messages || [];
+  return _getThreadHistory(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, threadTs, 20);
 }
 
 // --- Agentic loop ---
@@ -2178,7 +2119,6 @@ FORMAT SLACK RESPONSES:
 
 async function runAgent(userMessage, threadTs, threadHistory = []) {
   const token = await getGraphToken();
-  const anthropic = new Anthropic();
 
   // Build conversation context from thread history (so Claude knows about prior drafts, etc.)
   const messages = [];
@@ -2192,9 +2132,9 @@ async function runAgent(userMessage, threadTs, threadHistory = []) {
   messages.push({ role: 'user', content: userMessage });
 
   while (true) {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 4096,
+    const response = await callClaude({
+      model: DEFAULT_MODEL,
+      maxTokens: 4096,
       system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
       tools: EMAIL_TOOLS,
       messages,
