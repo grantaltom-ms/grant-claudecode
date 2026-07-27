@@ -1,4 +1,22 @@
 {
+  "functions": {
+    "pages/api/digest.js": { "maxDuration": 300 },
+    "pages/api/memory-maintenance.js": { "maxDuration": 300 },
+    "pages/api/backfill-inbox.js": { "maxDuration": 300 },
+    "pages/api/backfill-sent-mail.js": { "maxDuration": 300 },
+    "pages/api/backfill-email-bodies.js": { "maxDuration": 300 },
+    "pages/api/backfill-attachments.js": { "maxDuration": 300 },
+    "pages/api/backfill-entities.js": { "maxDuration": 300 },
+    "pages/api/backfill-memory-chunks.js": { "maxDuration": 300 },
+    "pages/api/backfill-operational-memory.js": { "maxDuration": 300 },
+    "pages/api/backfill-owner-investors.js": { "maxDuration": 300 },
+    "pages/api/backfill-source-memory.js": { "maxDuration": 300 },
+    "pages/api/backfill-draft-candidates.js": { "maxDuration": 300 },
+    "pages/api/backfill-context-cards.js": { "maxDuration": 300 },
+    "pages/api/inbox-assistant.js": { "maxDuration": 120 },
+    "pages/api/comply-vacate.js": { "maxDuration": 120 },
+    "pages/api/comply-interactions.js": { "maxDuration": 120 }
+  },
   "crons": [
     {
       "path": "/api/digest",

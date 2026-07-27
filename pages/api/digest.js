@@ -63,9 +63,10 @@ async function archiveEmail(token, messageId) {
     await graph(token, `/users/${OWNER_EMAIL}/messages/${messageId}/move`, 'POST', {
       destinationId: 'archive',
     });
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (error) {
+    console.error('Archive failed:', { messageId, error: error?.message || error });
+    return { ok: false, error: error?.message || String(error) };
   }
 }
 
@@ -557,7 +558,8 @@ Be conservative but useful. Prefer specific property names, vendor/company names
 async function extractEntitiesFromEmails(anthropic, emails) {
   const maxEmailsForExtraction = 20;
   const emailsForExtraction = emails.slice(0, maxEmailsForExtraction);
-  if (emailsForExtraction.length === 0) return [];
+  const skippedCount = Math.max(0, emails.length - maxEmailsForExtraction);
+  if (emailsForExtraction.length === 0) return { entities: [], skippedCount };
 
   const candidates = [];
   for (const batch of chunkArray(emailsForExtraction, 4)) {
@@ -579,11 +581,11 @@ async function extractEntitiesFromEmails(anthropic, emails) {
     }
   }
 
-  if (emails.length > maxEmailsForExtraction) {
-    console.log(`Skipped entity extraction for ${emails.length - maxEmailsForExtraction} emails due to per-digest cap.`);
+  if (skippedCount > 0) {
+    console.log(`Skipped entity extraction for ${skippedCount} emails due to per-digest cap.`);
   }
 
-  return savedEntities;
+  return { entities: savedEntities, skippedCount };
 }
 
 async function summarizeThreadMemory(anthropic, conversationId) {
@@ -682,6 +684,7 @@ async function summarizeThreadMemories(anthropic, emails) {
   ];
   const maxThreadsPerDigest = 12;
   const summarizedThreads = [];
+  const skippedCount = Math.max(0, conversationIds.length - maxThreadsPerDigest);
 
   for (const conversationId of conversationIds.slice(0, maxThreadsPerDigest)) {
     try {
@@ -695,11 +698,11 @@ async function summarizeThreadMemories(anthropic, emails) {
     }
   }
 
-  if (conversationIds.length > maxThreadsPerDigest) {
-    console.log(`Skipped ${conversationIds.length - maxThreadsPerDigest} thread summaries due to per-digest cap.`);
+  if (skippedCount > 0) {
+    console.log(`Skipped ${skippedCount} thread summaries due to per-digest cap.`);
   }
 
-  return summarizedThreads;
+  return { threads: summarizedThreads, skippedCount };
 }
 
 async function runDigest() {
@@ -791,6 +794,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   });
 
   let archivedCount = 0;
+  let archiveFailedCount = 0;
   let filteredSpamCount = 0;
   let filteredEmails = emails;
   try {
@@ -798,12 +802,12 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     if (Array.isArray(spamIndices) && spamIndices.length > 0) {
       filteredSpamCount = spamIndices.filter(i => emails[i]).length;
       if (process.env.AUTO_ARCHIVE_SPAM === 'true') {
-        const archivePromises = spamIndices.map(i => {
-          if (emails[i]) return archiveEmail(token, emails[i].id);
-          return Promise.resolve(false);
-        });
+        const archivePromises = spamIndices
+          .filter(i => emails[i])
+          .map(i => archiveEmail(token, emails[i].id));
         const results = await Promise.all(archivePromises);
-        archivedCount = results.filter(Boolean).length;
+        archivedCount = results.filter(r => r.ok).length;
+        archiveFailedCount = results.filter(r => !r.ok).length;
       }
       const spamSet = new Set(spamIndices);
       filteredEmails = emails.filter((_, i) => !spamSet.has(i));
@@ -814,7 +818,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
 
   if (filteredEmails.length === 0) {
     const archivedNote = archivedCount > 0
-      ? ` (${archivedCount} spam emails auto-archived)`
+      ? ` (${archivedCount} spam emails auto-archived${archiveFailedCount > 0 ? `, ${archiveFailedCount} failed to archive` : ''})`
       : filteredSpamCount > 0
         ? ` (${filteredSpamCount} suspected spam/noise emails filtered but not archived)`
         : '';
@@ -828,16 +832,17 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
       status: 'no_actionable',
       metadata: {
         filtered_spam_count: filteredSpamCount,
+        archive_failed_count: archiveFailedCount,
         auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true'
       }
     });
     return;
   }
 
-  const summarizedThreads = await summarizeThreadMemories(anthropic, filteredEmails);
+  const { threads: summarizedThreads, skippedCount: skippedThreadCount } = await summarizeThreadMemories(anthropic, filteredEmails);
   console.log(`Summarized ${summarizedThreads.length} thread memories.`);
 
-  const savedEntities = await extractEntitiesFromEmails(anthropic, filteredEmails);
+  const { entities: savedEntities, skippedCount: skippedEntityCount } = await extractEntitiesFromEmails(anthropic, filteredEmails);
   console.log(`Saved ${savedEntities.length} entity mentions.`);
 
   const savedDigestItems = await saveDigestItems(digestRun?.id, filteredEmails);
@@ -919,6 +924,17 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     digest += `\n_🧹 ${filteredSpamCount} suspected spam/noise email${filteredSpamCount > 1 ? 's' : ''} filtered from this digest; not archived_`;
   }
 
+  if (archiveFailedCount > 0) {
+    digest += `\n_⚠️ ${archiveFailedCount} spam email${archiveFailedCount > 1 ? 's' : ''} failed to archive — still in Inbox_`;
+  }
+
+  const capNotes = [];
+  if (skippedThreadCount > 0) capNotes.push(`${skippedThreadCount} thread${skippedThreadCount > 1 ? 's' : ''} not summarized`);
+  if (skippedEntityCount > 0) capNotes.push(`${skippedEntityCount} email${skippedEntityCount > 1 ? 's' : ''} not scanned for entities`);
+  if (capNotes.length > 0) {
+    digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 11 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
+  }
+
   const digestTs = await slackPost(digest);
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
@@ -928,7 +944,10 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     status: 'posted',
     metadata: {
       filtered_spam_count: filteredSpamCount,
-      auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true'
+      archive_failed_count: archiveFailedCount,
+      auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
+      skipped_thread_summaries: skippedThreadCount,
+      skipped_entity_extractions: skippedEntityCount
     }
   });
 

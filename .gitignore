@@ -10,6 +10,7 @@ env/
 node_modules/
 dist/
 .vite/
+.next/
 
 # Secrets / local config
 .env
