@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
 
 const TABLES = [
   'email_messages',
@@ -20,11 +20,6 @@ const TABLES = [
   'daily_priority_suggestions',
   'context_cards'
 ];
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;

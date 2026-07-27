@@ -1,14 +1,9 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
+import { callClaude } from '../../lib/claude';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 const TIME_ZONE = 'America/Los_Angeles';
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 export const config = {
   maxDuration: 60,
@@ -317,9 +312,8 @@ function compactContext(context) {
 
 async function generatePrioritySuggestion(context, suggestionDate) {
   const compact = compactContext(context);
-  const response = await new Anthropic().messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 3000,
+  const response = await callClaude({
+    maxTokens: 3000,
     system: `You select Grant Carlson's weekday One Priority for Milestone Properties.
 
 Use the focusing-question standard from The ONE Thing:

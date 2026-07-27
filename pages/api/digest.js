@@ -1,61 +1,16 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { createClient } from '@supabase/supabase-js';
 import { waitUntil } from '@vercel/functions';
+import { supabase } from '../../lib/supabase';
+import { getGraphToken, graph } from '../../lib/graph';
+import { extractBodyFields } from '../../lib/email-parse';
+import { slackPost as _slackPost } from '../../lib/slack';
+import { callClaude } from '../../lib/claude';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 // Verify this is a legitimate cron call (Vercel signs cron requests)
 function verifyCronRequest(req) {
   return req.headers['authorization'] === `Bearer ${process.env.CRON_SECRET}`;
-}
-
-// --- Graph API helpers ---
-
-let cachedToken = null;
-let tokenExpiry = 0;
-
-async function getGraphToken() {
-  if (cachedToken && Date.now() < tokenExpiry - 60_000) return cachedToken;
-  const res = await fetch(
-    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: process.env.AZURE_CLIENT_ID,
-        client_secret: process.env.AZURE_CLIENT_SECRET,
-        scope: 'https://graph.microsoft.com/.default',
-      }),
-    }
-  );
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`Graph auth failed: ${JSON.stringify(data)}`);
-  cachedToken = data.access_token;
-  tokenExpiry = Date.now() + data.expires_in * 1000;
-  return cachedToken;
-}
-
-async function graph(token, path, method = 'GET', body = null) {
-  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    ...(body && { body: JSON.stringify(body) }),
-  });
-  if (res.status === 202 || res.status === 204) return { success: true };
-  const text = await res.text();
-  if (!text) return { success: true };
-  const json = JSON.parse(text);
-  if (json.error) throw new Error(`Graph error: ${json.error.message}`);
-  return json;
 }
 
 async function archiveEmail(token, messageId) {
@@ -70,60 +25,21 @@ async function archiveEmail(token, messageId) {
   }
 }
 
+// Preserves this file's original contract (never throws, returns undefined
+// on failure) -- lib/slack.js's slackPost throws on API failure, which is a
+// deliberate behavior difference from the Comply bot's stricter needs, not
+// something to introduce here as a side effect of consolidation.
 async function slackPost(text, threadTs = null) {
-  const res = await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      channel: CHANNEL_ID,
-      text,
-      ...(threadTs && { thread_ts: threadTs }),
-    }),
-  });
-  const data = await res.json();
-  return data.ts;
+  try {
+    const data = await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, text, threadTs);
+    return data.ts;
+  } catch (err) {
+    console.error('slackPost failed:', err.message);
+    return undefined;
+  }
 }
 
 // --- Digest logic ---
-
-function htmlToText(html = '') {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function extractBodyFields(email) {
-  const body = email.body || {};
-  const content = body.content || null;
-  const contentType = (body.contentType || '').toLowerCase();
-
-  if (!content) return { body_text: null, body_html: null };
-  if (contentType === 'html') {
-    return {
-      body_text: htmlToText(content),
-      body_html: content
-    };
-  }
-
-  return {
-    body_text: content,
-    body_html: null
-  };
-}
 
 async function saveEmailToMemory(email) {
   const sender = email.from?.emailAddress || {};
@@ -496,7 +412,7 @@ function chunkArray(items, size) {
   return chunks;
 }
 
-async function extractEntityCandidatesBatch(anthropic, emails) {
+async function extractEntityCandidatesBatch(emails) {
   if (emails.length === 0) return [];
 
   const extractionInput = emails.map((email, index) => (
@@ -510,9 +426,8 @@ async function extractEntityCandidatesBatch(anthropic, emails) {
     `preview: ${(email.bodyPreview || '').slice(0, 600)}`
   )).join('\n\n');
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 2500,
+  const response = await callClaude({
+    maxTokens: 2500,
     system: `Extract durable business entities from Outlook email previews for Grant Carlson at Milestone Properties.
 
 Return ONLY a valid JSON array. Each item must have:
@@ -555,7 +470,7 @@ Be conservative but useful. Prefer specific property names, vendor/company names
   });
 }
 
-async function extractEntitiesFromEmails(anthropic, emails) {
+async function extractEntitiesFromEmails(emails) {
   const maxEmailsForExtraction = 20;
   const emailsForExtraction = emails.slice(0, maxEmailsForExtraction);
   const skippedCount = Math.max(0, emails.length - maxEmailsForExtraction);
@@ -564,7 +479,7 @@ async function extractEntitiesFromEmails(anthropic, emails) {
   const candidates = [];
   for (const batch of chunkArray(emailsForExtraction, 4)) {
     try {
-      const batchCandidates = await extractEntityCandidatesBatch(anthropic, batch);
+      const batchCandidates = await extractEntityCandidatesBatch(batch);
       candidates.push(...batchCandidates);
     } catch (error) {
       console.error('Entity extraction batch failed:', { error });
@@ -588,7 +503,7 @@ async function extractEntitiesFromEmails(anthropic, emails) {
   return { entities: savedEntities, skippedCount };
 }
 
-async function summarizeThreadMemory(anthropic, conversationId) {
+async function summarizeThreadMemory(conversationId) {
   const { data: messages, error } = await supabase
     .from('email_messages')
     .select('subject,sender_name,sender_email,received_at,body_preview,importance,is_read')
@@ -616,9 +531,8 @@ async function summarizeThreadMemory(anthropic, conversationId) {
     `Preview: ${(message.body_preview || '').slice(0, 500)}`
   )).join('\n');
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 700,
+  const response = await callClaude({
+    maxTokens: 700,
     system: `You summarize business email threads into durable memory for Grant Carlson at Milestone Properties.
 
 Return ONLY valid JSON with this shape:
@@ -678,7 +592,7 @@ Use only the email previews provided. If previews are too thin, say what is know
   return data;
 }
 
-async function summarizeThreadMemories(anthropic, emails) {
+async function summarizeThreadMemories(emails) {
   const conversationIds = [
     ...new Set(emails.map(email => email.conversationId).filter(Boolean))
   ];
@@ -688,7 +602,7 @@ async function summarizeThreadMemories(anthropic, emails) {
 
   for (const conversationId of conversationIds.slice(0, maxThreadsPerDigest)) {
     try {
-      const summary = await summarizeThreadMemory(anthropic, conversationId);
+      const summary = await summarizeThreadMemory(conversationId);
       if (summary) summarizedThreads.push(summary);
     } catch (error) {
       console.error('Thread summarization failed:', {
@@ -761,15 +675,13 @@ async function runDigest() {
   } catch {}
 
   const today = new Date();
-  const anthropic = new Anthropic();
 
   const spamCheckList = emails.map((e, i) =>
     `${i}|${e.id}|From: ${e.from?.emailAddress?.name} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Preview: ${e.bodyPreview?.slice(0, 100)}`
   ).join('\n');
 
-  const spamResponse = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 500,
+  const spamResponse = await callClaude({
+    maxTokens: 500,
     system: `You are a spam filter for Grant Carlson's business email at Milestone Properties, a property management company.
 
 Return ONLY a JSON array of index numbers (0-based) for emails that are CLEARLY spam or mass solicitation — things like:
@@ -839,10 +751,10 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     return;
   }
 
-  const { threads: summarizedThreads, skippedCount: skippedThreadCount } = await summarizeThreadMemories(anthropic, filteredEmails);
+  const { threads: summarizedThreads, skippedCount: skippedThreadCount } = await summarizeThreadMemories(filteredEmails);
   console.log(`Summarized ${summarizedThreads.length} thread memories.`);
 
-  const { entities: savedEntities, skippedCount: skippedEntityCount } = await extractEntitiesFromEmails(anthropic, filteredEmails);
+  const { entities: savedEntities, skippedCount: skippedEntityCount } = await extractEntitiesFromEmails(filteredEmails);
   console.log(`Saved ${savedEntities.length} entity mentions.`);
 
   const savedDigestItems = await saveDigestItems(digestRun?.id, filteredEmails);
@@ -855,9 +767,8 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     return `${i + 1}. From: ${e.from?.emailAddress?.name || e.from?.emailAddress?.address} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Read: ${e.isRead}${ageNote} | Preview: ${e.bodyPreview?.slice(0, 150)}`;
   }).join('\n');
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 2000,
+  const response = await callClaude({
+    maxTokens: 2000,
     system: `You are a morning email triage assistant for Grant Carlson at Milestone Properties, a property management company in the Seattle/Burien/SeaTac area.
 
 Analyze his emails and produce a concise, well-organized Slack digest.

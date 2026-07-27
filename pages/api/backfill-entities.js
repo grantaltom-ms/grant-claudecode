@@ -1,11 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
+import { callClaude } from '../../lib/claude';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
@@ -112,7 +108,7 @@ function chunkArray(items, size) {
   return chunks;
 }
 
-async function extractEntityCandidatesBatch(anthropic, messages) {
+async function extractEntityCandidatesBatch(messages) {
   if (messages.length === 0) return [];
 
   const extractionInput = messages.map((message, index) => (
@@ -126,9 +122,8 @@ async function extractEntityCandidatesBatch(anthropic, messages) {
     `preview: ${(message.body_preview || '').slice(0, 600)}`
   )).join('\n\n');
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 2500,
+  const response = await callClaude({
+    maxTokens: 2500,
     system: `Extract durable business entities from saved Outlook email previews for Grant Carlson at Milestone Properties.
 
 Return ONLY a valid JSON array. Each item must have:
@@ -169,10 +164,10 @@ Be conservative but useful. Prefer specific property names, vendor/company names
   });
 }
 
-async function extractEntityCandidates(anthropic, messages) {
+async function extractEntityCandidates(messages) {
   const allCandidates = [];
   for (const batch of chunkArray(messages, 4)) {
-    const candidates = await extractEntityCandidatesBatch(anthropic, batch);
+    const candidates = await extractEntityCandidatesBatch(batch);
     allCandidates.push(...candidates);
   }
   return allCandidates;
@@ -242,7 +237,7 @@ export default async function handler(req, res) {
     const days = boundedInteger(req.query.days, 7, 30);
     const maxMessages = boundedInteger(req.query.max, 30, 100);
     const messages = await loadMessages({ days, maxMessages });
-    const candidates = await extractEntityCandidates(new Anthropic(), messages);
+    const candidates = await extractEntityCandidates(messages);
 
     const saveResults = [];
     for (const candidate of candidates) {
