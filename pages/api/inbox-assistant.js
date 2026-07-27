@@ -4,6 +4,7 @@ import { supabase } from '../../lib/supabase';
 import { getGraphToken, graph } from '../../lib/graph';
 import { slackPost as _slackPost, getThreadHistory as _getThreadHistory } from '../../lib/slack';
 import { callClaude, DEFAULT_MODEL } from '../../lib/claude';
+import { fetchEmbedding } from '../../lib/openai';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -565,28 +566,13 @@ export async function createEmbedding(text) {
   const input = truncateText(text);
   if (!input) return null;
 
-  const response = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input,
-    }),
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    console.error('Memory search embedding failed:', {
-      status: response.status,
-      error: data?.error?.message || data,
-    });
+  try {
+    const data = await fetchEmbedding(input, EMBEDDING_MODEL);
+    return data.data?.[0]?.embedding || null;
+  } catch (error) {
+    console.error('Memory search embedding failed:', { status: error.status, error: error.message });
     return null;
   }
-
-  return data.data?.[0]?.embedding || null;
 }
 
 async function logRetrieval({ query, toolName, resultCount, usedEmbedding, metadata = {} }) {
