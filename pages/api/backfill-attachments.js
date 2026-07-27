@@ -1,13 +1,7 @@
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../lib/supabase';
+import { getGraphToken, graph } from '../../lib/graph';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-let cachedToken = null;
-let tokenExpiry = 0;
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
@@ -25,46 +19,6 @@ function projectRefFromUrl() {
   } catch {
     return null;
   }
-}
-
-async function getGraphToken() {
-  if (cachedToken && Date.now() < tokenExpiry - 60_000) return cachedToken;
-
-  const res = await fetch(
-    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: process.env.AZURE_CLIENT_ID,
-        client_secret: process.env.AZURE_CLIENT_SECRET,
-        scope: 'https://graph.microsoft.com/.default',
-      }),
-    }
-  );
-
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`Graph auth failed: ${JSON.stringify(data)}`);
-
-  cachedToken = data.access_token;
-  tokenExpiry = Date.now() + data.expires_in * 1000;
-  return cachedToken;
-}
-
-async function graph(token, path) {
-  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-  });
-  const text = await res.text();
-  if (!text) return { success: true };
-
-  const json = JSON.parse(text);
-  if (json.error) throw new Error(`Graph error: ${json.error.message}`);
-  return json;
 }
 
 function decodeBase64Text(contentBytes) {
