@@ -3,17 +3,21 @@
 
 > Upload this file to a Claude project to give Claude full context on how this system is built, what it does, and how to extend or debug it.
 
+_Last verified against code: 2026-07-27._
+
 ---
 
 ## What This System Does
 
-This is a fully custom AI email assistant for Grant Carlson (grant@milestoneproperties.net) at Milestone Properties. It has two modes:
+This is a fully custom AI email assistant for Grant Carlson (grant@milestoneproperties.net) at Milestone Properties. It has three parts:
 
-1. **Morning Digest** — Every day at 7:00 AM PT, it reads the last 24 hours of email, filters spam, triages the rest into priority categories, and posts a structured summary to the Slack channel #inbox-digest.
+1. **Morning Digest** — a Vercel Cron job (`0 18 * * *` UTC — 11:00 AM PDT / 10:00 AM PST, see "Cron Schedule" below) that reads the last 24 hours of email, filters spam, triages the rest into priority categories, and posts a structured summary to the Slack channel #inbox-digest.
 
 2. **Interactive Assistant** — Grant can message the bot directly in #inbox-digest at any time. The bot can read, search, summarize, and draft emails, then send them after Grant explicitly approves.
 
-Everything lives in a single Next.js project deployed on Vercel. There is no database — the system is stateless, reading live from Outlook and posting to Slack on each invocation.
+3. **Memory pipeline** — a set of Supabase-backed backfill and maintenance endpoints (`pages/api/backfill-*.js`, `memory-maintenance.js`) that ingest email into a layered memory system (entities, thread summaries, projects, commitments, open loops) so the assistant has context beyond a single conversation. See `docs/inbox-memory-architecture.md` for the full design.
+
+Everything lives in a single Next.js project deployed on Vercel. The system is backed by Supabase (Postgres + pgvector) — it is **not** stateless; there are 15 numbered migrations under `supabase/migrations/` and 18+ tables tracking email, memory, and operational state.
 
 ---
 
@@ -53,17 +57,22 @@ inbox-assistant/
 
 All secrets live in Vercel's environment variable settings. Never commit them to git.
 
+See `SETUP.md` for the complete, verified environment variable table (it also covers the Supabase, OpenAI, Comply bot, and cross-project sync variables that aren't listed here). The short version:
+
 | Variable | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Anthropic API access |
 | `SLACK_BOT_TOKEN` | Slack bot posting (xoxb-...) |
 | `SLACK_SIGNING_SECRET` | Vercel webhook signature verification |
-| `AZURE_TENANT_ID` | `469bd392-c1e4-4678-8aa5-db5cf792851a` |
-| `AZURE_CLIENT_ID` | `c5943140-46e4-42af-a096-3e4c57b2b570` |
-| `AZURE_CLIENT_SECRET` | Azure app secret Value (regenerate if compromised) |
-| `CRON_SECRET` | Shared secret for authenticating cron calls |
+| `AZURE_TENANT_ID` | Azure AD tenant ID for Graph auth |
+| `AZURE_CLIENT_ID` | Azure app registration client ID |
+| `AZURE_CLIENT_SECRET` | Azure app secret value (regenerate if compromised) |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Supabase project powering the memory pipeline |
+| `CRON_SECRET` | Shared secret for authenticating cron and backfill calls |
 | `VERCEL_TOKEN` | Vercel API token — used by bot to save triage rules |
 | `TRIAGE_RULES` | JSON array of custom triage rules (managed by bot) |
+
+Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this doc or any other file in the repo — reference them by variable name only. (This revision removes IDs that a previous version of this file had inlined directly.)
 
 ---
 
@@ -97,21 +106,17 @@ Admin consent must be granted after adding permissions. Delegated permissions wi
 
 ---
 
-## vercel.json
+## Cron Schedule
 
-```json
-{
-  "functions": {
-    "pages/api/inbox-assistant.js": { "maxDuration": 60 },
-    "pages/api/digest.js": { "maxDuration": 60 }
-  },
-  "crons": [
-    { "path": "/api/digest", "schedule": "0 14 * * *" }
-  ]
-}
-```
+Defined in `vercel.json`, which is the source of truth — see that file directly rather than trusting a copy pasted here. As of this revision there are three jobs:
 
-`0 14 * * *` = 14:00 UTC = 7:00 AM PT daily. Cron requires Vercel Pro plan.
+| Job | UTC schedule | Pacific time (PDT) | Pacific time (PST) |
+|---|---|---|---|
+| `/api/digest` | `0 18 * * *` | 11:00 AM | 10:00 AM |
+| `/api/memory-maintenance` | `0 19 * * *` | 12:00 PM | 11:00 AM |
+| `/api/weekday-one-priority` | `0 16 * * 1-5` | 9:00 AM (weekdays) | 8:00 AM (weekdays) |
+
+Vercel Cron runs on UTC with no daylight-saving adjustment, so each job's Pacific time shifts an hour twice a year. Cron requires a Vercel Pro plan. `vercel.json` also sets explicit `maxDuration` values per function under its `functions` block — check that file for current values, since digest and the backfill endpoints do enough sequential Claude/Graph work that they need more than Vercel's default timeout.
 
 ---
 
@@ -145,13 +150,10 @@ Handles all interactive Slack messages. When Grant sends a message in #inbox-dig
 ### Key Implementation Details
 
 **CC preservation on replies:**
-`create_draft_reply` fetches `ccRecipients` from the original email before creating the reply draft, then explicitly PATCHes them back in. This ensures CC recipients are never dropped.
-
-**Thread continuity:**
-Reply drafts are created using Graph API's `createReply` endpoint (which sets `conversationId` and reply headers), then PATCHed with an HTML body. Using HTML rather than plain text preserves Outlook's thread display.
+`create_draft_reply` fetches `ccRecipients` from the original email, then calls Graph's `createReply` endpoint (which sets `conversationId` and reply headers) with the reply text passed directly as the `comment` field — converted to per-line `<div>` HTML so Outlook renders it correctly. This is a single call, not a create-then-PATCH sequence; CC recipients are preserved but the original body is not fetched or re-quoted.
 
 **Send approval gate:**
-The system prompt explicitly prohibits sending without approval. `send_draft` is only defined as a tool — Claude must make a judgment call to use it, and the system prompt instructs it to only do so when Grant says "send it", "looks good", "go ahead", etc.
+There is no code-level approval gate — the system prompt explicitly prohibits sending without approval, and `send_draft` is an ordinary tool Claude can call at its own judgment. The entire safety boundary is the model correctly waiting for a phrase like "send it", "looks good", or "go ahead" before calling it. (See `docs/PLAN-tier1-2-reliability.md`, item 6, for a hardened design using Slack approval buttons — modeled on the pattern already used by the Comply-or-Vacate bot — that removes `send_draft` from the model's available tools entirely and requires a button click to actually send.)
 
 **Prompt caching:**
 The system prompt is sent with `cache_control: { type: 'ephemeral' }` to enable Anthropic prompt caching, reducing latency and cost on repeated calls.
@@ -202,7 +204,7 @@ The spam pre-pass uses a separate lightweight Claude call that returns only a JS
 - Anything property/tenant/deal related
 - Government or legal notices
 
-Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `destinationId: 'archive'`. Archive failures are caught silently to avoid breaking the digest.
+Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `destinationId: 'archive'`. As of this revision, archive failures are logged and counted (not silently discarded) — a failed-archive count appears in both the Slack digest footer and the `digest_runs` row's metadata.
 
 ### Digest Format
 
@@ -222,12 +224,11 @@ Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `d
 🟡 FYI / Needs Awareness
 • [Sender] — [Subject]: summary
 
-⚪ Low Priority / Noise
-• [Sender] — [Subject]
-
 [N] emails total — [X] need action
 🗑️ N spam emails auto-archived
 ```
+
+**There is no rendered "⚪ Low Priority / Noise" section.** The live triage prompt in `digest.js` explicitly instructs the model to silently discard anything that would fall in that bucket (automated confirmations, newsletters, routine system reports, Adobe Acrobat comment notifications, successful daily reports) rather than list it. If you want that content visible again — even as a collapsed/de-emphasized section — that's a prompt change in `digest.js`, not currently how it behaves.
 
 **Followed by thread reply:**
 `Reply here to act on any email — e.g. "draft reply to #1", "what does #3 say"`
@@ -242,8 +243,8 @@ Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `d
 | Invoice past due date | Prepend ⚠️ OVERDUE |
 | Deadline within 48h | Prepend 🕐 DUE SOON |
 | Automation error (Zapier, etc.) | Route to 🔧 System Alerts |
-| Successful daily reports | Route to ⚪ Low Priority |
-| Adobe Acrobat comment notifications | ⚪ Low Priority unless reply explicitly required |
+| Successful daily reports | Silently discarded (not shown anywhere in the digest) |
+| Adobe Acrobat comment notifications | Silently discarded unless a reply is explicitly required |
 | Custom TRIAGE_RULES in env | Applied before any other categorization |
 
 ---
@@ -269,22 +270,18 @@ Rules are stored as plain-English strings in a JSON array in the `TRIAGE_RULES` 
 
 ## Deployment
 
-The project is deployed to Vercel under the team `grantaltom-ms-projects`.
-
-**Production URL:** `https://inbox-assistant-one.vercel.app`  
-**Project ID:** `prj_1eeFtlROsHRqaCD3HkvGC6m9XMJX`  
-**Team ID:** `team_1mUqHwC1cSBZNn1LlIFJJube`
+The project is deployed to Vercel. Project and team IDs live in `.vercel/project.json` (linked via `vercel link`) — not repeated here, since this file may be more widely shared than the Vercel project settings should be.
 
 **To deploy:**
 ```bash
-cd /Users/grantcarlson/Claude/inbox-assistant
 npx vercel --prod
 ```
+Run from the repo root, wherever it's checked out locally.
 
 **To trigger digest manually:**
 ```bash
-curl -X POST https://inbox-assistant-one.vercel.app/api/digest \
-  -H "Authorization: Bearer {CRON_SECRET}"
+curl -X POST https://your-vercel-url.vercel.app/api/digest \
+  -H "Authorization: Bearer $CRON_SECRET"
 ```
 
 ---
@@ -344,11 +341,12 @@ A separate routine agent (not part of this codebase) reads emails after the morn
 
 ## Known Limitations & Future Improvements
 
-- **No persistent storage** — triage rules are stored in env vars; conversation history is reconstructed from Slack thread on each message
-- **50 email cap** per digest — if inbox gets very busy, oldest emails may be missed
-- **Spam filter is conservative by design** — borderline emails are not archived; they appear in Low Priority instead
-- **Triage rule updates require `VERCEL_TOKEN`** — without this, the bot can read rules but not save new ones
-- **Thread context limited to 20 messages** — very long Slack threads may lose early context
+- **Triage rules are the one thing still stored in env vars** (`TRIAGE_RULES`) rather than Supabase — everything else (email, memory, digest history, conversation state for the Comply bot) is in the database. Interactive-assistant conversation history is still reconstructed from the live Slack thread on each message rather than stored separately.
+- **50 email cap** per digest, with no pagination — on a busy day the oldest emails in the 24h window are silently dropped rather than the least important ones. As of this revision, when this cap (or the 12-thread-summary or 20-email-entity-extraction caps) is hit, the digest posts a footer noting it — previously this was only logged server-side and invisible in Slack. Fixing the cap itself (adding pagination) is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5.
+- **Spam filter is conservative by design** — borderline emails are not archived; when `AUTO_ARCHIVE_SPAM` isn't set to `true`, they're filtered out of the digest entirely and don't appear anywhere (not routed to a visible section).
+- **Triage rule updates require `VERCEL_TOKEN`** — without this, the bot can read rules but not save new ones.
+- **Thread context limited to 20 messages** — very long Slack threads may lose early context.
+- **Send approval is prompt-enforced only**, not a hard gate — see the "Send approval gate" note above and `docs/PLAN-tier1-2-reliability.md` item 6 for the planned fix.
 
 **Potential future additions:**
 - Calendar awareness (flag emails referencing meetings today)
@@ -356,3 +354,5 @@ A separate routine agent (not part of this codebase) reads emails after the morn
 - Sentiment analysis on tenant emails (flag escalating issues)
 - Weekly summary digest (Friday recap of the week's email patterns)
 - Read-status tracking (mark emails as read after drafting a reply)
+
+For a fuller, verified-against-code list of reliability gaps and a step-by-step plan to close them, see `docs/PLAN-tier1-2-reliability.md` and `docs/PLAN-tier3-structural.md`.
