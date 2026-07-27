@@ -1,6 +1,6 @@
 import { waitUntil } from '@vercel/functions';
 import { supabase } from '../../lib/supabase';
-import { getGraphToken, graph } from '../../lib/graph';
+import { getGraphToken, graph, fetchAllPages } from '../../lib/graph';
 import { extractBodyFields } from '../../lib/email-parse';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { callClaude } from '../../lib/claude';
@@ -657,13 +657,12 @@ export async function runDigest() {
 
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
-    + `?$top=50`
+    + `?$top=100`
     + `&$select=id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments`
     + `&$filter=receivedDateTime ge ${since}`
     + `&$orderby=receivedDateTime desc`;
 
-  const result = await graph(token, url);
-  const emails = result.value || [];
+  const { items: emails, truncated: emailsTruncated } = await fetchAllPages(token, url, { maxPages: 10, maxItems: 200 });
 
   const savedEmails = [];
   const savedThreads = [];
@@ -797,7 +796,10 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   }).join('\n');
 
   const response = await callClaude({
-    maxTokens: 2000,
+    // Raised from 2000 now that the inbox pull covers up to 200 emails
+    // (Phase 6.3) rather than a flat 50 -- a genuinely busy day's digest
+    // output can legitimately be longer than the old cap allowed for.
+    maxTokens: 4000,
     system: `You are a morning email triage assistant for Grant Carlson at Milestone Properties, a property management company in the Seattle/Burien/SeaTac area.
 
 Analyze his emails and produce a concise, well-organized Slack digest.
@@ -869,6 +871,7 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
   }
 
   const capNotes = [];
+  if (emailsTruncated) capNotes.push(`inbox pull capped at ${emails.length} emails`);
   if (skippedThreadCount > 0) capNotes.push(`${skippedThreadCount} thread${skippedThreadCount > 1 ? 's' : ''} not summarized`);
   if (skippedEntityCount > 0) capNotes.push(`${skippedEntityCount} email${skippedEntityCount > 1 ? 's' : ''} not scanned for entities`);
   if (capNotes.length > 0) {
@@ -887,7 +890,8 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       archive_failed_count: archiveFailedCount,
       auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
       skipped_thread_summaries: skippedThreadCount,
-      skipped_entity_extractions: skippedEntityCount
+      skipped_entity_extractions: skippedEntityCount,
+      emails_truncated: emailsTruncated
     }
   });
 
