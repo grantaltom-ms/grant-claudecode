@@ -1,5 +1,11 @@
 -- 016_lock_down_exposed_tables.sql
 --
+-- PARTIALLY SUPERSEDED. The "no code in this repo" test below is scoped to this
+-- repository, but the database is shared with other apps. This migration cut off
+-- six tables the milestone-turns app reads, and 017 did the same to `properties`.
+-- See 019_restore_turns_app_grants.sql. Do not reuse this repo-scoped test for
+-- future lockdowns without auditing every app on the project.
+--
 -- Incident fix: the anon key for this Supabase project (augbrysfqwgekfhfokco)
 -- was committed in plaintext to a PUBLIC GitHub repo (underwriting/src/lib/supabase.js,
 -- present since the repo's first commit) and dozens of tables had no real access
