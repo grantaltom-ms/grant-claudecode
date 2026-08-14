@@ -26,14 +26,20 @@ describe('addressSearchHints', () => {
     expect(hints[0]).toBe('3002 S 208th St Seatac Wa 98198');
     expect(hints).toEqual(expect.arrayContaining(['3002 S 208th St']));
   });
+
+  it('does not strip the second word of a property name like Willow Lake', () => {
+    const hints = addressSearchHints('Willow Lake');
+    expect(hints).toEqual(['Willow Lake']);
+    expect(hints).not.toContain('Willow');
+  });
 });
 
 describe('unitFilter', () => {
-  it('expands B06 into hyphenated and spaced AppFolio-style variants', () => {
+  it('expands B06 into hyphenated and spaced AppFolio-style variants with PostgREST quoting', () => {
     const decoded = decodeURIComponent(unitFilter('B06'));
-    expect(decoded).toContain('B06');
-    expect(decoded).toContain('B-06');
-    expect(decoded).toContain('B - 06');
+    expect(decoded).toContain('"B06"');
+    expect(decoded).toContain('"B-06"');
+    expect(decoded).toContain('"B - 06"');
   });
 });
 
