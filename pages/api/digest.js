@@ -1,7 +1,7 @@
 import { waitUntil } from '@vercel/functions';
 import { supabase } from '../../lib/supabase';
-import { getGraphToken, graph } from '../../lib/graph';
-import { extractBodyFields } from '../../lib/email-parse';
+import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
+import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { callClaude } from '../../lib/claude';
 
@@ -23,6 +23,15 @@ async function archiveEmail(token, messageId) {
     console.error('Archive failed:', { messageId, error: error?.message || error });
     return { ok: false, error: error?.message || String(error) };
   }
+}
+
+// Heuristic for the specific high-stakes combination auth forensics cares
+// about: a request to change how/where money moves. Deliberately narrower
+// than "invoice" or "payment" alone, which match plenty of ordinary mail.
+const PAYMENT_FRAUD_KEYWORD_PATTERN = /\b(wire transfer|wiring instructions|bank(ing)? details|account number|routing number|payment instructions|update(d)? (my |our )?(payment|banking) (details|info)|new (payment|banking|account) (details|instructions)|ach transfer|remit(tance)? to|change of bank)\b/i;
+
+function looksLikePaymentRequest(text = '') {
+  return PAYMENT_FRAUD_KEYWORD_PATTERN.test(text);
 }
 
 // Preserves this file's original contract (never throws, returns undefined
@@ -619,6 +628,89 @@ async function summarizeThreadMemories(emails) {
   return { threads: summarizedThreads, skippedCount };
 }
 
+// Kept in sync with backfill-inbox-delta.js's SELECT_FIELDS -- a delta
+// session only ever returns the fields requested on the call that
+// established it, so both entry points must request the same set.
+const INBOX_SELECT_FIELDS = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments,internetMessageHeaders';
+
+async function fetchInboxViaFixedWindow(token, since) {
+  const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
+    + `?$top=50`
+    + `&$select=${INBOX_SELECT_FIELDS}`
+    + `&$filter=receivedDateTime ge ${since}`
+    + `&$orderby=receivedDateTime desc`;
+  const result = await graph(token, url);
+  return result.value || [];
+}
+
+// Delta sync (docs/PLAN-outlook-mcp-inspired-features.md, item 4). Only
+// engages once backfill-inbox-delta.js has bootstrapped a cursor for this
+// mailbox; until then (or if the cursor expires), this transparently falls
+// back to the same fixed-window pull the digest has always used, so a
+// missing/broken delta cursor degrades to today's known-good behavior
+// rather than breaking the digest.
+async function fetchInboxEmails(token, since) {
+  const { data: deltaState, error: loadError } = await supabase
+    .from('inbox_delta_state')
+    .select('cursor_url, is_bootstrapped')
+    .eq('owner_email', OWNER_EMAIL)
+    .maybeSingle();
+
+  if (loadError) {
+    console.error('Failed to load inbox_delta_state, falling back to fixed-window pull:', loadError);
+  }
+
+  if (loadError || !deltaState?.is_bootstrapped || !deltaState.cursor_url) {
+    return { emails: await fetchInboxViaFixedWindow(token, since), deltaResynced: false };
+  }
+
+  try {
+    const { items, deltaLink, nextLink, pages } = await walkDeltaPages(token, deltaState.cursor_url, {
+      maxPages: 10,
+      startIsAbsolute: true,
+    });
+
+    const { error: updateError } = await supabase
+      .from('inbox_delta_state')
+      .update({ cursor_url: deltaLink || nextLink, updated_at: new Date().toISOString() })
+      .eq('owner_email', OWNER_EMAIL);
+    if (updateError) console.error('Failed to persist advanced delta cursor:', updateError);
+
+    // Delta feeds surface changes (including read/flag changes on older
+    // mail, and @removed entries for deleted/moved messages), not a clean
+    // 24h window -- both are filtered out here rather than in the Graph
+    // query, keeping the digest's scope identical to the fixed-window path.
+    const changed = items.filter(item => !item['@removed']);
+    const withinWindow = changed.filter(e => e.receivedDateTime && e.receivedDateTime >= since);
+    withinWindow.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
+
+    console.log(`Delta fetch: ${pages} page(s), ${items.length} changed item(s), ${withinWindow.length} within the 24h window.`);
+    return { emails: withinWindow, deltaResynced: false };
+  } catch (error) {
+    if (error.status === 410) {
+      // Graph invalidates a delta cursor after enough inactivity. This is
+      // expected to be rare -- surfaced in the digest footer and digest_runs
+      // metadata (not just logged) so a mailbox silently resyncing every run
+      // is visible rather than quietly costing the fixed-window pull's cost
+      // every day without anyone noticing.
+      console.error('Delta cursor expired (410 Gone) -- resetting and falling back to a fixed-window pull this run.', error);
+      const { error: resetError } = await supabase
+        .from('inbox_delta_state')
+        .update({
+          cursor_url: null,
+          is_bootstrapped: false,
+          last_resync_at: new Date().toISOString(),
+          last_resync_reason: 'expired_410',
+        })
+        .eq('owner_email', OWNER_EMAIL);
+      if (resetError) console.error('Failed to reset inbox_delta_state after 410:', resetError);
+
+      return { emails: await fetchInboxViaFixedWindow(token, since), deltaResynced: true };
+    }
+    throw error;
+  }
+}
+
 export async function runDigest() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Missing Supabase environment variables: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY');
@@ -627,14 +719,14 @@ export async function runDigest() {
   const token = await getGraphToken();
 
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
-    + `?$top=50`
-    + `&$select=id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments`
-    + `&$filter=receivedDateTime ge ${since}`
-    + `&$orderby=receivedDateTime desc`;
+  const { emails, deltaResynced } = await fetchInboxEmails(token, since);
 
-  const result = await graph(token, url);
-  const emails = result.value || [];
+  // SPF/DKIM/DMARC verdicts Microsoft 365 already computed on inbound mail --
+  // read once here so both the spam pre-pass and the triage prompt (and the
+  // deterministic banner below) can use them without re-parsing headers.
+  const authResultsByEmailId = new Map(
+    emails.map(e => [e.id, parseAuthResults(e.internetMessageHeaders)])
+  );
 
   const savedEmails = [];
   const savedThreads = [];
@@ -661,7 +753,8 @@ export async function runDigest() {
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
       run_completed_at: new Date().toISOString(),
-      status: 'no_emails'
+      status: 'no_emails',
+      metadata: { delta_resynced: deltaResynced }
     });
     return;
   }
@@ -676,9 +769,13 @@ export async function runDigest() {
 
   const today = new Date();
 
-  const spamCheckList = emails.map((e, i) =>
-    `${i}|${e.id}|From: ${e.from?.emailAddress?.name} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Preview: ${e.bodyPreview?.slice(0, 100)}`
-  ).join('\n');
+  const spamCheckList = emails.map((e, i) => {
+    const auth = authResultsByEmailId.get(e.id) || {};
+    const authNote = (auth.spf || auth.dmarc)
+      ? ` | Auth: spf=${auth.spf || 'n/a'},dkim=${auth.dkim || 'n/a'},dmarc=${auth.dmarc || 'n/a'}`
+      : '';
+    return `${i}|${e.id}|From: ${e.from?.emailAddress?.name} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Preview: ${e.bodyPreview?.slice(0, 100)}${authNote}`;
+  }).join('\n');
 
   const spamResponse = await callClaude({
     maxTokens: 500,
@@ -690,6 +787,7 @@ Return ONLY a JSON array of index numbers (0-based) for emails that are CLEARLY 
 - SEO, web design, or digital marketing solicitations
 - Phishing attempts or scammy offers
 - Generic "we can help your business" cold pitches
+- An "Auth: spf=fail" or "dmarc=fail" tag combined with a request to change payment, banking, or wire details — this is a strong spoofing signal even when the display name looks like a known contact or vendor
 
 Be CONSERVATIVE. When in doubt, do NOT mark as spam. Never mark as spam:
 - Any email from a known contact or business Grant works with
@@ -745,7 +843,8 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
       metadata: {
         filtered_spam_count: filteredSpamCount,
         archive_failed_count: archiveFailedCount,
-        auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true'
+        auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
+        delta_resynced: deltaResynced
       }
     });
     return;
@@ -764,8 +863,21 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     const received = new Date(e.receivedDateTime);
     const daysAgo = Math.floor((today - received) / (1000 * 60 * 60 * 24));
     const ageNote = daysAgo > 0 ? ` (${daysAgo}d ago)` : ' (today)';
-    return `${i + 1}. From: ${e.from?.emailAddress?.name || e.from?.emailAddress?.address} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Read: ${e.isRead}${ageNote} | Preview: ${e.bodyPreview?.slice(0, 150)}`;
+    const auth = authResultsByEmailId.get(e.id) || {};
+    const authNote = isAuthFailure(auth) ? ` | ⚠️ AUTH FAILED (spf=${auth.spf || 'n/a'}, dmarc=${auth.dmarc || 'n/a'})` : '';
+    return `${i + 1}. From: ${e.from?.emailAddress?.name || e.from?.emailAddress?.address} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Read: ${e.isRead}${ageNote} | Preview: ${e.bodyPreview?.slice(0, 150)}${authNote}`;
   }).join('\n');
+
+  // Deterministic check, not model judgment: flag anything that failed sender
+  // authentication AND asks to change how/where money moves. This is exactly
+  // the case the spam-filter prompt is told NOT to flag as spam (invoices
+  // from known/unknown vendors are protected there), so it needs a separate
+  // guarantee that doesn't depend on the model getting it right.
+  const authFlaggedEmails = filteredEmails
+    .map((e, i) => ({ email: e, number: i + 1, auth: authResultsByEmailId.get(e.id) || {} }))
+    .filter(({ email, auth }) =>
+      isAuthFailure(auth) && looksLikePaymentRequest(`${email.subject} ${email.bodyPreview}`)
+    );
 
   const response = await callClaude({
     maxTokens: 2000,
@@ -810,6 +922,11 @@ TIME-SENSITIVE FLAGS:
 - If an invoice or deadline is overdue, prepend: ⚠️ OVERDUE —
 - If something is due within 48 hours, prepend: 🕐 DUE SOON —
 
+AUTHENTICATION FAILURES:
+- If a line is tagged "⚠️ AUTH FAILED", it failed the sender's own SPF/DMARC check — treat this as a real spoofing signal, not a formality, even if the sender name looks familiar
+- Put these in 🔴 Action Required with a note to verify the sender out-of-band before doing anything the email asks
+- Do not let a familiar display name override this — that's exactly what a spoofed sender name is designed to exploit
+
 CATEGORIZATION:
 - 🔧 System Alerts: Automation errors, Zapier failures, system notifications that indicate something broke
 - 🔴 Action Required: Emails that genuinely need Grant to do something — reply, sign, approve, pay, decide
@@ -829,6 +946,16 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
 
   let digest = response.content[0].text;
 
+  if (authFlaggedEmails.length > 0) {
+    const banner = authFlaggedEmails.map(({ email, number, auth }) => {
+      const sender = email.from?.emailAddress || {};
+      return `• [#${number}] ${sender.name || sender.address} <${sender.address}> — "${email.subject}" — spf=${auth.spf || 'n/a'}, dmarc=${auth.dmarc || 'n/a'}`;
+    }).join('\n');
+    digest = `*🚨 AUTHENTICATION FAILURE DETECTED — possible phishing/fraud*\n`
+      + `_Failed sender authentication AND mentions payment/banking/wire details. This is a deterministic check, not a model judgment call — verify independently (call the sender at a known number) before acting on anything these emails ask for._\n`
+      + `${banner}\n\n${digest}`;
+  }
+
   if (archivedCount > 0) {
     digest += `\n_🗑️ ${archivedCount} spam email${archivedCount > 1 ? 's' : ''} auto-archived_`;
   } else if (filteredSpamCount > 0) {
@@ -846,6 +973,10 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 11 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
   }
 
+  if (deltaResynced) {
+    digest += `\n_🔄 Delta sync cursor expired and was reset — this run used a full pull instead. Re-run \`/api/backfill-inbox-delta\` when convenient to re-establish it._`;
+  }
+
   const digestTs = await slackPost(digest);
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
@@ -858,7 +989,9 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       archive_failed_count: archiveFailedCount,
       auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
       skipped_thread_summaries: skippedThreadCount,
-      skipped_entity_extractions: skippedEntityCount
+      skipped_entity_extractions: skippedEntityCount,
+      auth_flagged_count: authFlaggedEmails.length,
+      delta_resynced: deltaResynced
     }
   });
 

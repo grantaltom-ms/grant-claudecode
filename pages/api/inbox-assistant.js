@@ -1,9 +1,10 @@
 import crypto from 'crypto';
 import { waitUntil } from '@vercel/functions';
 import { supabase } from '../../lib/supabase';
-import { getGraphToken, graph } from '../../lib/graph';
+import { getGraphToken, graph, getMailTips, summarizeMailTips } from '../../lib/graph';
 import { slackPost as _slackPost, getThreadHistory as _getThreadHistory } from '../../lib/slack';
 import { callClaude, DEFAULT_MODEL } from '../../lib/claude';
+import { checkSendRateLimit, recordSend, flagNewRecipients } from '../../lib/send-safety';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -1800,8 +1801,9 @@ async function executeToolInternal(name, input, token, threadTs) {
     }
 
     case 'create_draft_reply': {
-      // Fetch original to get CC recipients we need to preserve
-      const original = await graph(token, `${base}/messages/${input.message_id}?$select=ccRecipients`);
+      // Fetch original to get the sender (the reply's implicit To) and CC
+      // recipients we need to preserve
+      const original = await graph(token, `${base}/messages/${input.message_id}?$select=from,ccRecipients`);
       const ccRecipients = original.ccRecipients || [];
 
       // Use createReply's `comment` to prepend our text above the quoted history
@@ -1818,10 +1820,27 @@ async function executeToolInternal(name, input, token, threadTs) {
       });
       const candidate = await markDraftCandidateDrafted(input.message_id, draft.id, input.body);
 
+      const recipientAddresses = [
+        original.from?.emailAddress?.address,
+        ...ccRecipients.map(r => r.emailAddress?.address),
+      ].filter(Boolean);
+      const firstTimeRecipients = await flagNewRecipients(supabase, OWNER_EMAIL, recipientAddresses).catch(err => {
+        console.error('flagNewRecipients failed:', err);
+        return [];
+      });
+      const mailTipWarnings = await getMailTips(token, OWNER_EMAIL, recipientAddresses)
+        .then(summarizeMailTips)
+        .catch(err => {
+          console.error('getMailTips failed:', err);
+          return [];
+        });
+
       return {
         draft_id: draft.id,
         subject: draft.subject,
         candidate,
+        ...(firstTimeRecipients.length && { first_time_recipients: firstTimeRecipients }),
+        ...(mailTipWarnings.length && { mail_tip_warnings: mailTipWarnings }),
         message: 'Draft saved. Awaiting approval.',
       };
     }
@@ -1845,11 +1864,48 @@ async function executeToolInternal(name, input, token, threadTs) {
         toRecipients,
         ...(ccRecipients.length && { ccRecipients }),
       });
-      return { draft_id: draft.id, subject: draft.subject, message: 'New draft created. Awaiting approval.' };
+
+      const allRecipients = [...input.to, ...(input.cc || [])];
+      const firstTimeRecipients = await flagNewRecipients(supabase, OWNER_EMAIL, allRecipients).catch(err => {
+        console.error('flagNewRecipients failed:', err);
+        return [];
+      });
+      const mailTipWarnings = await getMailTips(token, OWNER_EMAIL, allRecipients)
+        .then(summarizeMailTips)
+        .catch(err => {
+          console.error('getMailTips failed:', err);
+          return [];
+        });
+
+      return {
+        draft_id: draft.id,
+        subject: draft.subject,
+        ...(firstTimeRecipients.length && { first_time_recipients: firstTimeRecipients }),
+        ...(mailTipWarnings.length && { mail_tip_warnings: mailTipWarnings }),
+        message: 'New draft created. Awaiting approval.',
+      };
     }
 
     case 'send_draft': {
+      const rateCheck = await checkSendRateLimit(supabase, OWNER_EMAIL);
+      if (!rateCheck.allowed) {
+        return {
+          success: false,
+          message: `Send blocked: daily send limit reached (${rateCheck.count}/${rateCheck.limit} sent in the last 24h). `
+            + `Tell Grant directly rather than retrying — this needs a human decision to raise MAX_SENDS_PER_DAY or wait.`,
+        };
+      }
+
+      // Recipients are needed for the send log, and Graph moves a sent draft
+      // out of Drafts, so read them before sending rather than after.
+      const draftDetail = await graph(token, `${base}/messages/${input.draft_id}?$select=toRecipients,ccRecipients`);
+      const recipientAddresses = [
+        ...(draftDetail.toRecipients || []),
+        ...(draftDetail.ccRecipients || []),
+      ].map(r => r.emailAddress?.address).filter(Boolean);
+
       await graph(token, `${base}/messages/${input.draft_id}/send`, 'POST', {});
+      await recordSend(supabase, OWNER_EMAIL, recipientAddresses, input.draft_id);
       const candidate = await markDraftCandidateByDraftId(input.draft_id, 'sent');
       return { success: true, candidate, message: 'Email sent.' };
     }
@@ -1960,7 +2016,7 @@ async function executeToolInternal(name, input, token, threadTs) {
   }
 }
 
-async function executeTool(name, input, token, threadTs) {
+export async function executeTool(name, input, token, threadTs) {
   try {
     const result = await executeToolInternal(name, input, token, threadTs);
     await logAgentAction({
@@ -2038,6 +2094,9 @@ RULES:
 - If Grant says a numbered digest item is done, waiting, dismissed, or has a draft prepared, call update_digest_item_status.
 - When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
 - When showing a reply draft, always list who it's going To: and CC: (CC recipients from the original are included automatically)
+- If create_draft_reply or create_new_draft returns first_time_recipients, mention it when showing the draft (e.g. "First time emailing newvendor@example.com") — this is informational, not a reason to withhold the draft or ask extra questions
+- If create_draft_reply or create_new_draft returns mail_tip_warnings (e.g. an out-of-office reply, a full mailbox, a delivery restriction), mention it briefly when showing the draft — this is also informational, not a reason to withhold the draft
+- If send_draft returns success: false with a rate-limit message, relay it to Grant exactly as given and stop — do not retry the send
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
 - When Grant says an email type should be higher or lower priority (e.g. "emails from X should be Action Required"), use update_triage_rules to save it — confirm the rule was saved and list all active rules

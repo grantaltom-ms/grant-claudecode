@@ -71,6 +71,8 @@ See `SETUP.md` for the complete, verified environment variable table (it also co
 | `CRON_SECRET` | Shared secret for authenticating cron and backfill calls |
 | `VERCEL_TOKEN` | Vercel API token — used by bot to save triage rules |
 | `TRIAGE_RULES` | JSON array of custom triage rules (managed by bot) |
+| `MAX_SENDS_PER_DAY` | Optional. Hard cap on `send_draft` calls per rolling 24h (default 25) — see "Send safety" below |
+| `TRUSTED_DOMAINS` | Optional. Comma-separated domains exempt from the first-time-recipient flag (default `milestoneproperties.net`) |
 
 Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this doc or any other file in the repo — reference them by variable name only. (This revision removes IDs that a previous version of this file had inlined directly.)
 
@@ -84,6 +86,7 @@ Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this do
 - `Mail.Read` — read inbox
 - `Mail.ReadWrite` — create drafts, move/archive emails
 - `Mail.Send` — send emails
+- `MailboxSettings.Read` — pre-send mail tips (out-of-office, full mailbox, delivery restrictions) via `getMailTips`; without this, `getMailTips` calls fail and are silently skipped (mail tips are advisory and non-fatal by design — see "Pre-send mail tips" below)
 
 Admin consent must be granted after adding permissions. Delegated permissions will NOT work — must be Application permissions.
 
@@ -155,6 +158,14 @@ Handles all interactive Slack messages. When Grant sends a message in #inbox-dig
 **Send approval gate:**
 There is no code-level approval gate — the system prompt explicitly prohibits sending without approval, and `send_draft` is an ordinary tool Claude can call at its own judgment. The entire safety boundary is the model correctly waiting for a phrase like "send it", "looks good", or "go ahead" before calling it. (See `docs/PLAN-tier1-2-reliability.md`, item 6, for a hardened design using Slack approval buttons — modeled on the pattern already used by the Comply-or-Vacate bot — that removes `send_draft` from the model's available tools entirely and requires a button click to actually send.)
 
+**Send safety (`lib/send-safety.js`):**
+Two independent checks, neither of which is the approval gate above — they exist underneath whatever calls Graph's send endpoint, today's `send_draft` handler:
+- `checkSendRateLimit` — a hard backstop, not advisory. Before `send_draft` calls Graph, it counts rows in the `send_log` table (migration `021_send_log.sql`) for the last rolling 24h and refuses if `MAX_SENDS_PER_DAY` (default 25) is reached; `recordSend` logs every actual send afterward. This exists to bound the damage of a runaway loop or a bad approval, not to restrict who Grant can email.
+- `flagNewRecipients` — advisory only, never blocks. `create_draft_reply` and `create_new_draft` check each recipient against `TRUSTED_DOMAINS` and this mailbox's saved `email_messages` history (as sender, To, or Cc); anything neither trusted nor previously seen comes back as `first_time_recipients` in the tool result, and the system prompt tells Claude to mention it when showing the draft. A strict allowlist was deliberately not used here — Grant emails new tenants/vendors as normal business, so blocking unknown recipients would break real usage.
+
+**Pre-send mail tips (`lib/graph.js`'s `getMailTips`/`summarizeMailTips`):**
+`create_draft_reply` and `create_new_draft` call Graph's `getMailTips` for the draft's recipients (out-of-office replies, full mailbox, delivery restrictions) and return any findings as `mail_tip_warnings` on the tool result; the system prompt tells Claude to mention them when showing the draft. Advisory only — wrapped in try/catch so a failed or unsupported mail tips call (e.g. missing `MailboxSettings.Read`, or an external domain that doesn't expose mail tips) never blocks drafting.
+
 **Prompt caching:**
 The system prompt is sent with `cache_control: { type: 'ephemeral' }` to enable Anthropic prompt caching, reducing latency and cost on repeated calls.
 
@@ -189,7 +200,7 @@ Runs every morning at 7 AM PT via Vercel Cron. Generates and posts the morning e
 
 1. Verifies `Authorization: Bearer {CRON_SECRET}` header
 2. Returns 200 immediately, runs digest in background via `waitUntil`
-3. Fetches last 24 hours of inbox emails (up to 50) via Graph API
+3. Fetches last 24 hours of inbox emails via `fetchInboxEmails` — a fixed-window pull (up to 50, no pagination) by default, or delta sync once bootstrapped; see "Inbox fetch: delta sync" below
 4. Loads custom `TRIAGE_RULES` from environment
 5. **Spam pre-pass:** sends email list to Claude for spam classification, archives identified spam via Graph API, removes from working set
 6. **Triage pass:** sends filtered email list to Claude with full formatting instructions
@@ -205,6 +216,15 @@ The spam pre-pass uses a separate lightweight Claude call that returns only a JS
 - Government or legal notices
 
 Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `destinationId: 'archive'`. As of this revision, archive failures are logged and counted (not silently discarded) — a failed-archive count appears in both the Slack digest footer and the `digest_runs` row's metadata.
+
+### Inbox fetch: delta sync
+
+`fetchInboxEmails` (top of `digest.js`) checks `inbox_delta_state` for this mailbox before deciding how to fetch:
+- **No bootstrapped cursor (default today):** falls back to `fetchInboxViaFixedWindow` — the same `$filter=receivedDateTime ge {since}` pull this system has always used, unchanged.
+- **Bootstrapped cursor present:** walks it forward via `walkDeltaPages` (`lib/graph.js`), filters out `@removed` entries and anything outside the 24h window in code (Graph's mail delta query doesn't support filtering by `receivedDateTime`), and persists the advanced cursor back to `inbox_delta_state` for next time.
+- **Cursor expired (`410 Gone`):** resets `inbox_delta_state` (`is_bootstrapped: false`, `cursor_url: null`), falls back to the fixed-window pull for that run, and records the resync in both the digest footer and `digest_runs.metadata.delta_resynced` — not just a server log.
+
+**Bootstrapping:** call `/api/backfill-inbox-delta` (Bearer `$CRON_SECRET`) repeatedly until it responds `bootstrap_complete: true`. Establishing the first cursor requires walking the *entire* Inbox once — Graph's mail delta query has no way to scope the initial call to a recent window — so on a mailbox with years of history this can take many calls. Each call processes up to `max_pages` (default 20, query param) and picks up where the last one left off. This is deliberately decoupled from the digest cron: `digest.js`'s fetch path doesn't change until bootstrap finishes.
 
 ### Digest Format
 
@@ -246,6 +266,16 @@ Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `d
 | Successful daily reports | Silently discarded (not shown anywhere in the digest) |
 | Adobe Acrobat comment notifications | Silently discarded unless a reply is explicitly required |
 | Custom TRIAGE_RULES in env | Applied before any other categorization |
+| SPF/DMARC auth failure + payment/banking/wire language | Prepends a `🚨 AUTHENTICATION FAILURE DETECTED` banner ahead of the whole digest — a deterministic code check, not the triage model's judgment (see "Authentication forensics" below) |
+
+### Authentication Forensics
+
+Every inbox pull now requests `internetMessageHeaders` and reads the `Authentication-Results` header Microsoft 365 already stamps on inbound mail (`lib/email-parse.js`'s `parseAuthResults`/`isAuthFailure` — no cryptographic verification is performed here, it just reads Microsoft's own verdict). Two things happen with it:
+
+1. The spam pre-pass prompt is told that `spf=fail`/`dmarc=fail` combined with a payment/banking-change request is a spoofing signal even when the display name looks like a known vendor.
+2. Independently of what the spam/triage model decides, `digest.js` checks every email that survives the spam filter against `isAuthFailure()` and a payment/wire-fraud keyword heuristic (`looksLikePaymentRequest`). Any match gets a `🚨 AUTHENTICATION FAILURE DETECTED` banner prepended to the digest — this is a hardcoded check, deliberately not routed through the LLM, because the cost of a missed positive (funds sent on a spoofed instruction) is asymmetric to the cost of a false positive.
+
+`digest_runs.metadata.auth_flagged_count` records how often this fires.
 
 ---
 
@@ -342,7 +372,7 @@ A separate routine agent (not part of this codebase) reads emails after the morn
 ## Known Limitations & Future Improvements
 
 - **Triage rules are the one thing still stored in env vars** (`TRIAGE_RULES`) rather than Supabase — everything else (email, memory, digest history, conversation state for the Comply bot) is in the database. Interactive-assistant conversation history is still reconstructed from the live Slack thread on each message rather than stored separately.
-- **50 email cap** per digest, with no pagination — on a busy day the oldest emails in the 24h window are silently dropped rather than the least important ones. As of this revision, when this cap (or the 12-thread-summary or 20-email-entity-extraction caps) is hit, the digest posts a footer noting it — previously this was only logged server-side and invisible in Slack. Fixing the cap itself (adding pagination) is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5.
+- **50 email cap** per digest, with no pagination — on a busy day the oldest emails in the 24h window are silently dropped rather than the least important ones. As of this revision, when this cap (or the 12-thread-summary or 20-email-entity-extraction caps) is hit, the digest posts a footer noting it — previously this was only logged server-side and invisible in Slack. Fixing the cap itself (adding pagination) is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5. **This cap only applies to the fixed-window fetch path** — see "Inbox fetch: delta sync" below for the alternative that sidesteps it once bootstrapped, though it isn't a substitute for pagination on the fixed-window path itself.
 - **Spam filter is conservative by design** — borderline emails are not archived; when `AUTO_ARCHIVE_SPAM` isn't set to `true`, they're filtered out of the digest entirely and don't appear anywhere (not routed to a visible section).
 - **Triage rule updates require `VERCEL_TOKEN`** — without this, the bot can read rules but not save new ones.
 - **Thread context limited to 20 messages** — very long Slack threads may lose early context.

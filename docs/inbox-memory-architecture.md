@@ -17,6 +17,7 @@ All maintenance endpoints require `Authorization: Bearer $CRON_SECRET`.
 
 - `/api/memory-status`
 - `/api/backfill-inbox`
+- `/api/backfill-inbox-delta`
 - `/api/backfill-email-bodies`
 - `/api/backfill-attachments`
 - `/api/backfill-entities`
@@ -29,6 +30,15 @@ Run:
 ```bash
 CRON_SECRET=... npm run smoke:memory
 ```
+
+## Delta Sync (Inbox Fetch)
+
+`digest.js` fetches the last 24h of Inbox mail one of two ways:
+
+- **Fixed window (default)** — a single `$filter=receivedDateTime ge {since}` pull, capped at `$top=50` with no pagination. This is the only mode until delta sync is bootstrapped for the mailbox.
+- **Delta (once bootstrapped)** — follows the stored `inbox_delta_state.cursor_url` via Graph's mail delta query, filtering to the last 24h and dropping `@removed` entries in code (Graph's delta filtering support doesn't cover `receivedDateTime`, so this can't happen in the query itself).
+
+Delta sync is bootstrapped by calling `/api/backfill-inbox-delta` repeatedly (each call is capped at `max_pages`, default 20) until it reports `bootstrap_complete: true` — establishing the cursor requires walking the entire Inbox once, since Graph's mail delta query can't be scoped to a recent window. This is deliberately decoupled from the live digest cron: `digest.js`'s fetch path is unaffected until bootstrap finishes, and if the cursor later expires (Graph returns `410 Gone` after enough inactivity), `digest.js` resets it and falls back to the fixed-window pull for that run, surfacing the resync in the digest footer and `digest_runs.metadata.delta_resynced` rather than only logging it.
 
 ## Search Modes
 
