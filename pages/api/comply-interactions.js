@@ -61,13 +61,14 @@ async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
   const conversationHistory = buildConversationHistory(threadMessages, botUserId, skipMessageTs);
   await slackPost(COMPLY_CHANNEL_ID, '_On it..._', threadTs);
 
-  const { text: agentResponse, tenantData, sectionApprovals } = await runAgent(
+  const { text: agentResponse, tenantData, managerName, sectionApprovals } = await runAgent(
     userChoice,
     conversationHistory,
     state
   );
 
   const newState = state || {};
+  if (managerName) newState.managerName = managerName;
   if (tenantData) Object.assign(newState, tenantData);
   for (const { section_number, content } of sectionApprovals) {
     newState[`section${section_number}`] = content;
@@ -131,12 +132,22 @@ export default async function handler(req, res) {
           const { threadTs: payloadThreadTs } = parseJson(action.value);
           const resolvedThread = payloadThreadTs || threadTs;
 
+          // Capture the draft text BEFORE slackUpdateMessage destroys it.
+          // The model needs the approved content to call record_section_approval.
+          const rawDraft = (payload.message?.text || '')
+            .replace(/APPROVE_OR_REVISE/g, '')
+            .trim();
+
           await slackUpdateMessage(channelId, messageTs, `✅ *${userName}* approved this section.`, null);
           await slackPost(COMPLY_CHANNEL_ID, `[USER_CHOICE] ✅ Approved`, resolvedThread);
 
+          const userChoice = rawDraft
+            ? `✅ Approved. The section draft that was approved:\n${rawDraft}`
+            : '✅ Approved';
+
           await handleAgentRun({
             threadTs: resolvedThread,
-            userChoice: '✅ Approved',
+            userChoice,
             skipMessageTs: messageTs,
           });
 
