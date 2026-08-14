@@ -86,6 +86,7 @@ Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this do
 - `Mail.Read` — read inbox
 - `Mail.ReadWrite` — create drafts, move/archive emails
 - `Mail.Send` — send emails
+- `MailboxSettings.Read` — pre-send mail tips (out-of-office, full mailbox, delivery restrictions) via `getMailTips`; without this, `getMailTips` calls fail and are silently skipped (mail tips are advisory and non-fatal by design — see "Pre-send mail tips" below)
 
 Admin consent must be granted after adding permissions. Delegated permissions will NOT work — must be Application permissions.
 
@@ -161,6 +162,9 @@ There is no code-level approval gate — the system prompt explicitly prohibits 
 Two independent checks, neither of which is the approval gate above — they exist underneath whatever calls Graph's send endpoint, today's `send_draft` handler:
 - `checkSendRateLimit` — a hard backstop, not advisory. Before `send_draft` calls Graph, it counts rows in the `send_log` table (migration `021_send_log.sql`) for the last rolling 24h and refuses if `MAX_SENDS_PER_DAY` (default 25) is reached; `recordSend` logs every actual send afterward. This exists to bound the damage of a runaway loop or a bad approval, not to restrict who Grant can email.
 - `flagNewRecipients` — advisory only, never blocks. `create_draft_reply` and `create_new_draft` check each recipient against `TRUSTED_DOMAINS` and this mailbox's saved `email_messages` history (as sender, To, or Cc); anything neither trusted nor previously seen comes back as `first_time_recipients` in the tool result, and the system prompt tells Claude to mention it when showing the draft. A strict allowlist was deliberately not used here — Grant emails new tenants/vendors as normal business, so blocking unknown recipients would break real usage.
+
+**Pre-send mail tips (`lib/graph.js`'s `getMailTips`/`summarizeMailTips`):**
+`create_draft_reply` and `create_new_draft` call Graph's `getMailTips` for the draft's recipients (out-of-office replies, full mailbox, delivery restrictions) and return any findings as `mail_tip_warnings` on the tool result; the system prompt tells Claude to mention them when showing the draft. Advisory only — wrapped in try/catch so a failed or unsupported mail tips call (e.g. missing `MailboxSettings.Read`, or an external domain that doesn't expose mail tips) never blocks drafting.
 
 **Prompt caching:**
 The system prompt is sent with `cache_control: { type: 'ephemeral' }` to enable Anthropic prompt caching, reducing latency and cost on repeated calls.

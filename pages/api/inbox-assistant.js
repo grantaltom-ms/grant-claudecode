@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { waitUntil } from '@vercel/functions';
 import { supabase } from '../../lib/supabase';
-import { getGraphToken, graph } from '../../lib/graph';
+import { getGraphToken, graph, getMailTips, summarizeMailTips } from '../../lib/graph';
 import { slackPost as _slackPost, getThreadHistory as _getThreadHistory } from '../../lib/slack';
 import { callClaude, DEFAULT_MODEL } from '../../lib/claude';
 import { checkSendRateLimit, recordSend, flagNewRecipients } from '../../lib/send-safety';
@@ -1828,12 +1828,19 @@ async function executeToolInternal(name, input, token, threadTs) {
         console.error('flagNewRecipients failed:', err);
         return [];
       });
+      const mailTipWarnings = await getMailTips(token, OWNER_EMAIL, recipientAddresses)
+        .then(summarizeMailTips)
+        .catch(err => {
+          console.error('getMailTips failed:', err);
+          return [];
+        });
 
       return {
         draft_id: draft.id,
         subject: draft.subject,
         candidate,
         ...(firstTimeRecipients.length && { first_time_recipients: firstTimeRecipients }),
+        ...(mailTipWarnings.length && { mail_tip_warnings: mailTipWarnings }),
         message: 'Draft saved. Awaiting approval.',
       };
     }
@@ -1858,15 +1865,23 @@ async function executeToolInternal(name, input, token, threadTs) {
         ...(ccRecipients.length && { ccRecipients }),
       });
 
-      const firstTimeRecipients = await flagNewRecipients(supabase, OWNER_EMAIL, [...input.to, ...(input.cc || [])]).catch(err => {
+      const allRecipients = [...input.to, ...(input.cc || [])];
+      const firstTimeRecipients = await flagNewRecipients(supabase, OWNER_EMAIL, allRecipients).catch(err => {
         console.error('flagNewRecipients failed:', err);
         return [];
       });
+      const mailTipWarnings = await getMailTips(token, OWNER_EMAIL, allRecipients)
+        .then(summarizeMailTips)
+        .catch(err => {
+          console.error('getMailTips failed:', err);
+          return [];
+        });
 
       return {
         draft_id: draft.id,
         subject: draft.subject,
         ...(firstTimeRecipients.length && { first_time_recipients: firstTimeRecipients }),
+        ...(mailTipWarnings.length && { mail_tip_warnings: mailTipWarnings }),
         message: 'New draft created. Awaiting approval.',
       };
     }
@@ -2080,6 +2095,7 @@ RULES:
 - When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
 - When showing a reply draft, always list who it's going To: and CC: (CC recipients from the original are included automatically)
 - If create_draft_reply or create_new_draft returns first_time_recipients, mention it when showing the draft (e.g. "First time emailing newvendor@example.com") — this is informational, not a reason to withhold the draft or ask extra questions
+- If create_draft_reply or create_new_draft returns mail_tip_warnings (e.g. an out-of-office reply, a full mailbox, a delivery restriction), mention it briefly when showing the draft — this is also informational, not a reason to withhold the draft
 - If send_draft returns success: false with a rate-limit message, relay it to Grant exactly as given and stop — do not retry the send
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
