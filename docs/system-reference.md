@@ -200,7 +200,7 @@ Runs every morning at 7 AM PT via Vercel Cron. Generates and posts the morning e
 
 1. Verifies `Authorization: Bearer {CRON_SECRET}` header
 2. Returns 200 immediately, runs digest in background via `waitUntil`
-3. Fetches last 24 hours of inbox emails (up to 50) via Graph API
+3. Fetches last 24 hours of inbox emails via `fetchInboxEmails` — a fixed-window pull (up to 50, no pagination) by default, or delta sync once bootstrapped; see "Inbox fetch: delta sync" below
 4. Loads custom `TRIAGE_RULES` from environment
 5. **Spam pre-pass:** sends email list to Claude for spam classification, archives identified spam via Graph API, removes from working set
 6. **Triage pass:** sends filtered email list to Claude with full formatting instructions
@@ -216,6 +216,15 @@ The spam pre-pass uses a separate lightweight Claude call that returns only a JS
 - Government or legal notices
 
 Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `destinationId: 'archive'`. As of this revision, archive failures are logged and counted (not silently discarded) — a failed-archive count appears in both the Slack digest footer and the `digest_runs` row's metadata.
+
+### Inbox fetch: delta sync
+
+`fetchInboxEmails` (top of `digest.js`) checks `inbox_delta_state` for this mailbox before deciding how to fetch:
+- **No bootstrapped cursor (default today):** falls back to `fetchInboxViaFixedWindow` — the same `$filter=receivedDateTime ge {since}` pull this system has always used, unchanged.
+- **Bootstrapped cursor present:** walks it forward via `walkDeltaPages` (`lib/graph.js`), filters out `@removed` entries and anything outside the 24h window in code (Graph's mail delta query doesn't support filtering by `receivedDateTime`), and persists the advanced cursor back to `inbox_delta_state` for next time.
+- **Cursor expired (`410 Gone`):** resets `inbox_delta_state` (`is_bootstrapped: false`, `cursor_url: null`), falls back to the fixed-window pull for that run, and records the resync in both the digest footer and `digest_runs.metadata.delta_resynced` — not just a server log.
+
+**Bootstrapping:** call `/api/backfill-inbox-delta` (Bearer `$CRON_SECRET`) repeatedly until it responds `bootstrap_complete: true`. Establishing the first cursor requires walking the *entire* Inbox once — Graph's mail delta query has no way to scope the initial call to a recent window — so on a mailbox with years of history this can take many calls. Each call processes up to `max_pages` (default 20, query param) and picks up where the last one left off. This is deliberately decoupled from the digest cron: `digest.js`'s fetch path doesn't change until bootstrap finishes.
 
 ### Digest Format
 
@@ -363,7 +372,7 @@ A separate routine agent (not part of this codebase) reads emails after the morn
 ## Known Limitations & Future Improvements
 
 - **Triage rules are the one thing still stored in env vars** (`TRIAGE_RULES`) rather than Supabase — everything else (email, memory, digest history, conversation state for the Comply bot) is in the database. Interactive-assistant conversation history is still reconstructed from the live Slack thread on each message rather than stored separately.
-- **50 email cap** per digest, with no pagination — on a busy day the oldest emails in the 24h window are silently dropped rather than the least important ones. As of this revision, when this cap (or the 12-thread-summary or 20-email-entity-extraction caps) is hit, the digest posts a footer noting it — previously this was only logged server-side and invisible in Slack. Fixing the cap itself (adding pagination) is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5.
+- **50 email cap** per digest, with no pagination — on a busy day the oldest emails in the 24h window are silently dropped rather than the least important ones. As of this revision, when this cap (or the 12-thread-summary or 20-email-entity-extraction caps) is hit, the digest posts a footer noting it — previously this was only logged server-side and invisible in Slack. Fixing the cap itself (adding pagination) is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5. **This cap only applies to the fixed-window fetch path** — see "Inbox fetch: delta sync" below for the alternative that sidesteps it once bootstrapped, though it isn't a substitute for pagination on the fixed-window path itself.
 - **Spam filter is conservative by design** — borderline emails are not archived; when `AUTO_ARCHIVE_SPAM` isn't set to `true`, they're filtered out of the digest entirely and don't appear anywhere (not routed to a visible section).
 - **Triage rule updates require `VERCEL_TOKEN`** — without this, the bot can read rules but not save new ones.
 - **Thread context limited to 20 messages** — very long Slack threads may lose early context.

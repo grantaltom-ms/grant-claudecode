@@ -1,6 +1,6 @@
 import { waitUntil } from '@vercel/functions';
 import { supabase } from '../../lib/supabase';
-import { getGraphToken, graph } from '../../lib/graph';
+import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
 import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { callClaude } from '../../lib/claude';
@@ -628,6 +628,89 @@ async function summarizeThreadMemories(emails) {
   return { threads: summarizedThreads, skippedCount };
 }
 
+// Kept in sync with backfill-inbox-delta.js's SELECT_FIELDS -- a delta
+// session only ever returns the fields requested on the call that
+// established it, so both entry points must request the same set.
+const INBOX_SELECT_FIELDS = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments,internetMessageHeaders';
+
+async function fetchInboxViaFixedWindow(token, since) {
+  const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
+    + `?$top=50`
+    + `&$select=${INBOX_SELECT_FIELDS}`
+    + `&$filter=receivedDateTime ge ${since}`
+    + `&$orderby=receivedDateTime desc`;
+  const result = await graph(token, url);
+  return result.value || [];
+}
+
+// Delta sync (docs/PLAN-outlook-mcp-inspired-features.md, item 4). Only
+// engages once backfill-inbox-delta.js has bootstrapped a cursor for this
+// mailbox; until then (or if the cursor expires), this transparently falls
+// back to the same fixed-window pull the digest has always used, so a
+// missing/broken delta cursor degrades to today's known-good behavior
+// rather than breaking the digest.
+async function fetchInboxEmails(token, since) {
+  const { data: deltaState, error: loadError } = await supabase
+    .from('inbox_delta_state')
+    .select('cursor_url, is_bootstrapped')
+    .eq('owner_email', OWNER_EMAIL)
+    .maybeSingle();
+
+  if (loadError) {
+    console.error('Failed to load inbox_delta_state, falling back to fixed-window pull:', loadError);
+  }
+
+  if (loadError || !deltaState?.is_bootstrapped || !deltaState.cursor_url) {
+    return { emails: await fetchInboxViaFixedWindow(token, since), deltaResynced: false };
+  }
+
+  try {
+    const { items, deltaLink, nextLink, pages } = await walkDeltaPages(token, deltaState.cursor_url, {
+      maxPages: 10,
+      startIsAbsolute: true,
+    });
+
+    const { error: updateError } = await supabase
+      .from('inbox_delta_state')
+      .update({ cursor_url: deltaLink || nextLink, updated_at: new Date().toISOString() })
+      .eq('owner_email', OWNER_EMAIL);
+    if (updateError) console.error('Failed to persist advanced delta cursor:', updateError);
+
+    // Delta feeds surface changes (including read/flag changes on older
+    // mail, and @removed entries for deleted/moved messages), not a clean
+    // 24h window -- both are filtered out here rather than in the Graph
+    // query, keeping the digest's scope identical to the fixed-window path.
+    const changed = items.filter(item => !item['@removed']);
+    const withinWindow = changed.filter(e => e.receivedDateTime && e.receivedDateTime >= since);
+    withinWindow.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
+
+    console.log(`Delta fetch: ${pages} page(s), ${items.length} changed item(s), ${withinWindow.length} within the 24h window.`);
+    return { emails: withinWindow, deltaResynced: false };
+  } catch (error) {
+    if (error.status === 410) {
+      // Graph invalidates a delta cursor after enough inactivity. This is
+      // expected to be rare -- surfaced in the digest footer and digest_runs
+      // metadata (not just logged) so a mailbox silently resyncing every run
+      // is visible rather than quietly costing the fixed-window pull's cost
+      // every day without anyone noticing.
+      console.error('Delta cursor expired (410 Gone) -- resetting and falling back to a fixed-window pull this run.', error);
+      const { error: resetError } = await supabase
+        .from('inbox_delta_state')
+        .update({
+          cursor_url: null,
+          is_bootstrapped: false,
+          last_resync_at: new Date().toISOString(),
+          last_resync_reason: 'expired_410',
+        })
+        .eq('owner_email', OWNER_EMAIL);
+      if (resetError) console.error('Failed to reset inbox_delta_state after 410:', resetError);
+
+      return { emails: await fetchInboxViaFixedWindow(token, since), deltaResynced: true };
+    }
+    throw error;
+  }
+}
+
 export async function runDigest() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Missing Supabase environment variables: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY');
@@ -636,14 +719,7 @@ export async function runDigest() {
   const token = await getGraphToken();
 
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const url = `/users/${OWNER_EMAIL}/mailFolders/Inbox/messages`
-    + `?$top=50`
-    + `&$select=id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments,internetMessageHeaders`
-    + `&$filter=receivedDateTime ge ${since}`
-    + `&$orderby=receivedDateTime desc`;
-
-  const result = await graph(token, url);
-  const emails = result.value || [];
+  const { emails, deltaResynced } = await fetchInboxEmails(token, since);
 
   // SPF/DKIM/DMARC verdicts Microsoft 365 already computed on inbound mail --
   // read once here so both the spam pre-pass and the triage prompt (and the
@@ -677,7 +753,8 @@ export async function runDigest() {
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
       run_completed_at: new Date().toISOString(),
-      status: 'no_emails'
+      status: 'no_emails',
+      metadata: { delta_resynced: deltaResynced }
     });
     return;
   }
@@ -766,7 +843,8 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
       metadata: {
         filtered_spam_count: filteredSpamCount,
         archive_failed_count: archiveFailedCount,
-        auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true'
+        auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
+        delta_resynced: deltaResynced
       }
     });
     return;
@@ -895,6 +973,10 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 11 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
   }
 
+  if (deltaResynced) {
+    digest += `\n_🔄 Delta sync cursor expired and was reset — this run used a full pull instead. Re-run \`/api/backfill-inbox-delta\` when convenient to re-establish it._`;
+  }
+
   const digestTs = await slackPost(digest);
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
@@ -908,7 +990,8 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
       skipped_thread_summaries: skippedThreadCount,
       skipped_entity_extractions: skippedEntityCount,
-      auth_flagged_count: authFlaggedEmails.length
+      auth_flagged_count: authFlaggedEmails.length,
+      delta_resynced: deltaResynced
     }
   });
 
