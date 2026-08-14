@@ -61,13 +61,14 @@ export default async function handler(req, res) {
           conversationHistory = buildConversationHistory(threadMessages, botUserId, event.ts);
         }
 
-        const { text: agentResponse, tenantData, sectionApprovals } = await runAgent(
+        const { text: agentResponse, tenantData, managerName, sectionApprovals } = await runAgent(
           event.text || '',
           conversationHistory,
           state
         );
 
         let newState = state || {};
+        if (managerName) newState.managerName = managerName;
         if (tenantData) Object.assign(newState, tenantData);
         for (const { section_number, content } of sectionApprovals) {
           newState[`section${section_number}`] = content;
