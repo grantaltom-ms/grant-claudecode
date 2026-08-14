@@ -246,6 +246,16 @@ Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `d
 | Successful daily reports | Silently discarded (not shown anywhere in the digest) |
 | Adobe Acrobat comment notifications | Silently discarded unless a reply is explicitly required |
 | Custom TRIAGE_RULES in env | Applied before any other categorization |
+| SPF/DMARC auth failure + payment/banking/wire language | Prepends a `🚨 AUTHENTICATION FAILURE DETECTED` banner ahead of the whole digest — a deterministic code check, not the triage model's judgment (see "Authentication forensics" below) |
+
+### Authentication Forensics
+
+Every inbox pull now requests `internetMessageHeaders` and reads the `Authentication-Results` header Microsoft 365 already stamps on inbound mail (`lib/email-parse.js`'s `parseAuthResults`/`isAuthFailure` — no cryptographic verification is performed here, it just reads Microsoft's own verdict). Two things happen with it:
+
+1. The spam pre-pass prompt is told that `spf=fail`/`dmarc=fail` combined with a payment/banking-change request is a spoofing signal even when the display name looks like a known vendor.
+2. Independently of what the spam/triage model decides, `digest.js` checks every email that survives the spam filter against `isAuthFailure()` and a payment/wire-fraud keyword heuristic (`looksLikePaymentRequest`). Any match gets a `🚨 AUTHENTICATION FAILURE DETECTED` banner prepended to the digest — this is a hardcoded check, deliberately not routed through the LLM, because the cost of a missed positive (funds sent on a spoofed instruction) is asymmetric to the cost of a false positive.
+
+`digest_runs.metadata.auth_flagged_count` records how often this fires.
 
 ---
 
