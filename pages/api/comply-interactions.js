@@ -95,6 +95,11 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
+  // Ignore Slack retries — the first delivery already ACKed and is running.
+  if (req.headers['x-slack-retry-num']) {
+    return res.status(200).end();
+  }
+
   const payload = parseJson(new URLSearchParams(rawBody).get('payload'));
 
   if (payload.type !== 'block_actions') return res.status(200).end();
