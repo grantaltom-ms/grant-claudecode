@@ -71,6 +71,8 @@ See `SETUP.md` for the complete, verified environment variable table (it also co
 | `CRON_SECRET` | Shared secret for authenticating cron and backfill calls |
 | `VERCEL_TOKEN` | Vercel API token — used by bot to save triage rules |
 | `TRIAGE_RULES` | JSON array of custom triage rules (managed by bot) |
+| `MAX_SENDS_PER_DAY` | Optional. Hard cap on `send_draft` calls per rolling 24h (default 25) — see "Send safety" below |
+| `TRUSTED_DOMAINS` | Optional. Comma-separated domains exempt from the first-time-recipient flag (default `milestoneproperties.net`) |
 
 Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this doc or any other file in the repo — reference them by variable name only. (This revision removes IDs that a previous version of this file had inlined directly.)
 
@@ -154,6 +156,11 @@ Handles all interactive Slack messages. When Grant sends a message in #inbox-dig
 
 **Send approval gate:**
 There is no code-level approval gate — the system prompt explicitly prohibits sending without approval, and `send_draft` is an ordinary tool Claude can call at its own judgment. The entire safety boundary is the model correctly waiting for a phrase like "send it", "looks good", or "go ahead" before calling it. (See `docs/PLAN-tier1-2-reliability.md`, item 6, for a hardened design using Slack approval buttons — modeled on the pattern already used by the Comply-or-Vacate bot — that removes `send_draft` from the model's available tools entirely and requires a button click to actually send.)
+
+**Send safety (`lib/send-safety.js`):**
+Two independent checks, neither of which is the approval gate above — they exist underneath whatever calls Graph's send endpoint, today's `send_draft` handler:
+- `checkSendRateLimit` — a hard backstop, not advisory. Before `send_draft` calls Graph, it counts rows in the `send_log` table (migration `021_send_log.sql`) for the last rolling 24h and refuses if `MAX_SENDS_PER_DAY` (default 25) is reached; `recordSend` logs every actual send afterward. This exists to bound the damage of a runaway loop or a bad approval, not to restrict who Grant can email.
+- `flagNewRecipients` — advisory only, never blocks. `create_draft_reply` and `create_new_draft` check each recipient against `TRUSTED_DOMAINS` and this mailbox's saved `email_messages` history (as sender, To, or Cc); anything neither trusted nor previously seen comes back as `first_time_recipients` in the tool result, and the system prompt tells Claude to mention it when showing the draft. A strict allowlist was deliberately not used here — Grant emails new tenants/vendors as normal business, so blocking unknown recipients would break real usage.
 
 **Prompt caching:**
 The system prompt is sent with `cache_control: { type: 'ephemeral' }` to enable Anthropic prompt caching, reducing latency and cost on repeated calls.
