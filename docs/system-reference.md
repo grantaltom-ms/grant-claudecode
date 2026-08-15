@@ -73,6 +73,7 @@ See `SETUP.md` for the complete, verified environment variable table (it also co
 | `TRIAGE_RULES` | JSON array of custom triage rules (managed by bot) |
 | `MAX_SENDS_PER_DAY` | Optional. Hard cap on `send_draft` calls per rolling 24h (default 25) — see "Send safety" below |
 | `TRUSTED_DOMAINS` | Optional. Comma-separated domains exempt from the first-time-recipient flag (default `milestoneproperties.net`) |
+| `DIGEST_HISTORY_MIN_EXCHANGES` / `DIGEST_HISTORY_WINDOW_DAYS` / `DIGEST_HISTORY_MAX_MESSAGES` | Optional. Tune the digest's correspondent-history enrichment (defaults 3 / 180 / 1000) — see "Correspondent History Enrichment" below |
 
 Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this doc or any other file in the repo — reference them by variable name only. (This revision removes IDs that a previous version of this file had inlined directly.)
 
@@ -267,6 +268,7 @@ Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `d
 | Adobe Acrobat comment notifications | Silently discarded unless a reply is explicitly required |
 | Custom TRIAGE_RULES in env | Applied before any other categorization |
 | SPF/DMARC auth failure + payment/banking/wire language | Prepends a `🚨 AUTHENTICATION FAILURE DETECTED` banner ahead of the whole digest — a deterministic code check, not the triage model's judgment (see "Authentication forensics" below) |
+| Sender crosses the correspondence-history threshold (3+ prior exchanges, at least one sent) | That line's `History:` note is available to the triage model, which is instructed to write a context-aware one-liner instead of restating the subject (see "Correspondent History Enrichment" below) |
 
 ### Authentication Forensics
 
@@ -276,6 +278,26 @@ Every inbox pull now requests `internetMessageHeaders` and reads the `Authentica
 2. Independently of what the spam/triage model decides, `digest.js` checks every email that survives the spam filter against `isAuthFailure()` and a payment/wire-fraud keyword heuristic (`looksLikePaymentRequest`). Any match gets a `🚨 AUTHENTICATION FAILURE DETECTED` banner prepended to the digest — this is a hardcoded check, deliberately not routed through the LLM, because the cost of a missed positive (funds sent on a spoofed instruction) is asymmetric to the cost of a false positive.
 
 `digest_runs.metadata.auth_flagged_count` records how often this fires.
+
+### Correspondent History Enrichment
+
+Pilot feature: makes the triage prompt's one-line summaries context-aware for frequent/high-value senders, without a second Claude call or a new digest section.
+
+`runDigest()` loads `loadCorrespondentStatsMap` (`lib/correspondent-history.js`) **concurrently with the inbox fetch, and before today's emails are saved into `email_messages`** — this ordering is load-bearing: if the stats load happened after that save, today's own arrivals would count toward "prior" correspondence, misclassifying a true first-time sender who sends 2-3 emails in one day. The stats map covers both `Inbox` and `SentItems` mail (up to `DIGEST_HISTORY_WINDOW_DAYS` back, capped at `DIGEST_HISTORY_MAX_MESSAGES` rows) for every external contact (any address off the owner's domain).
+
+A sender's line in the triage prompt gets a `History:` note only if it *qualifies* (`qualifiesForHistoryNote` in `digest.js`): at least one prior **outbound** message (so a purely automated one-way sender like DocuSign doesn't qualify just by sending 3+ notifications) and `DIGEST_HISTORY_MIN_EXCHANGES` (default 3) combined inbound+outbound exchanges. The triage system prompt is told to use that note to write a context-aware summary (e.g. "4th follow-up on the BECU refi") rather than restate the subject — it's never told to fabricate history for lines without a note.
+
+`digest_runs.metadata.history_enriched_count` records how many lines got a note each run; the exact note text is also `console.log`'d per qualifying sender for easy comparison against what the model actually wrote.
+
+New optional env vars, same style as `MAX_SENDS_PER_DAY`/`TRUSTED_DOMAINS`:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `DIGEST_HISTORY_MIN_EXCHANGES` | Minimum combined inbound+outbound exchanges to qualify for a `History:` note | 3 |
+| `DIGEST_HISTORY_WINDOW_DAYS` | How far back the correspondence-history query looks | 180 |
+| `DIGEST_HISTORY_MAX_MESSAGES` | Row cap on the correspondence-history query | 1000 |
+
+This shares its underlying stats logic (`lib/correspondent-history.js`) with `backfill-draft-candidates.js`'s existing (stricter) gate for draft-candidate creation — the two keep separate thresholds since they serve different purposes.
 
 ---
 

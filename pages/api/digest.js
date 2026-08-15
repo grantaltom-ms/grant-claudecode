@@ -2,8 +2,10 @@ import { waitUntil } from '@vercel/functions';
 import { supabase } from '../../lib/supabase';
 import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
 import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
+import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { callClaude } from '../../lib/claude';
+import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
@@ -32,6 +34,45 @@ const PAYMENT_FRAUD_KEYWORD_PATTERN = /\b(wire transfer|wiring instructions|bank
 
 function looksLikePaymentRequest(text = '') {
   return PAYMENT_FRAUD_KEYWORD_PATTERN.test(text);
+}
+
+// Correspondent history enrichment (docs/PLAN-outlook-mcp-inspired-features.md
+// follow-on pilot): makes the triage prompt's one-line summaries context-aware
+// for frequent/high-value senders, without a second Claude call or a new
+// digest section. Same 0-safe env-parsing idiom as lib/send-safety.js's
+// resolveMaxSendsPerDay -- an explicit "" or unset falls back to the default,
+// anything else must parse as a finite number.
+const DEFAULT_HISTORY_MIN_EXCHANGES = 3;
+const DEFAULT_HISTORY_WINDOW_DAYS = 180;
+const DEFAULT_HISTORY_MAX_MESSAGES = 1000;
+
+function resolveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function resolveMinExchanges() {
+  return resolveIntEnv('DIGEST_HISTORY_MIN_EXCHANGES', DEFAULT_HISTORY_MIN_EXCHANGES);
+}
+
+function resolveHistoryWindowDays() {
+  return resolveIntEnv('DIGEST_HISTORY_WINDOW_DAYS', DEFAULT_HISTORY_WINDOW_DAYS);
+}
+
+function resolveHistoryMaxMessages() {
+  return resolveIntEnv('DIGEST_HISTORY_MAX_MESSAGES', DEFAULT_HISTORY_MAX_MESSAGES);
+}
+
+// Requires at least one outbound message (not just inbound volume) so a
+// purely automated one-way sender (DocuSign, a vendor notification address)
+// doesn't qualify just by sending 3+ notifications -- that's volume, not the
+// ongoing correspondence this feature is meant to surface.
+function qualifiesForHistoryNote(stats) {
+  return !!stats
+    && stats.outbound_count >= 1
+    && (stats.inbound_count + stats.outbound_count) >= resolveMinExchanges();
 }
 
 // Preserves this file's original contract (never throws, returns undefined
@@ -92,103 +133,6 @@ async function saveEmailToMemory(email) {
   if (error) {
     console.error('Failed to save email to memory:', {
       graph_message_id: email.id,
-      subject: email.subject,
-      error
-    });
-    return null;
-  }
-
-  return data;
-}
-
-function collectEmailAddresses(recipients = []) {
-  return recipients
-    .map(recipient => recipient.emailAddress?.address)
-    .filter(Boolean);
-}
-
-function collectEmailNames(recipients = []) {
-  return recipients
-    .map(recipient => recipient.emailAddress?.name)
-    .filter(Boolean);
-}
-
-async function upsertThreadMemory(email) {
-  if (!email.conversationId) return null;
-
-  const sender = email.from?.emailAddress || {};
-  const participantEmails = [
-    sender.address,
-    ...collectEmailAddresses(email.toRecipients),
-    ...collectEmailAddresses(email.ccRecipients)
-  ].filter(Boolean);
-  const participantNames = [
-    sender.name,
-    ...collectEmailNames(email.toRecipients),
-    ...collectEmailNames(email.ccRecipients)
-  ].filter(Boolean);
-
-  const { data: existingThread, error: existingError } = await supabase
-    .from('email_threads')
-    .select('first_message_at,last_message_at,participant_emails,participant_names')
-    .eq('graph_conversation_id', email.conversationId)
-    .maybeSingle();
-
-  if (existingError) {
-    console.error('Failed to load existing thread memory:', {
-      graph_conversation_id: email.conversationId,
-      error: existingError
-    });
-    return null;
-  }
-
-  const receivedAt = email.receivedDateTime || email.sentDateTime || null;
-  const existingEmails = existingThread?.participant_emails || [];
-  const existingNames = existingThread?.participant_names || [];
-  const mergedEmails = [...new Set([...existingEmails, ...participantEmails])];
-  const mergedNames = [...new Set([...existingNames, ...participantNames])];
-  const firstMessageAt = [existingThread?.first_message_at, receivedAt]
-    .filter(Boolean)
-    .sort()[0] || null;
-  const lastMessageCandidates = [existingThread?.last_message_at, receivedAt]
-    .filter(Boolean)
-    .sort();
-  const lastMessageAt = lastMessageCandidates[lastMessageCandidates.length - 1] || null;
-
-  const { count, error: countError } = await supabase
-    .from('email_messages')
-    .select('id', { count: 'exact', head: true })
-    .eq('graph_conversation_id', email.conversationId);
-
-  if (countError) {
-    console.error('Failed to count thread messages:', {
-      graph_conversation_id: email.conversationId,
-      error: countError
-    });
-  }
-
-  const { data, error } = await supabase
-    .from('email_threads')
-    .upsert({
-      graph_conversation_id: email.conversationId,
-      owner_email: OWNER_EMAIL,
-      latest_subject: email.subject || null,
-      participant_emails: mergedEmails,
-      participant_names: mergedNames,
-      first_message_at: firstMessageAt,
-      last_message_at: lastMessageAt,
-      last_graph_message_id: email.id,
-      message_count: count || 0,
-      updated_at: new Date().toISOString()
-    }, {
-      onConflict: 'graph_conversation_id'
-    })
-    .select()
-    .single();
-
-  if (error) {
-    console.error('Failed to upsert thread memory:', {
-      graph_conversation_id: email.conversationId,
       subject: email.subject,
       error
     });
@@ -719,7 +663,20 @@ export async function runDigest() {
   const token = await getGraphToken();
 
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const { emails, deltaResynced } = await fetchInboxEmails(token, since);
+
+  // Loaded concurrently with the inbox fetch, and -- this ordering is
+  // load-bearing, not incidental -- BEFORE today's emails are saved into
+  // email_messages below. If the stats load happened after that save loop,
+  // today's own arrivals would count toward "prior" correspondence,
+  // misclassifying a true first-time sender who sends 2-3 emails in one day
+  // as a frequent contact.
+  const [{ emails, deltaResynced }, correspondentStats] = await Promise.all([
+    fetchInboxEmails(token, since),
+    loadCorrespondentStatsMap(supabase, OWNER_EMAIL, {
+      days: resolveHistoryWindowDays(),
+      maxMessages: resolveHistoryMaxMessages(),
+    }),
+  ]);
 
   // SPF/DKIM/DMARC verdicts Microsoft 365 already computed on inbound mail --
   // read once here so both the spam pre-pass and the triage prompt (and the
@@ -735,7 +692,7 @@ export async function runDigest() {
     const saved = await saveEmailToMemory(email);
     if (saved) {
       savedEmails.push(saved);
-      const savedThread = await upsertThreadMemory(email);
+      const savedThread = await upsertThreadMemory(supabase, OWNER_EMAIL, email);
       if (savedThread) savedThreads.push(savedThread);
     }
   }
@@ -859,13 +816,27 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   const savedDigestItems = await saveDigestItems(digestRun?.id, filteredEmails);
   console.log(`Saved ${savedDigestItems.length}/${filteredEmails.length} digest item mappings.`);
 
+  const historyWindowDays = resolveHistoryWindowDays();
+  let historyEnrichedCount = 0;
+
   const emailList = filteredEmails.map((e, i) => {
     const received = new Date(e.receivedDateTime);
     const daysAgo = Math.floor((today - received) / (1000 * 60 * 60 * 24));
     const ageNote = daysAgo > 0 ? ` (${daysAgo}d ago)` : ' (today)';
     const auth = authResultsByEmailId.get(e.id) || {};
     const authNote = isAuthFailure(auth) ? ` | ⚠️ AUTH FAILED (spf=${auth.spf || 'n/a'}, dmarc=${auth.dmarc || 'n/a'})` : '';
-    return `${i + 1}. From: ${e.from?.emailAddress?.name || e.from?.emailAddress?.address} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Read: ${e.isRead}${ageNote} | Preview: ${e.bodyPreview?.slice(0, 150)}${authNote}`;
+
+    const stats = correspondentStats.get(normalizeEmail(e.from?.emailAddress?.address));
+    let historyNote = '';
+    if (qualifiesForHistoryNote(stats)) {
+      historyEnrichedCount += 1;
+      const subjectNote = stats.last_subject ? `, most recent: "${stats.last_subject}"` : '';
+      historyNote = ` | History: ${stats.inbound_count + stats.outbound_count} prior exchanges `
+        + `(${stats.inbound_count} received, ${stats.outbound_count} sent) in the last ${historyWindowDays}d${subjectNote}`;
+      console.log(`Correspondent history note for ${e.from?.emailAddress?.address}:${historyNote}`);
+    }
+
+    return `${i + 1}. From: ${e.from?.emailAddress?.name || e.from?.emailAddress?.address} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Read: ${e.isRead}${ageNote} | Preview: ${e.bodyPreview?.slice(0, 150)}${authNote}${historyNote}`;
   }).join('\n');
 
   // Deterministic check, not model judgment: flag anything that failed sender
@@ -937,6 +908,10 @@ NUMBERING:
 - Assign each email a number [#N] in Action Required items only
 - Don't number FYI items
 
+CORRESPONDENCE HISTORY:
+- If a line includes a "History:" note, use it to make that item's one-line summary context-aware — e.g. "4th follow-up on the BECU refi" rather than restating the subject as if this were a first contact
+- Do not fabricate or imply history for lines without a "History:" note
+
 OMIT sections with no emails entirely.${triageRulesSection}`,
     messages: [{
       role: 'user',
@@ -970,7 +945,7 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
   if (skippedThreadCount > 0) capNotes.push(`${skippedThreadCount} thread${skippedThreadCount > 1 ? 's' : ''} not summarized`);
   if (skippedEntityCount > 0) capNotes.push(`${skippedEntityCount} email${skippedEntityCount > 1 ? 's' : ''} not scanned for entities`);
   if (capNotes.length > 0) {
-    digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 11 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
+    digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 10 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
   }
 
   if (deltaResynced) {
@@ -991,6 +966,7 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       skipped_thread_summaries: skippedThreadCount,
       skipped_entity_extractions: skippedEntityCount,
       auth_flagged_count: authFlaggedEmails.length,
+      history_enriched_count: historyEnrichedCount,
       delta_resynced: deltaResynced
     }
   });

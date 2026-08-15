@@ -1,6 +1,7 @@
 import { supabase } from '../../lib/supabase';
 import { getGraphToken, graph, graphAbsolute } from '../../lib/graph';
 import { extractBodyFields } from '../../lib/email-parse';
+import { upsertThreadMemory } from '../../lib/email-thread-memory';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 
@@ -67,6 +68,61 @@ async function saveSentEmailToMemory(email) {
   return data;
 }
 
+export async function runSentMailBackfill({ days = 180, maxMessages = 250 } = {}) {
+  const token = await getGraphToken();
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const select = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments';
+
+  const initialPath = `/users/${OWNER_EMAIL}/mailFolders/SentItems/messages`
+    + `?$top=50`
+    + `&$select=${select}`
+    + `&$filter=sentDateTime ge ${since}`
+    + `&$orderby=sentDateTime desc`;
+  let nextLink = null;
+  let fetched = 0;
+  let savedEmails = 0;
+  let updatedThreads = 0;
+  const errors = [];
+
+  while (fetched < maxMessages) {
+    const result = nextLink ? await graphAbsolute(token, nextLink) : await graph(token, initialPath);
+    const emails = result.value || [];
+
+    for (const email of emails) {
+      if (fetched >= maxMessages) break;
+      fetched += 1;
+
+      const saved = await saveSentEmailToMemory(email);
+      if (!saved) {
+        errors.push({ graph_message_id: email.id, subject: email.subject });
+        continue;
+      }
+
+      savedEmails += 1;
+      // Direction-agnostic: for a SentItems message, email.from is the owner
+      // and toRecipients/ccRecipients are the external contacts, so this
+      // correctly folds sent mail into participant_emails/last_message_at.
+      const savedThread = await upsertThreadMemory(supabase, OWNER_EMAIL, email);
+      if (savedThread) updatedThreads += 1;
+    }
+
+    nextLink = result['@odata.nextLink'] || null;
+    if (!nextLink) break;
+  }
+
+  return {
+    ok: errors.length === 0,
+    supabase_project_ref: projectRefFromUrl(),
+    days,
+    max_messages: maxMessages,
+    fetched,
+    saved_emails: savedEmails,
+    updated_threads: updatedThreads,
+    error_count: errors.length,
+    errors: errors.slice(0, 10),
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST' && req.method !== 'GET') return res.status(405).end();
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
@@ -74,47 +130,8 @@ export default async function handler(req, res) {
   try {
     const days = boundedInteger(req.query.days, 180, 730);
     const maxMessages = boundedInteger(req.query.max, 250, 1000);
-    const token = await getGraphToken();
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    const select = 'id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,body,bodyPreview,importance,hasAttachments';
-
-    const initialPath = `/users/${OWNER_EMAIL}/mailFolders/SentItems/messages`
-      + `?$top=50`
-      + `&$select=${select}`
-      + `&$filter=sentDateTime ge ${since}`
-      + `&$orderby=sentDateTime desc`;
-    let nextLink = null;
-    let fetched = 0;
-    let savedEmails = 0;
-    const errors = [];
-
-    while (fetched < maxMessages) {
-      const result = nextLink ? await graphAbsolute(token, nextLink) : await graph(token, initialPath);
-      const emails = result.value || [];
-
-      for (const email of emails) {
-        if (fetched >= maxMessages) break;
-        fetched += 1;
-
-        const saved = await saveSentEmailToMemory(email);
-        if (saved) savedEmails += 1;
-        else errors.push({ graph_message_id: email.id, subject: email.subject });
-      }
-
-      nextLink = result['@odata.nextLink'] || null;
-      if (!nextLink) break;
-    }
-
-    return res.status(200).json({
-      ok: errors.length === 0,
-      supabase_project_ref: projectRefFromUrl(),
-      days,
-      max_messages: maxMessages,
-      fetched,
-      saved_emails: savedEmails,
-      error_count: errors.length,
-      errors: errors.slice(0, 10),
-    });
+    const result = await runSentMailBackfill({ days, maxMessages });
+    return res.status(200).json(result);
   } catch (error) {
     console.error('Sent mail backfill failed:', error);
     return res.status(500).json({
