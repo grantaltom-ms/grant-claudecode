@@ -2,8 +2,8 @@
 
 The Vercel inbox assistant now has a durable memory pipeline:
 
-1. Microsoft Graph ingestion saves Outlook messages into `email_messages`.
-2. Thread rollups save conversation state into `email_threads`.
+1. Microsoft Graph ingestion saves Outlook messages into `email_messages` — both Inbox (`backfill-inbox.js`, plus `digest.js` each run) and Sent Items (`backfill-sent-mail.js`, now running daily via `memory-maintenance.js` rather than the ~1-in-10-day rotation it used to share with other tasks).
+2. Thread rollups save conversation state into `email_threads` via the shared `upsertThreadMemory` (`lib/email-thread-memory.js`) — called from all three ingestion paths above, so sent mail keeps `participant_emails`/`last_message_at` current too, not just inbound mail.
 3. Digest runs map Slack item numbers to Graph messages via `digest_runs` and `digest_items`.
 4. Entity extraction writes durable people, vendors, properties, invoices, insurance, financial statements, and issue records into `entities` and `entity_mentions`.
 5. Full-body and attachment backfills enrich `email_messages`, `email_attachments`, and `memory_chunks`.
@@ -18,6 +18,7 @@ All maintenance endpoints require `Authorization: Bearer $CRON_SECRET`.
 - `/api/memory-status`
 - `/api/backfill-inbox`
 - `/api/backfill-inbox-delta`
+- `/api/backfill-sent-mail`
 - `/api/backfill-email-bodies`
 - `/api/backfill-attachments`
 - `/api/backfill-entities`
@@ -39,6 +40,10 @@ CRON_SECRET=... npm run smoke:memory
 - **Delta (once bootstrapped)** — follows the stored `inbox_delta_state.cursor_url` via Graph's mail delta query, filtering to the last 24h and dropping `@removed` entries in code (Graph's delta filtering support doesn't cover `receivedDateTime`, so this can't happen in the query itself).
 
 Delta sync is bootstrapped by calling `/api/backfill-inbox-delta` repeatedly (each call is capped at `max_pages`, default 20) until it reports `bootstrap_complete: true` — establishing the cursor requires walking the entire Inbox once, since Graph's mail delta query can't be scoped to a recent window. This is deliberately decoupled from the live digest cron: `digest.js`'s fetch path is unaffected until bootstrap finishes, and if the cursor later expires (Graph returns `410 Gone` after enough inactivity), `digest.js` resets it and falls back to the fixed-window pull for that run, surfacing the resync in the digest footer and `digest_runs.metadata.delta_resynced` rather than only logging it.
+
+## Correspondent History (Digest Enrichment)
+
+`digest.js` loads per-contact correspondence stats (`lib/correspondent-history.js`, shared with `backfill-draft-candidates.js`'s own gate) covering both `email_messages.folder` values, and uses them to add a `History:` note to a sender's line in the triage prompt once they cross a configurable exchange threshold — see "Correspondent History Enrichment" in `docs/system-reference.md` for the full design, including the load-bearing ordering requirement (stats must load before today's mail is saved) and the env vars that tune it. This is why sent-mail freshness matters: the stats are only as current as `email_messages`'s `SentItems` rows, which is what moving `backfill_sent_mail` to a daily cadence (above) is for.
 
 ## Search Modes
 

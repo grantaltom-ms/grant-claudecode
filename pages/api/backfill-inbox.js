@@ -1,23 +1,12 @@
 import { supabase } from '../../lib/supabase';
 import { getGraphToken, graph, graphAbsolute } from '../../lib/graph';
 import { extractBodyFields } from '../../lib/email-parse';
+import { upsertThreadMemory as upsertThreadMemoryShared } from '../../lib/email-thread-memory';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 
 function verifyCronRequest(req) {
   return req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
-}
-
-function collectEmailAddresses(recipients = []) {
-  return recipients
-    .map(recipient => recipient.emailAddress?.address)
-    .filter(Boolean);
-}
-
-function collectEmailNames(recipients = []) {
-  return recipients
-    .map(recipient => recipient.emailAddress?.name)
-    .filter(Boolean);
 }
 
 async function saveEmailToMemory(email) {
@@ -83,106 +72,16 @@ function projectRefFromUrl() {
 }
 
 async function upsertThreadMemory(email, threadErrors) {
-  if (!email.conversationId) return null;
-
-  const sender = email.from?.emailAddress || {};
-  const participantEmails = [
-    sender.address,
-    ...collectEmailAddresses(email.toRecipients),
-    ...collectEmailAddresses(email.ccRecipients)
-  ].filter(Boolean);
-  const participantNames = [
-    sender.name,
-    ...collectEmailNames(email.toRecipients),
-    ...collectEmailNames(email.ccRecipients)
-  ].filter(Boolean);
-
-  const { data: existingThread, error: existingError } = await supabase
-    .from('email_threads')
-    .select('first_message_at,last_message_at,participant_emails,participant_names')
-    .eq('graph_conversation_id', email.conversationId)
-    .maybeSingle();
-
-  if (existingError) {
-    console.error('Backfill failed to load thread memory:', {
-      graph_conversation_id: email.conversationId,
-      error: existingError
-    });
-    threadErrors.push({
-      stage: 'load_thread',
-      graph_conversation_id: email.conversationId,
-      subject: email.subject,
-      error: safeError(existingError)
-    });
-    return null;
-  }
-
-  const receivedAt = email.receivedDateTime || email.sentDateTime || null;
-  const existingEmails = existingThread?.participant_emails || [];
-  const existingNames = existingThread?.participant_names || [];
-  const mergedEmails = [...new Set([...existingEmails, ...participantEmails])];
-  const mergedNames = [...new Set([...existingNames, ...participantNames])];
-  const firstMessageAt = [existingThread?.first_message_at, receivedAt]
-    .filter(Boolean)
-    .sort()[0] || null;
-  const lastMessageCandidates = [existingThread?.last_message_at, receivedAt]
-    .filter(Boolean)
-    .sort();
-  const lastMessageAt = lastMessageCandidates[lastMessageCandidates.length - 1] || null;
-
-  const { count, error: countError } = await supabase
-    .from('email_messages')
-    .select('id', { count: 'exact', head: true })
-    .eq('graph_conversation_id', email.conversationId);
-
-  if (countError) {
-    console.error('Backfill failed to count thread messages:', {
-      graph_conversation_id: email.conversationId,
-      error: countError
-    });
-    threadErrors.push({
-      stage: 'count_messages',
-      graph_conversation_id: email.conversationId,
-      subject: email.subject,
-      error: safeError(countError)
-    });
-  }
-
-  const { data, error } = await supabase
-    .from('email_threads')
-    .upsert({
-      graph_conversation_id: email.conversationId,
-      owner_email: OWNER_EMAIL,
-      latest_subject: email.subject || null,
-      participant_emails: mergedEmails,
-      participant_names: mergedNames,
-      first_message_at: firstMessageAt,
-      last_message_at: lastMessageAt,
-      last_graph_message_id: email.id,
-      message_count: count || 0,
-      updated_at: new Date().toISOString()
-    }, {
-      onConflict: 'graph_conversation_id'
-    })
-    .select()
-    .single();
-
-  if (error) {
-    console.error('Backfill failed to upsert thread memory:', {
-      graph_conversation_id: email.conversationId,
-      subject: email.subject,
-      error
-    });
-    threadErrors.push({
-      stage: 'upsert_thread',
-      graph_conversation_id: email.conversationId,
-      subject: email.subject,
-      error: safeError(error)
-    });
-    return null;
-  }
-
-  return data;
+  return upsertThreadMemoryShared(supabase, OWNER_EMAIL, email, {
+    onError: (stage, error) => {
+      threadErrors.push({
+        stage,
+        graph_conversation_id: email.conversationId,
+        subject: email.subject,
+        error: safeError(error)
+      });
+    }
+  });
 }
 
 function boundedInteger(value, fallback, max) {

@@ -1,4 +1,5 @@
 import { supabase } from '../../lib/supabase';
+import { normalizeEmail, isExternalContact, loadContactHistory, buildContactStats } from '../../lib/correspondent-history';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 
@@ -18,77 +19,6 @@ function projectRefFromUrl() {
   } catch {
     return null;
   }
-}
-
-function normalizeEmail(value) {
-  return (value || '').trim().toLowerCase();
-}
-
-function recipientAddresses(message) {
-  return [...(message.recipients || []), ...(message.cc_recipients || [])]
-    .map(recipient => normalizeEmail(recipient?.emailAddress?.address || recipient?.address))
-    .filter(Boolean);
-}
-
-function isExternalContact(email) {
-  const normalized = normalizeEmail(email);
-  return normalized && normalized !== OWNER_EMAIL && !normalized.endsWith('@milestoneproperties.net');
-}
-
-function buildContactStats(messages) {
-  const stats = new Map();
-
-  function ensure(email) {
-    const normalized = normalizeEmail(email);
-    if (!stats.has(normalized)) {
-      stats.set(normalized, {
-        email: normalized,
-        inbound_count: 0,
-        outbound_count: 0,
-        conversations: new Map(),
-      });
-    }
-    return stats.get(normalized);
-  }
-
-  function markConversation(contactStats, conversationId, direction) {
-    if (!conversationId) return;
-    const current = contactStats.conversations.get(conversationId) || { inbound: 0, outbound: 0 };
-    current[direction] += 1;
-    contactStats.conversations.set(conversationId, current);
-  }
-
-  for (const message of messages) {
-    const folder = message.folder;
-    const conversationId = message.graph_conversation_id || message.graph_message_id;
-
-    if (folder === 'Inbox' && isExternalContact(message.sender_email)) {
-      const contactStats = ensure(message.sender_email);
-      contactStats.inbound_count += 1;
-      markConversation(contactStats, conversationId, 'inbound');
-    }
-
-    if (folder === 'SentItems') {
-      for (const recipient of recipientAddresses(message)) {
-        if (!isExternalContact(recipient)) continue;
-        const contactStats = ensure(recipient);
-        contactStats.outbound_count += 1;
-        markConversation(contactStats, conversationId, 'outbound');
-      }
-    }
-  }
-
-  for (const contactStats of stats.values()) {
-    contactStats.back_and_forth_thread_count = [...contactStats.conversations.values()]
-      .filter(conversation => conversation.inbound > 0 && conversation.outbound > 0)
-      .length;
-    contactStats.known_contact_score =
-      contactStats.back_and_forth_thread_count * 10
-      + Math.min(contactStats.inbound_count, 10)
-      + Math.min(contactStats.outbound_count, 10);
-  }
-
-  return stats;
 }
 
 function qualifies(stats) {
@@ -170,20 +100,6 @@ function seemsToNeedResponse(message) {
     matched_request_terms: matchedRequest,
     matched_non_response_terms: matchedNonResponse,
   };
-}
-
-async function loadContactHistory(days, maxMessages) {
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const { data, error } = await supabase
-    .from('email_messages')
-    .select('id, graph_message_id, graph_conversation_id, folder, sender_email, recipients, cc_recipients, received_at, sent_at')
-    .eq('owner_email', OWNER_EMAIL)
-    .or(`received_at.gte.${since},sent_at.gte.${since}`)
-    .order('received_at', { ascending: false, nullsFirst: false })
-    .limit(maxMessages);
-
-  if (error) throw new Error(`Contact history load failed: ${error.message}`);
-  return data || [];
 }
 
 async function loadRecentInbound(days, maxMessages) {
@@ -280,10 +196,10 @@ export default async function handler(req, res) {
     }
 
     const [history, inboundMessages] = await Promise.all([
-      loadContactHistory(historyDays, maxHistory),
+      loadContactHistory(supabase, OWNER_EMAIL, { days: historyDays, maxMessages: maxHistory }),
       loadRecentInbound(candidateDays, maxCandidates),
     ]);
-    const stats = buildContactStats(history);
+    const stats = buildContactStats(history, OWNER_EMAIL);
     const existingIds = await existingCandidateIds(inboundMessages.map(message => message.graph_message_id));
     const seenConversationIds = new Set();
 
@@ -306,7 +222,7 @@ export default async function handler(req, res) {
         skipped.existing += 1;
         continue;
       }
-      if (!isExternalContact(sender)) {
+      if (!isExternalContact(sender, OWNER_EMAIL)) {
         skipped.internal_or_unknown += 1;
         continue;
       }

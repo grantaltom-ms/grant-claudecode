@@ -41,11 +41,19 @@ async function callTask(req, task) {
   };
 }
 
-const CONTEXT_CARD_TASK = { name: 'context_cards', path: '/api/backfill-context-cards?max_chunks=500&max_records=250' };
+export const CONTEXT_CARD_TASK = { name: 'context_cards', path: '/api/backfill-context-cards?max_chunks=500&max_records=250' };
 
-const TASKS = [
+// Pulled out of the round-robin and always appended (same pattern as
+// CONTEXT_CARD_TASK below) so sent-mail ingestion runs daily rather than
+// once every ~10 days -- correspondent-history context in the digest is
+// only as good as how current this data is. The window is intentionally
+// short (3 days, matching backfill_inbox's own cadence) now that it runs
+// daily; the old 180-day depth was doing double duty as an infrequent deep
+// resync and remains available on demand via ?task=backfill_sent_mail&days=180.
+export const SENT_MAIL_TASK = { name: 'backfill_sent_mail', path: '/api/backfill-sent-mail?days=3&max=50' };
+
+export const TASKS = [
   { name: 'backfill_inbox', path: '/api/backfill-inbox?days=3&max=50' },
-  { name: 'backfill_sent_mail', path: '/api/backfill-sent-mail?days=180&max=100' },
   { name: 'email_bodies', path: '/api/backfill-email-bodies?max=50' },
   { name: 'attachments', path: '/api/backfill-attachments?max=25' },
   { name: 'entities', path: '/api/backfill-entities?days=7&max=10' },
@@ -57,29 +65,38 @@ const TASKS = [
   { name: 'missing_embeddings', path: '/api/backfill-memory-chunks?missing=50' },
 ];
 
+// Includes tasks that are always-appended rather than rotated, so ?task= and
+// available_tasks reporting can still address them individually.
+export const ALL_TASKS = [...TASKS, SENT_MAIL_TASK];
+
 function dayOfYear(date = new Date()) {
   const start = Date.UTC(date.getUTCFullYear(), 0, 0);
   const today = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
   return Math.floor((today - start) / 86_400_000);
 }
 
-function selectedTasks(req) {
-  if (req.query.all === '1') return TASKS;
+export function selectedTasks(req) {
+  if (req.query.all === '1') return ALL_TASKS;
 
   const requestedTask = req.query.task;
   if (requestedTask) {
-    const task = TASKS.find(candidate => candidate.name === requestedTask);
+    const task = ALL_TASKS.find(candidate => candidate.name === requestedTask);
     return task ? [task] : [];
   }
 
   return [TASKS[dayOfYear() % TASKS.length]];
 }
 
-function tasksForRun(req) {
-  const tasks = selectedTasks(req);
-  if (req.query.skip_context_cards === '1') return tasks;
-  if (!tasks.length || tasks.some(task => task.name === CONTEXT_CARD_TASK.name)) return tasks;
-  return [...tasks, CONTEXT_CARD_TASK];
+export function tasksForRun(req) {
+  let tasks = selectedTasks(req);
+  if (!tasks.length) return tasks;
+  if (req.query.skip_context_cards !== '1' && !tasks.some(task => task.name === CONTEXT_CARD_TASK.name)) {
+    tasks = [...tasks, CONTEXT_CARD_TASK];
+  }
+  if (req.query.skip_sent_mail !== '1' && !tasks.some(task => task.name === SENT_MAIL_TASK.name)) {
+    tasks = [...tasks, SENT_MAIL_TASK];
+  }
+  return tasks;
 }
 
 export default async function handler(req, res) {
@@ -91,7 +108,7 @@ export default async function handler(req, res) {
     return res.status(400).json({
       ok: false,
       error: 'Unknown maintenance task.',
-      available_tasks: TASKS.map(task => task.name),
+      available_tasks: ALL_TASKS.map(task => task.name),
     });
   }
 
@@ -102,7 +119,7 @@ export default async function handler(req, res) {
       supabase_project_ref: projectRefFromUrl(),
       mode: req.query.all === '1' ? 'all' : (req.query.task ? 'single' : 'rotating_daily'),
       tasks,
-      available_tasks: TASKS.map(task => task.name),
+      available_tasks: ALL_TASKS.map(task => task.name),
     });
   }
 
