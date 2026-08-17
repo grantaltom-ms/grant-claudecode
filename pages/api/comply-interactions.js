@@ -16,7 +16,12 @@ import {
   saveState,
   runAgent,
 } from '../../lib/comply-agent.js';
-import { buildChoiceBlocks, buildApprovalBlocks, buildConversationHistory } from '../../lib/comply-blocks.js';
+import {
+  buildChoiceBlocks,
+  buildApprovalBlocks,
+  buildConversationHistory,
+  formatResolvedMessage,
+} from '../../lib/comply-blocks.js';
 
 export const config = { api: { bodyParser: false } };
 
@@ -123,7 +128,13 @@ export default async function handler(req, res) {
           const { choiceText, threadTs: payloadThreadTs } = parseJson(action.value);
           const resolvedThread = payloadThreadTs || threadTs;
 
-          await slackUpdateMessage(channelId, messageTs, `✅ *${userName}* selected: ${choiceText}`, null);
+          const answered = formatResolvedMessage(
+            payload.message?.text,
+            `✅ *${userName}* selected: ${choiceText}`,
+            `✅ *${userName}* selected: ${choiceText}`
+          );
+
+          await slackUpdateMessage(channelId, messageTs, answered, null);
           await slackPost(COMPLY_CHANNEL_ID, `[USER_CHOICE] ${choiceText}`, resolvedThread);
 
           await handleAgentRun({
@@ -137,13 +148,20 @@ export default async function handler(req, res) {
           const { threadTs: payloadThreadTs } = parseJson(action.value);
           const resolvedThread = payloadThreadTs || threadTs;
 
-          // Capture the draft text BEFORE slackUpdateMessage destroys it.
-          // The model needs the approved content to call record_section_approval.
           const rawDraft = (payload.message?.text || '')
             .replace(/APPROVE_OR_REVISE/g, '')
             .trim();
 
-          await slackUpdateMessage(channelId, messageTs, `✅ *${userName}* approved this section.`, null);
+          // Overwriting this text erased every draft the bot had written: it then saw a run of
+          // identical "approved" turns, could no longer tell which sections existed, and
+          // restarted the interview from step one.
+          const approved = formatResolvedMessage(
+            payload.message?.text,
+            `✅ *Approved by ${userName}*`,
+            `✅ *${userName}* approved this section.`
+          );
+
+          await slackUpdateMessage(channelId, messageTs, approved, null);
           await slackPost(COMPLY_CHANNEL_ID, `[USER_CHOICE] ✅ Approved`, resolvedThread);
 
           const userChoice = rawDraft
