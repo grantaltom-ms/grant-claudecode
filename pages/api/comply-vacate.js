@@ -36,13 +36,33 @@ function withBudget(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+// Slack signs the exact bytes it sent, so the signature must be checked against those bytes.
+// Re-serializing the parsed body with JSON.stringify produced a different string whenever
+// Slack's encoding differed from V8's — notably any character Slack sends escaped, such as an
+// em dash — and those messages failed verification and were dropped without a reply.
+async function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (chunk) => (data += chunk));
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
-  const rawBody = JSON.stringify(req.body);
+  const rawBody = await getRawBody(req);
 
-  if (req.body.type === 'url_verification') {
-    return res.json({ challenge: req.body.challenge });
+  let body;
+  try {
+    body = JSON.parse(rawBody || '{}');
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+
+  if (body.type === 'url_verification') {
+    return res.json({ challenge: body.challenge });
   }
 
   if (!verifySlackSignature(req, rawBody)) {
@@ -55,7 +75,7 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  const event = req.body.event;
+  const event = body.event;
   if (!event || event.type !== 'message' || event.subtype) return res.status(200).end();
   if (event.channel !== COMPLY_CHANNEL_ID) return res.status(200).end();
 
@@ -139,6 +159,7 @@ export default async function handler(req, res) {
   );
 }
 
+// Body parsing is off so the handler can read the exact bytes Slack signed.
 export const config = {
-  api: { bodyParser: { type: 'application/json' } },
+  api: { bodyParser: false },
 };
