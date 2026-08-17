@@ -81,3 +81,34 @@ describe('inbox-assistant verifySlackSignature', () => {
     expect(inboxVerify(rawBody, {})).toBe(false);
   });
 });
+
+// Regression: comply-vacate.js used to verify against JSON.stringify(req.body) instead of the
+// bytes Slack sent. Slack escapes some non-ASCII characters that V8 emits literally, so any
+// message containing one — an em dash, for instance — failed verification and was silently
+// dropped with no reply in the thread.
+describe('signature verification against re-serialized JSON', () => {
+  const secret = process.env.COMPLY_SLACK_SIGNING_SECRET;
+
+  // What Slack actually puts on the wire for an em dash.
+  const slackRawBody = '{"event":{"text":"pet was not approved \\u2014 see lease"}}';
+
+  function reqWith(timestamp, signature) {
+    return { headers: { 'x-slack-request-timestamp': String(timestamp), 'x-slack-signature': signature } };
+  }
+
+  it('re-serializing the parsed body changes the bytes Slack signed', () => {
+    const reserialized = JSON.stringify(JSON.parse(slackRawBody));
+    expect(reserialized).not.toBe(slackRawBody);
+    expect(reserialized).toContain('—');
+  });
+
+  it('verifies the raw body but not the re-serialized one', () => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = sign(secret, timestamp, slackRawBody);
+
+    expect(complyVerify(reqWith(timestamp, signature), slackRawBody)).toBe(true);
+    expect(
+      complyVerify(reqWith(timestamp, signature), JSON.stringify(JSON.parse(slackRawBody)))
+    ).toBe(false);
+  });
+});
