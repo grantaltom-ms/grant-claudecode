@@ -88,6 +88,9 @@ Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this do
 - `Mail.ReadWrite` — create drafts, move/archive emails
 - `Mail.Send` — send emails
 - `MailboxSettings.Read` — pre-send mail tips (out-of-office, full mailbox, delivery restrictions) via `getMailTips`; without this, `getMailTips` calls fail and are silently skipped (mail tips are advisory and non-fatal by design — see "Pre-send mail tips" below)
+- `Calendars.ReadWrite` — read Grant's calendar (`list_calendar_events`, `find_availability`) and create/update/cancel events (`apply_calendar_event`) — see "Calendar (`lib/calendar.js`)" below
+- `MailboxFolder.ReadWrite` — create and manage the native Outlook triage folders (Needs Reply, Waiting On, Snoozed) and move messages into them — see "Native mail folders (`lib/mailbox-folders.js`)" below
+- `MailboxItem.ImportExport` — required for Graph to honor `receivedDateTime`/`sentDateTime` on message create (`import_historical_email`) and for raw MIME export (`export_email_mime`) — see "Historical import/export (`lib/mail-import.js`)" below
 
 Admin consent must be granted after adding permissions. Delegated permissions will NOT work — must be Application permissions.
 
@@ -150,6 +153,17 @@ Handles all interactive Slack messages. When Grant sends a message in #inbox-dig
 | `get_recent_drafts` | Retrieves most recent drafts — used to find the draft when Grant says "send it". |
 | `send_draft` | Sends a saved draft. Only called after Grant explicitly approves. |
 | `update_triage_rules` | Adds/removes/lists custom triage rules stored in Vercel env vars via Vercel API. |
+| `list_calendar_events` | Lists events on Grant's calendar in a date range. |
+| `find_availability` | Computes free time slots from Graph's `getSchedule` free/busy data. |
+| `propose_calendar_event` | Stages a create/update/cancel calendar action in `calendar_event_drafts`. Never touches the calendar. |
+| `get_recent_calendar_drafts` | Lists pending calendar drafts — used to find the draft when Grant says "book it". |
+| `apply_calendar_event` | Applies a staged calendar draft to Graph (creates/updates/cancels the event, sending invites/notices to attendees). Only called after Grant explicitly approves. |
+| `discard_calendar_event` | Marks a staged calendar draft discarded without touching the calendar. |
+| `list_mail_folders` | Lists top-level Outlook folders with unread/total counts. |
+| `create_mail_folder` | Creates a new Outlook mail folder. |
+| `move_email_to_folder` | Moves a message into Inbox, Archive, or one of the native triage folders (created on first use). |
+| `import_historical_email` | Imports a genuinely historical email with its true original date preserved. Never used for anything being sent now. |
+| `export_email_mime` | Exports an email's raw MIME source (full headers), truncated to 20,000 characters. |
 
 ### Key Implementation Details
 
@@ -167,6 +181,15 @@ Two independent checks, neither of which is the approval gate above — they exi
 **Pre-send mail tips (`lib/graph.js`'s `getMailTips`/`summarizeMailTips`):**
 `create_draft_reply` and `create_new_draft` call Graph's `getMailTips` for the draft's recipients (out-of-office replies, full mailbox, delivery restrictions) and return any findings as `mail_tip_warnings` on the tool result; the system prompt tells Claude to mention them when showing the draft. Advisory only — wrapped in try/catch so a failed or unsupported mail tips call (e.g. missing `MailboxSettings.Read`, or an external domain that doesn't expose mail tips) never blocks drafting.
 
+**Calendar (`lib/calendar.js`):**
+Mirrors the email draft/approval pattern, but staged in Supabase instead of in Outlook — Graph has no unsent-draft state for calendar events, and a `POST /events` call with attendees sends real invites immediately. `propose_calendar_event` writes a row to `calendar_event_drafts` (migration `023_calendar_event_drafts.sql`, action `create`/`update`/`cancel`, status `pending`) and never calls Graph. Only `apply_calendar_event` — gated the same way `send_draft` is, by the system prompt requiring Grant's explicit approval — calls Graph: `createEvent`/`updateEvent`/`cancelEvent` (the last via `POST /events/{id}/cancel` rather than `DELETE`, so a `cancel_comment` can be included in the notice sent to attendees). `find_availability` decodes Graph's `getSchedule` `availabilityView` digit string (`lib/calendar.js`'s `freeSlotsFromAvailability`) into free time windows.
+
+**Native mail folders (`lib/mailbox-folders.js`):**
+`move_email_to_folder` moves a message into Inbox, Archive (both Graph well-known folder names), or one of three custom triage folders (Needs Reply, Waiting On, Snoozed). `resolveTriageFolderId` resolves a folder's Graph ID via a Supabase cache (`mailbox_folders`, migration `024_mailbox_folders.sql`); on a cache miss it lists Inbox's child folders by display name (so a folder Grant already created by hand is reused, not duplicated) and only creates one if it's truly missing. `update_digest_item_status` and `update_forgotten_item_status` also file the underlying email as a best-effort side effect of a status change (`waiting`→Waiting On, `snooze`→Snoozed, `dismiss(ed)`/`done`→Archive; `open`/`drafted`/`priority` leave it where it is) — wrapped in try/catch so a failed move never fails the status update itself, and surfaced back as `filed_to` when it succeeds.
+
+**Historical import/export (`lib/mail-import.js`):**
+`import_historical_email` is for genuinely historical content only (e.g. correspondence recovered from a legacy system) — a plain `Mail.ReadWrite` message create ignores `receivedDateTime`/`sentDateTime` and Graph stamps the actual call time regardless of what's posted; `MailboxItem.ImportExport` is what makes Graph honor those fields, so the message shows its real original date instead of "today." `export_email_mime` fetches an email's raw MIME (`GET /messages/{id}/$value`) for cases where a summary isn't enough (e.g. proving exact send time) — this bypasses `lib/graph.js`'s `graph()` helper since `$value` returns raw text, not JSON, and is truncated to 20,000 characters before being returned to Claude/Slack.
+
 **Prompt caching:**
 The system prompt is sent with `cache_control: { type: 'ephemeral' }` to enable Anthropic prompt caching, reducing latency and cost on repeated calls.
 
@@ -177,9 +200,11 @@ When Grant replies in a thread, the handler fetches the full thread via `convers
 
 Claude is instructed to:
 - Write as Grant Carlson in first person
-- Never send without explicit approval
-- Show To: and CC: when presenting drafts
+- Never send an email, or create/update/cancel a calendar event, without explicit approval
+- Show To: and CC: when presenting drafts; show the proposed subject/time/attendees before booking a calendar event
 - Save triage rules when Grant gives priority feedback
+- Use `move_email_to_folder` when Grant asks to file/organize an email, and mention `filed_to` when a status change files one automatically
+- Only use `import_historical_email` for genuinely historical mail Grant is re-filing, never for anything being sent now
 - Format Slack responses with bold, bullets, and code blocks for drafts
 
 **Writing style baked into system prompt:**
