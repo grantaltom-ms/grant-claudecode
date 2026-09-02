@@ -8,11 +8,15 @@ import { checkSendRateLimit, recordSend, flagNewRecipients } from '../../lib/sen
 import { listCalendarEvents, getAvailability, freeSlotsFromAvailability, createEvent, updateEvent, cancelEvent } from '../../lib/calendar';
 import { TRIAGE_FOLDERS, listMailFolders, createMailFolder, moveMessageToFolder, resolveTriageFolderId } from '../../lib/mailbox-folders';
 import { importMessage, exportMessageMime } from '../../lib/mail-import';
+import { buildCalendarApprovalBlocks, formatCalendarSummary } from '../../lib/inbox-blocks';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
 
-const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
+export const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
+// Only this Slack user's button clicks are honored by pages/api/inbox-interactions.js.
+// Override via env if Grant's Slack user id ever changes.
+export const APPROVER_USER_ID = process.env.SLACK_APPROVER_USER_ID || 'U03DSPRS10R';
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 
@@ -374,7 +378,7 @@ const EMAIL_TOOLS = [
   },
   {
     name: 'apply_calendar_event',
-    description: 'Apply a staged calendar draft — actually creates/updates/cancels the event and, if attendees are involved, sends them a real invite, update, or cancellation notice. Only call this after Grant explicitly approves (e.g. "send it", "go ahead", "book it").',
+    description: 'Apply a staged calendar draft — actually creates/updates/cancels the event and, if attendees are involved, sends them a real invite, update, or cancellation notice. Only call this after Grant explicitly approves (e.g. "send it", "go ahead", "book it"). Grant normally approves with the ✅ Book it button (handled outside you); only call this when he approves in words in the thread.',
     input_schema: {
       type: 'object',
       properties: {
@@ -2270,7 +2274,16 @@ async function executeToolInternal(name, input, token, threadTs) {
         .maybeSingle();
       if (error) throw new Error(`Failed to save calendar draft: ${error.message}`);
 
-      return { draft: data, message: `Calendar ${action} staged. Awaiting approval.` };
+      // slackPost never throws (see its own try/catch below), so a failed
+      // card post can't fail staging -- Grant can still approve by typing.
+      if (threadTs) {
+        await slackPost(formatCalendarSummary(data), threadTs, buildCalendarApprovalBlocks({ draft: data, threadTs }));
+      }
+
+      return {
+        draft: data,
+        message: `Calendar ${action} staged. Awaiting approval via the ✅ Book it / ✏️ Edit / 🗑️ Discard buttons just posted in Slack. Reply with ONE short sentence; do not repeat the event details and do not ask whether to book.`,
+      };
     }
 
     case 'get_recent_calendar_drafts': {
@@ -2296,6 +2309,22 @@ async function executeToolInternal(name, input, token, threadTs) {
       if (!draft) throw new Error('No calendar draft found for that ID.');
       if (draft.status !== 'pending') {
         return { success: false, message: `That calendar draft is already ${draft.status}.` };
+      }
+
+      // Atomic claim: without this, two near-simultaneous callers (a
+      // double-click, or a button click racing a typed "book it") could
+      // both read status='pending' above and both reach Graph, creating a
+      // duplicate event -- exactly the bug this system is built to avoid.
+      // Only the caller whose UPDATE actually matches a pending row wins.
+      const { data: claimed, error: claimError } = await supabase
+        .from('calendar_event_drafts')
+        .update({ status: 'applying', updated_at: new Date().toISOString() })
+        .eq('id', draft.id)
+        .eq('status', 'pending')
+        .select('id');
+      if (claimError) throw new Error(`Calendar draft claim failed: ${claimError.message}`);
+      if (!claimed?.length) {
+        return { success: false, message: 'That calendar draft is already being applied.' };
       }
 
       try {
@@ -2359,9 +2388,13 @@ async function executeToolInternal(name, input, token, threadTs) {
         .from('calendar_event_drafts')
         .update({ status: 'discarded', updated_at: new Date().toISOString() })
         .eq('id', input.draft_id)
+        .eq('status', 'pending')
         .select('id, status')
         .maybeSingle();
       if (error) throw new Error(`Failed to discard calendar draft: ${error.message}`);
+      if (!data) {
+        return { success: false, message: 'No pending calendar draft with that ID (already booked or discarded).' };
+      }
       return { success: true, draft: data, message: 'Calendar draft discarded.' };
     }
 
@@ -2487,9 +2520,9 @@ export function verifySlackSignature(rawBody, headers) {
 // lib/slack.js's slackPost throws on API failure, which is a deliberate
 // behavior difference from the Comply bot's stricter needs, not something
 // to introduce here as a side effect of consolidation.
-async function slackPost(text, threadTs = null) {
+async function slackPost(text, threadTs = null, blocks = null) {
   try {
-    return await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, text, threadTs);
+    return await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, text, threadTs, blocks);
   } catch (err) {
     console.error('slackPost failed:', err.message);
     return null;
@@ -2506,10 +2539,12 @@ const SYSTEM_PROMPT = `You are an email and calendar assistant for Grant Carlson
 
 RULES:
 - NEVER send an email without Grant explicitly approving it (e.g. "send it", "looks good", "go ahead")
-- NEVER create, update, or cancel a calendar event without Grant explicitly approving it first — the same approval phrases apply ("send it", "book it", "go ahead"). Always use propose_calendar_event to stage it and show the details before calling apply_calendar_event.
-- When Grant asks to schedule, book, or set up a meeting, call find_availability first if the time isn't already fixed, then propose_calendar_event with action=create. Show the proposed subject/time/attendees and ask "Book it, edit it, or discard?" before ever calling apply_calendar_event.
-- To change or cancel an existing meeting, first find its event_id (list_calendar_events or search_context_cards/search_memory if Grant doesn't have it handy), then propose_calendar_event with action=update or action=cancel, then wait for approval before apply_calendar_event.
-- When Grant says "discard it" or "never mind" about a proposed event, use get_recent_calendar_drafts to find it, then discard_calendar_event.
+- NEVER create, update, or cancel a calendar event without Grant explicitly approving it first. Always stage it with propose_calendar_event. Staging posts a card in Slack with ✅ Book it / ✏️ Edit / 🗑️ Discard buttons — that card is how Grant normally approves, and button clicks are handled outside of you. Only call apply_calendar_event yourself when Grant approves in words in the thread ("book it", "send it", "go ahead").
+- When Grant asks to schedule, book, or set up a meeting, call find_availability first if the time isn't already fixed, then propose_calendar_event with action=create. After staging, reply with ONE short sentence (e.g. "Staged — use the buttons above to book, edit, or discard."). Do not repeat the event details and do not ask "Book it, edit it, or discard?" — the card already shows both.
+- To change or cancel an existing meeting, first find its event_id (list_calendar_events or search_context_cards/search_memory if Grant doesn't have it handy), then propose_calendar_event with action=update or action=cancel, then wait for Grant's approval (button or words) before apply_calendar_event.
+- When Grant says "discard it" or "never mind" about a proposed event, use get_recent_calendar_drafts to find it, then discard_calendar_event. If get_recent_calendar_drafts returns nothing, the draft was already handled via the buttons — say so briefly and do not re-propose.
+- A card in the thread ending in "✅ Booked", "🗑️ Discarded", or "✏️ Grant is editing" is finished — never apply or discard that draft again. After ✏️ Edit, Grant's next message describes the change: stage a NEW draft with propose_calendar_event with the corrected details (a new card is posted). Do not call apply_calendar_event directly from an edit request.
+- If Grant says an event isn't showing on his calendar, call list_calendar_events for that day and check BEFORE proposing anything. If it exists, tell him the exact time; never re-propose or re-book an event that already exists.
 - If a thread message says "send it" or "book it" and both an email draft and a calendar draft were recently discussed, resolve it from the more recent one in conversation; ask if genuinely ambiguous.
 - Use move_email_to_folder when Grant asks to file, organize, put away, or move an email into Needs Reply, Waiting On, Snoozed, Archive, or back to Inbox. The custom triage folders are created automatically the first time they're used.
 - import_historical_email is only for genuinely historical correspondence Grant is re-filing with its true original date (e.g. from a legacy system or a paper record) — never use it for anything being sent or drafted now.
