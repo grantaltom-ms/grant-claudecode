@@ -2593,7 +2593,25 @@ FORMAT SLACK RESPONSES:
 - Bullet points for summaries
 - Use \`\`\` code blocks for draft email text`;
 
-async function runAgent(userMessage, threadTs, threadHistory = []) {
+// The static SYSTEM_PROMPT block is cached (cache_control below), so it must
+// never contain the current date -- that would freeze "today" at whatever
+// date happened to be in place on the first request that populated the
+// cache. This second, uncached block carries it instead: relative date
+// reasoning (list_calendar_events/find_availability defaults, "this week",
+// "tomorrow", etc.) has nothing else to ground on, since Claude has no
+// built-in notion of the real current date.
+function currentDateSystemBlock() {
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'America/Los_Angeles',
+  }).format(new Date());
+  return { type: 'text', text: `Today's date is ${formatted} (America/Los_Angeles time zone). Use this, not any other assumption, for "today," "this week," "tomorrow," and similar relative dates.` };
+}
+
+export async function runAgent(userMessage, threadTs, threadHistory = []) {
   const token = await getGraphToken();
 
   // Build conversation context from thread history (so Claude knows about prior drafts, etc.)
@@ -2611,7 +2629,10 @@ async function runAgent(userMessage, threadTs, threadHistory = []) {
     const response = await callClaude({
       model: DEFAULT_MODEL,
       maxTokens: 4096,
-      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      system: [
+        { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+        currentDateSystemBlock(),
+      ],
       tools: EMAIL_TOOLS,
       messages,
     });

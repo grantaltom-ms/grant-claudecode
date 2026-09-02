@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from './mocks/server';
-import { executeTool } from '../pages/api/inbox-assistant';
+import { executeTool, runAgent } from '../pages/api/inbox-assistant';
 
 const TOKEN = 'test-graph-token';
 
@@ -165,5 +165,31 @@ describe('inbox-assistant calendar approval flow', () => {
       { start: '2026-09-01T09:00:00.000Z', end: '2026-09-01T09:30:00.000Z' },
       { start: '2026-09-01T10:30:00.000Z', end: '2026-09-01T11:00:00.000Z' },
     ]);
+  });
+});
+
+describe('runAgent grounds relative dates in the real current date', () => {
+  it('tells Claude today\'s date in an uncached system block, separate from the cached static prompt', async () => {
+    let requestBody;
+    server.use(
+      http.post('https://api.anthropic.com/v1/messages', async ({ request }) => {
+        requestBody = await request.json();
+        return HttpResponse.json({
+          id: 'msg_test',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+        });
+      })
+    );
+
+    await runAgent('what is on my calendar this week?', 'thread-ts', []);
+
+    expect(requestBody.system).toHaveLength(2);
+    expect(requestBody.system[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(requestBody.system[0].text).not.toMatch(/Today's date/);
+    expect(requestBody.system[1].cache_control).toBeUndefined();
+    expect(requestBody.system[1].text).toMatch(/^Today's date is [A-Za-z]+, [A-Za-z]+ \d{1,2}, \d{4} \(America\/Los_Angeles time zone\)\./);
   });
 });
