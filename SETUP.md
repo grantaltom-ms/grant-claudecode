@@ -16,7 +16,7 @@ There's also a separate Comply-or-Vacate legal-notice bot (`pages/api/comply-vac
 
 ## Prerequisites
 
-- [ ] An Azure AD app registration with Microsoft Graph **application** permissions: `Mail.Read`, `Mail.ReadWrite`, `Mail.Send` (application permissions, not delegated — delegated permissions will not work with this client-credentials flow). Admin consent must be granted after adding the permissions.
+- [ ] An Azure AD app registration with Microsoft Graph **application** permissions: `Mail.Read`, `Mail.ReadWrite`, `Mail.Send`, `MailboxSettings.Read`, `Calendars.ReadWrite`, `MailboxFolder.ReadWrite`, `MailboxItem.ImportExport` (application permissions, not delegated — delegated permissions will not work with this client-credentials flow). Admin consent must be granted after adding the permissions. See `docs/system-reference.md`'s "Azure App Registration" section for what each permission unlocks.
 - [ ] A Supabase project with the migrations in `supabase/migrations/` applied, in order.
 - [ ] An Anthropic API key.
 - [ ] Two Slack apps: one for the inbox-digest bot, one for the Comply-or-Vacate bot (if you're using that feature). Each needs a bot token and signing secret.

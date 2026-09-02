@@ -5,6 +5,9 @@ import { getGraphToken, graph, getMailTips, summarizeMailTips } from '../../lib/
 import { slackPost as _slackPost, getThreadHistory as _getThreadHistory } from '../../lib/slack';
 import { callClaude, DEFAULT_MODEL } from '../../lib/claude';
 import { checkSendRateLimit, recordSend, flagNewRecipients } from '../../lib/send-safety';
+import { listCalendarEvents, getAvailability, freeSlotsFromAvailability, createEvent, updateEvent, cancelEvent } from '../../lib/calendar';
+import { TRIAGE_FOLDERS, listMailFolders, createMailFolder, moveMessageToFolder, resolveTriageFolderId } from '../../lib/mailbox-folders';
+import { importMessage, exportMessageMime } from '../../lib/mail-import';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -311,6 +314,154 @@ const EMAIL_TOOLS = [
         extracted_guidance: { type: 'string', description: 'Reusable guidance distilled from Grant feedback.' },
       },
       required: ['user_feedback'],
+    },
+  },
+
+  // --- Calendar (Calendars.ReadWrite) ---
+  {
+    name: 'list_calendar_events',
+    description: "List events from Grant's calendar in a date range.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        start_date: { type: 'string', description: 'ISO date/datetime to start from. Default: now.' },
+        end_date: { type: 'string', description: 'ISO date/datetime to end at. Default: 7 days after start_date.' },
+        top: { type: 'number', description: 'Max events to return. Default 25, max 50.' },
+      },
+    },
+  },
+  {
+    name: 'find_availability',
+    description: "Find open (free) time slots on Grant's calendar within a window. Use this before proposing a meeting time.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        start_date: { type: 'string', description: 'ISO date/datetime to start from. Default: now.' },
+        end_date: { type: 'string', description: 'ISO date/datetime to end at. Default: 24 hours after start_date.' },
+        interval_minutes: { type: 'number', description: 'Granularity of the free/busy check. Default 30.' },
+      },
+    },
+  },
+  {
+    name: 'propose_calendar_event',
+    description: 'Stage a calendar event to create, update, or cancel. Does NOT touch the calendar or notify attendees yet — Grant must approve first, same as an email draft. Use find_availability first when proposing a new meeting time.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'cancel'], description: 'Default: create.' },
+        event_id: { type: 'string', description: "Existing Graph calendar event ID. Required for action=update or action=cancel — get it from list_calendar_events." },
+        subject: { type: 'string' },
+        start_time: { type: 'string', description: 'ISO 8601 datetime, e.g. 2026-09-05T14:00:00. Required for a new event.' },
+        end_time: { type: 'string', description: 'ISO 8601 datetime. Required for a new event.' },
+        time_zone: { type: 'string', description: "IANA time zone. Default: America/Los_Angeles." },
+        location: { type: 'string' },
+        body: { type: 'string', description: 'Plain-text event description.' },
+        attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses. Applying this draft sends them a real meeting invite/update.' },
+        cancel_comment: { type: 'string', description: 'For action=cancel, an optional note included in the cancellation notice sent to attendees.' },
+        source_message_id: { type: 'string', description: 'Optional Outlook message ID this event was proposed from.' },
+      },
+    },
+  },
+  {
+    name: 'get_recent_calendar_drafts',
+    description: 'Get the most recent pending calendar event drafts (useful to find what was just proposed for approval).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        top: { type: 'number', description: 'Number of drafts. Default 5.' },
+      },
+    },
+  },
+  {
+    name: 'apply_calendar_event',
+    description: 'Apply a staged calendar draft — actually creates/updates/cancels the event and, if attendees are involved, sends them a real invite, update, or cancellation notice. Only call this after Grant explicitly approves (e.g. "send it", "go ahead", "book it").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        draft_id: { type: 'string', description: 'The calendar_event_drafts ID to apply.' },
+      },
+      required: ['draft_id'],
+    },
+  },
+  {
+    name: 'discard_calendar_event',
+    description: 'Discard a staged calendar draft without touching the calendar. Use when Grant says "never mind", "discard it", or similar about a proposed event.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        draft_id: { type: 'string', description: 'The calendar_event_drafts ID to discard.' },
+      },
+      required: ['draft_id'],
+    },
+  },
+
+  // --- Native mail folders (MailboxFolder.ReadWrite) ---
+  {
+    name: 'list_mail_folders',
+    description: "List Grant's top-level Outlook mail folders with unread/total counts.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'create_mail_folder',
+    description: 'Create a new Outlook mail folder, e.g. for a specific project or correspondent.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        display_name: { type: 'string', description: 'The folder name.' },
+        parent_folder_id: { type: 'string', description: 'Optional parent folder ID. Default: top-level.' },
+      },
+      required: ['display_name'],
+    },
+  },
+  {
+    name: 'move_email_to_folder',
+    description: "Move an email into a real Outlook folder — the Needs Reply, Waiting On, and Snoozed triage folders are created automatically the first time they're used.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'The email message ID to move.' },
+        folder: {
+          type: 'string',
+          enum: ['inbox', 'archive', 'needs_reply', 'waiting_on', 'snoozed'],
+          description: 'Destination folder.',
+        },
+      },
+      required: ['message_id', 'folder'],
+    },
+  },
+
+  // --- Historical import/export (MailboxItem.ImportExport) ---
+  {
+    name: 'import_historical_email',
+    description: "Import a genuinely historical email into Outlook with its true original date preserved (e.g. correspondence recovered from a legacy system, an old thread Grant is re-filing, or a paper record). Never use this for anything Grant is sending now — use create_new_draft/send_draft for that.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        subject: { type: 'string' },
+        body: { type: 'string', description: 'Plain-text body.' },
+        from_address: { type: 'string', description: 'Original sender email address.' },
+        from_name: { type: 'string' },
+        to_addresses: { type: 'array', items: { type: 'string' } },
+        received_at: { type: 'string', description: 'The ORIGINAL date/time this email actually happened, e.g. 2023-04-12T09:00:00. Preserved exactly — it will not show as today.' },
+        is_read: { type: 'boolean', description: 'Default true.' },
+        folder: {
+          type: 'string',
+          enum: ['inbox', 'archive', 'needs_reply', 'waiting_on', 'snoozed'],
+          description: 'Destination folder. Default: archive.',
+        },
+      },
+      required: ['subject', 'body', 'from_address', 'received_at'],
+    },
+  },
+  {
+    name: 'export_email_mime',
+    description: "Export the raw MIME source of an email (original headers, exact formatting) — for example to prove exact send time or produce a record for a dispute. Most questions about an email are better answered with get_email; only use this when the raw source itself is specifically needed.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'The email message ID to export.' },
+      },
+      required: ['message_id'],
     },
   },
 ];
@@ -736,7 +887,43 @@ async function resolveDigestItem(threadTs, itemNumber) {
   };
 }
 
-async function updateDigestItemStatus(threadTs, itemNumber, actionStatus) {
+// Maps a digest/forgotten-item status transition to the native Outlook
+// folder it should file into. Both tools' action vocab is covered
+// ('dismiss' from update_forgotten_item_status, 'dismissed' from
+// update_digest_item_status). Statuses with no entry (open, drafted,
+// priority) leave the message wherever it already is.
+const TRIAGE_STATUS_FOLDER = {
+  waiting: 'waiting_on',
+  snooze: 'snoozed',
+  dismiss: 'archive',
+  dismissed: 'archive',
+  done: 'archive',
+};
+
+async function resolveDestinationFolderId(token, folderKey) {
+  if (folderKey === 'inbox') return 'inbox';
+  if (folderKey === 'archive') return 'archive';
+  return resolveTriageFolderId(supabase, token, OWNER_EMAIL, folderKey);
+}
+
+// Best-effort side effect: mirrors a status change into a real Outlook
+// folder so triage state is visible natively, not just in Supabase. Never
+// blocks or fails the status update itself -- a folder move failure (e.g.
+// a missing message or a stale folder cache) is logged and swallowed.
+async function fileMessageForStatus(token, graphMessageId, status) {
+  const folderKey = TRIAGE_STATUS_FOLDER[status];
+  if (!folderKey || !graphMessageId || !token) return null;
+  try {
+    const destinationId = await resolveDestinationFolderId(token, folderKey);
+    await moveMessageToFolder(token, OWNER_EMAIL, graphMessageId, destinationId);
+    return folderKey;
+  } catch (error) {
+    console.error('fileMessageForStatus move failed:', { graphMessageId, status, error: error.message });
+    return null;
+  }
+}
+
+async function updateDigestItemStatus(threadTs, itemNumber, actionStatus, token) {
   const resolved = await resolveDigestItem(threadTs, itemNumber);
 
   const { error } = await supabase
@@ -749,11 +936,14 @@ async function updateDigestItemStatus(threadTs, itemNumber, actionStatus) {
 
   if (error) throw new Error(`Digest item status update failed: ${error.message}`);
 
+  const filedTo = await fileMessageForStatus(token, resolved.message_id, actionStatus);
+
   return {
     item_number: itemNumber,
     action_status: actionStatus,
     message_id: resolved.message_id,
     subject: resolved.digest_item.subject,
+    ...(filedTo && { filed_to: TRIAGE_FOLDERS[filedTo] || filedTo }),
   };
 }
 
@@ -1510,7 +1700,7 @@ async function fetchRowForForgottenItem(table, id, select = 'id, metadata') {
   return data;
 }
 
-async function updateForgottenItemStatus(input, threadTs) {
+async function updateForgottenItemStatus(input, threadTs, token) {
   const action = normalizeForgottenAction(input.action);
   if (!['done', 'dismiss', 'waiting', 'snooze', 'priority', 'open'].includes(action)) {
     throw new Error(`Unsupported forgotten item action: ${input.action}`);
@@ -1525,6 +1715,7 @@ async function updateForgottenItemStatus(input, threadTs) {
   let updated = null;
   let table = null;
   let appliedAction = action;
+  let filedTo = null;
 
   if (kind === 'open_loop') {
     table = 'open_loops';
@@ -1588,7 +1779,7 @@ async function updateForgottenItemStatus(input, threadTs) {
     updated = data;
   } else if (kind === 'digest_item') {
     table = 'digest_items';
-    const row = await fetchRowForForgottenItem(table, item.id, 'id, subject, action_status, raw_digest_input');
+    const row = await fetchRowForForgottenItem(table, item.id, 'id, subject, graph_message_id, action_status, raw_digest_input');
     const rawDigestInput = updatePayloadForAction({
       action,
       existingMetadata: row.raw_digest_input || {},
@@ -1607,6 +1798,7 @@ async function updateForgottenItemStatus(input, threadTs) {
       .maybeSingle();
     if (error) throw new Error(`Digest item update failed: ${error.message}`);
     updated = data;
+    filedTo = await fileMessageForStatus(token, row.graph_message_id, action);
   } else if (kind === 'context_card') {
     table = 'context_cards';
     const row = await fetchRowForForgottenItem(table, item.id, 'id, title, status, importance, facts');
@@ -1643,6 +1835,7 @@ async function updateForgottenItemStatus(input, threadTs) {
     },
     table,
     updated,
+    ...(filedTo && { filed_to: TRIAGE_FOLDERS[filedTo] || filedTo }),
     message: action === 'snooze'
       ? `Snoozed for ${snoozeDays} day(s).`
       : `Marked ${action}.`,
@@ -1968,7 +2161,7 @@ async function executeToolInternal(name, input, token, threadTs) {
     }
 
     case 'update_digest_item_status': {
-      return updateDigestItemStatus(threadTs, input.item_number, input.action_status);
+      return updateDigestItemStatus(threadTs, input.item_number, input.action_status, token);
     }
 
     case 'search_context_cards': {
@@ -2000,7 +2193,7 @@ async function executeToolInternal(name, input, token, threadTs) {
     }
 
     case 'update_forgotten_item_status': {
-      return updateForgottenItemStatus(input, threadTs);
+      return updateForgottenItemStatus(input, threadTs, token);
     }
 
     case 'resolve_draft_response_candidate': {
@@ -2009,6 +2202,222 @@ async function executeToolInternal(name, input, token, threadTs) {
 
     case 'record_draft_feedback': {
       return recordDraftFeedback(input);
+    }
+
+    // --- Calendar ---
+
+    case 'list_calendar_events': {
+      const startIso = input.start_date ? new Date(input.start_date).toISOString() : new Date().toISOString();
+      const endIso = input.end_date
+        ? new Date(input.end_date).toISOString()
+        : new Date(Date.parse(startIso) + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const events = await listCalendarEvents(token, OWNER_EMAIL, startIso, endIso, { top: input.top || 25 });
+      return { events };
+    }
+
+    case 'find_availability': {
+      const startIso = input.start_date ? new Date(input.start_date).toISOString() : new Date().toISOString();
+      const endIso = input.end_date
+        ? new Date(input.end_date).toISOString()
+        : new Date(Date.parse(startIso) + 24 * 60 * 60 * 1000).toISOString();
+      const intervalMinutes = input.interval_minutes || 30;
+      const availability = await getAvailability(token, OWNER_EMAIL, startIso, endIso, { intervalMinutes });
+      const freeSlots = availability.availabilityView
+        ? freeSlotsFromAvailability(startIso, availability.availabilityView, intervalMinutes)
+        : [];
+      return { free_slots: freeSlots, interval_minutes: intervalMinutes };
+    }
+
+    case 'propose_calendar_event': {
+      const action = input.action || 'create';
+      if (!['create', 'update', 'cancel'].includes(action)) {
+        throw new Error(`Unsupported calendar action: ${action}`);
+      }
+      if (action !== 'create' && !input.event_id) {
+        throw new Error('event_id is required to update or cancel an existing event.');
+      }
+      if (action === 'create' && (!input.subject || !input.start_time || !input.end_time)) {
+        throw new Error('subject, start_time, and end_time are required to propose a new event.');
+      }
+
+      const { data, error } = await supabase
+        .from('calendar_event_drafts')
+        .insert({
+          owner_email: OWNER_EMAIL,
+          action,
+          target_event_id: input.event_id || null,
+          subject: input.subject || null,
+          start_time: input.start_time || null,
+          end_time: input.end_time || null,
+          time_zone: input.time_zone || 'America/Los_Angeles',
+          location: input.location || null,
+          body: input.body || null,
+          attendees: input.attendees || [],
+          cancel_comment: input.cancel_comment || null,
+          source_message_id: input.source_message_id || null,
+          status: 'pending',
+        })
+        .select('id, action, subject, start_time, end_time, time_zone, location, attendees, target_event_id, cancel_comment')
+        .maybeSingle();
+      if (error) throw new Error(`Failed to save calendar draft: ${error.message}`);
+
+      return { draft: data, message: `Calendar ${action} staged. Awaiting approval.` };
+    }
+
+    case 'get_recent_calendar_drafts': {
+      const top = input.top || 5;
+      const { data, error } = await supabase
+        .from('calendar_event_drafts')
+        .select('id, action, subject, start_time, end_time, location, attendees, target_event_id, status, created_at')
+        .eq('owner_email', OWNER_EMAIL)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(top);
+      if (error) throw new Error(`Failed to list calendar drafts: ${error.message}`);
+      return { drafts: data || [] };
+    }
+
+    case 'apply_calendar_event': {
+      const { data: draft, error: fetchError } = await supabase
+        .from('calendar_event_drafts')
+        .select('*')
+        .eq('id', input.draft_id)
+        .maybeSingle();
+      if (fetchError) throw new Error(`Calendar draft lookup failed: ${fetchError.message}`);
+      if (!draft) throw new Error('No calendar draft found for that ID.');
+      if (draft.status !== 'pending') {
+        return { success: false, message: `That calendar draft is already ${draft.status}.` };
+      }
+
+      try {
+        let graphResult;
+        if (draft.action === 'create') {
+          graphResult = await createEvent(token, OWNER_EMAIL, {
+            subject: draft.subject,
+            startIso: draft.start_time,
+            endIso: draft.end_time,
+            timeZone: draft.time_zone,
+            location: draft.location,
+            body: draft.body,
+            attendees: draft.attendees || [],
+          });
+        } else if (draft.action === 'update') {
+          graphResult = await updateEvent(token, OWNER_EMAIL, draft.target_event_id, {
+            subject: draft.subject ?? undefined,
+            startIso: draft.start_time ?? undefined,
+            endIso: draft.end_time ?? undefined,
+            timeZone: draft.time_zone,
+            location: draft.location ?? undefined,
+            body: draft.body ?? undefined,
+            attendees: draft.attendees?.length ? draft.attendees : undefined,
+          });
+        } else if (draft.action === 'cancel') {
+          graphResult = await cancelEvent(token, OWNER_EMAIL, draft.target_event_id, draft.cancel_comment || '');
+        } else {
+          throw new Error(`Unsupported calendar draft action: ${draft.action}`);
+        }
+
+        await supabase
+          .from('calendar_event_drafts')
+          .update({
+            status: 'sent',
+            graph_event_id: graphResult?.id || draft.target_event_id || null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', draft.id);
+
+        return {
+          success: true,
+          action: draft.action,
+          graph_event_id: graphResult?.id || draft.target_event_id || null,
+          message: draft.action === 'create'
+            ? 'Calendar event created.'
+            : draft.action === 'update'
+              ? 'Calendar event updated.'
+              : 'Calendar event canceled.',
+        };
+      } catch (error) {
+        await supabase
+          .from('calendar_event_drafts')
+          .update({ status: 'failed', error_message: error.message, updated_at: new Date().toISOString() })
+          .eq('id', draft.id);
+        throw error;
+      }
+    }
+
+    case 'discard_calendar_event': {
+      const { data, error } = await supabase
+        .from('calendar_event_drafts')
+        .update({ status: 'discarded', updated_at: new Date().toISOString() })
+        .eq('id', input.draft_id)
+        .select('id, status')
+        .maybeSingle();
+      if (error) throw new Error(`Failed to discard calendar draft: ${error.message}`);
+      return { success: true, draft: data, message: 'Calendar draft discarded.' };
+    }
+
+    // --- Native mail folders ---
+
+    case 'list_mail_folders': {
+      const folders = await listMailFolders(token, OWNER_EMAIL);
+      return {
+        folders: folders.map(f => ({
+          id: f.id,
+          name: f.displayName,
+          unread: f.unreadItemCount,
+          total: f.totalItemCount,
+        })),
+      };
+    }
+
+    case 'create_mail_folder': {
+      const folder = await createMailFolder(token, OWNER_EMAIL, input.display_name, input.parent_folder_id || null);
+      return { folder: { id: folder.id, name: folder.displayName }, message: `Folder "${folder.displayName}" created.` };
+    }
+
+    case 'move_email_to_folder': {
+      const destinationId = await resolveDestinationFolderId(token, input.folder);
+      const moved = await moveMessageToFolder(token, OWNER_EMAIL, input.message_id, destinationId);
+      return {
+        success: true,
+        message_id: moved.id,
+        folder: TRIAGE_FOLDERS[input.folder] || input.folder,
+        message: `Moved to ${TRIAGE_FOLDERS[input.folder] || input.folder}.`,
+      };
+    }
+
+    // --- Historical import/export ---
+
+    case 'import_historical_email': {
+      const destinationId = await resolveDestinationFolderId(token, input.folder || 'archive');
+      const imported = await importMessage(token, OWNER_EMAIL, destinationId, {
+        subject: input.subject,
+        bodyText: input.body,
+        fromAddress: input.from_address,
+        fromName: input.from_name,
+        toAddresses: input.to_addresses || [],
+        receivedDateTime: new Date(input.received_at).toISOString(),
+        isRead: input.is_read !== false,
+      });
+      return {
+        success: true,
+        message_id: imported.id,
+        subject: imported.subject,
+        received_at: imported.receivedDateTime,
+        message: 'Historical email imported with its original date preserved.',
+      };
+    }
+
+    case 'export_email_mime': {
+      const mime = await exportMessageMime(token, OWNER_EMAIL, input.message_id);
+      const MAX_CHARS = 20000;
+      const truncated = mime.length > MAX_CHARS;
+      return {
+        message_id: input.message_id,
+        mime: truncated ? mime.slice(0, MAX_CHARS) : mime,
+        truncated,
+        total_length: mime.length,
+      };
     }
 
     default:
@@ -2084,10 +2493,17 @@ async function getThreadHistory(threadTs) {
 
 // --- Agentic loop ---
 
-const SYSTEM_PROMPT = `You are an email assistant for Grant Carlson, Head of Operations at Milestone Properties (grant@milestoneproperties.net), a property management company in the Seattle/Burien/SeaTac area. Grant messages you in Slack. You have tools to read, search, and draft emails in his Outlook inbox.
+const SYSTEM_PROMPT = `You are an email and calendar assistant for Grant Carlson, Head of Operations at Milestone Properties (grant@milestoneproperties.net), a property management company in the Seattle/Burien/SeaTac area. Grant messages you in Slack. You have tools to read, search, and draft emails in his Outlook inbox, manage his Outlook calendar, organize mail into real Outlook folders, and import/export historical mail.
 
 RULES:
 - NEVER send an email without Grant explicitly approving it (e.g. "send it", "looks good", "go ahead")
+- NEVER create, update, or cancel a calendar event without Grant explicitly approving it first — the same approval phrases apply ("send it", "book it", "go ahead"). Always use propose_calendar_event to stage it and show the details before calling apply_calendar_event.
+- When Grant asks to schedule, book, or set up a meeting, call find_availability first if the time isn't already fixed, then propose_calendar_event with action=create. Show the proposed subject/time/attendees and ask "Book it, edit it, or discard?" before ever calling apply_calendar_event.
+- To change or cancel an existing meeting, first find its event_id (list_calendar_events or search_context_cards/search_memory if Grant doesn't have it handy), then propose_calendar_event with action=update or action=cancel, then wait for approval before apply_calendar_event.
+- When Grant says "discard it" or "never mind" about a proposed event, use get_recent_calendar_drafts to find it, then discard_calendar_event.
+- If a thread message says "send it" or "book it" and both an email draft and a calendar draft were recently discussed, resolve it from the more recent one in conversation; ask if genuinely ambiguous.
+- Use move_email_to_folder when Grant asks to file, organize, put away, or move an email into Needs Reply, Waiting On, Snoozed, Archive, or back to Inbox. The custom triage folders are created automatically the first time they're used.
+- import_historical_email is only for genuinely historical correspondence Grant is re-filing with its true original date (e.g. from a legacy system or a paper record) — never use it for anything being sent or drafted now.
 - If the current Slack thread contains a forgotten-items list, follow-up references like "#1", "#2", or "number 3" refer to that forgotten-items list unless Grant explicitly says digest item.
 - When Grant refers to a numbered digest item like "#1", "#2", or "number 3", call resolve_digest_item first and use its message_id for any get_email or create_draft_reply call.
 - When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading. Save the draft, show it in Slack, then ask: "Send it, edit it, or discard?"
@@ -2109,7 +2525,8 @@ RULES:
 - When answering from memory, mention the source email subject/sender/date when available and say when the stored memory is thin or based only on previews.
 - When Grant asks "what am I forgetting?", "what slipped?", "what loose ends are there?", or similar, call list_forgotten_items first. Return the top 3-6 items as a numbered list, grouped lightly if helpful, with one concrete next action per item.
 - When Grant follows up on a forgotten-items list with "done #2", "dismiss #3", "waiting on #4", "snooze #1", "make #5 priority", or similar, call update_forgotten_item_status. Resolve the number against the latest forgotten-items list in the Slack thread, not the morning digest.
-- For forgotten-items feedback, confirm the update in one short sentence. Do not send emails or change AppFolio.
+- For forgotten-items feedback, confirm the update in one short sentence. Do not send emails or change AppFolio. If the result includes filed_to, mention which real Outlook folder the email was moved to.
+- If update_digest_item_status returns filed_to, mention which real Outlook folder the email was moved to.
 - Suggested draft replies should only be surfaced from list_draft_response_candidates, which is limited to known contacts with more than one prior back-and-forth exchange and emails that appear to seek a response.
 - When Grant asks "what should I respond to?" or asks for draft suggestions, call list_draft_response_candidates first. For a chosen candidate, gather the email, thread, memory, contact/entity context, and prior draft_feedback before drafting.
 - When Grant refers to a draft candidate by number, such as "candidate #1", "draft #1", or "first one", call resolve_draft_response_candidate first. Use its original email body, thread memory, and prior_feedback before drafting.
