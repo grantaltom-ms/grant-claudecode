@@ -38,6 +38,43 @@ describe('inbox-assistant calendar approval flow', () => {
     expect(eventsCalled).toBe(false);
   });
 
+  it('propose_calendar_event posts a Block Kit card with the three approval buttons', async () => {
+    let postedBody;
+    server.use(
+      http.post('https://test-project.supabase.co/rest/v1/calendar_event_drafts', async ({ request }) => {
+        const insertedBody = await request.json();
+        return HttpResponse.json({ id: 'draft-card', ...insertedBody });
+      }),
+      http.post('https://slack.com/api/chat.postMessage', async ({ request }) => {
+        postedBody = await request.json();
+        return HttpResponse.json({ ok: true, ts: '1700000000.000002' });
+      })
+    );
+
+    await executeTool('propose_calendar_event', {
+      subject: 'Insurance renewal call',
+      start_time: '2026-09-05T14:00:00',
+      end_time: '2026-09-05T14:30:00',
+      attendees: ['crystal.li@becu.org'],
+    }, TOKEN, 'thread-ts');
+
+    expect(postedBody.thread_ts).toBe('thread-ts');
+    expect(postedBody.text).toMatch(/Insurance renewal call/);
+    expect(postedBody.text).toMatch(/2:00 PM/);
+
+    const actionsBlock = postedBody.blocks.find(b => b.type === 'actions');
+    expect(actionsBlock.elements).toHaveLength(3);
+    const values = actionsBlock.elements.map(el => JSON.parse(el.value));
+    for (const value of values) {
+      expect(value).toEqual({ draftId: 'draft-card', threadTs: 'thread-ts' });
+    }
+    expect(actionsBlock.elements.map(el => el.action_id)).toEqual([
+      'calendar_apply',
+      'calendar_edit',
+      'calendar_discard',
+    ]);
+  });
+
   it('rejects a new-event proposal missing required fields', async () => {
     await expect(
       executeTool('propose_calendar_event', { subject: 'No times' }, TOKEN, 'thread-ts')
@@ -85,7 +122,7 @@ describe('inbox-assistant calendar approval flow', () => {
     let createdEventBody;
     server.use(
       http.get('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([draft])),
-      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([])),
+      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([{ id: draft.id }])),
       http.post('https://graph.microsoft.com/v1.0/users/:email/events', async ({ request }) => {
         createdEventBody = await request.json();
         return HttpResponse.json({ id: 'evt-tz' });
@@ -126,7 +163,7 @@ describe('inbox-assistant calendar approval flow', () => {
       http.get('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([draft])),
       http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', async ({ request }) => {
         updatedDraftBody = await request.json();
-        return HttpResponse.json([]);
+        return HttpResponse.json([{ id: draft.id }]);
       }),
       http.post('https://graph.microsoft.com/v1.0/users/:email/events', async ({ request }) => {
         createdEventBody = await request.json();
@@ -155,7 +192,7 @@ describe('inbox-assistant calendar approval flow', () => {
     let cancelBody;
     server.use(
       http.get('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([draft])),
-      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([])),
+      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([{ id: draft.id }])),
       http.post('https://graph.microsoft.com/v1.0/users/:email/events/:id/cancel', async ({ request }) => {
         cancelBody = await request.json();
         return new HttpResponse(null, { status: 202 });
@@ -167,6 +204,29 @@ describe('inbox-assistant calendar approval flow', () => {
     expect(result.success).toBe(true);
     expect(result.action).toBe('cancel');
     expect(cancelBody).toEqual({ comment: 'Rescheduling, will resend.' });
+  });
+
+  it('apply_calendar_event loses an atomic-claim race (concurrent apply) without calling Graph', async () => {
+    // The draft still reads as 'pending' on the initial fetch, but the claim
+    // UPDATE ... WHERE status='pending' matches zero rows -- simulating a
+    // second caller (a double-click, or a click racing a typed approval)
+    // that already claimed it a moment earlier.
+    let eventsCalled = false;
+    server.use(
+      http.get('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () =>
+        HttpResponse.json([{ id: 'draft-race', status: 'pending', action: 'create' }])
+      ),
+      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([])),
+      http.post('https://graph.microsoft.com/v1.0/users/:email/events', () => {
+        eventsCalled = true;
+        return HttpResponse.json({ id: 'should-not-be-created' });
+      })
+    );
+
+    const result = await executeTool('apply_calendar_event', { draft_id: 'draft-race' }, TOKEN, 'thread-ts');
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/already being applied/);
+    expect(eventsCalled).toBe(false);
   });
 
   it('apply_calendar_event refuses to re-apply an already-applied draft', async () => {
@@ -199,6 +259,36 @@ describe('inbox-assistant calendar approval flow', () => {
     expect(result.success).toBe(true);
     expect(result.draft.status).toBe('discarded');
     expect(discardBody.status).toBe('discarded');
+    expect(eventsCalled).toBe(false);
+  });
+
+  it('discard_calendar_event refuses a draft that is already booked or discarded', async () => {
+    let eventsCalled = false;
+    server.use(
+      // .eq('status', 'pending').select('id, status').maybeSingle() on a
+      // non-GET request that matches zero rows: real PostgREST returns 406
+      // with an error whose `details` mentions "0 rows"; postgrest-js
+      // special-cases that into { data: null, error: null }.
+      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () =>
+        HttpResponse.json(
+          {
+            code: 'PGRST116',
+            details: 'Results contain 0 rows, application/vnd.pgrst.object+json requires 1 row',
+            hint: null,
+            message: 'JSON object requested, multiple (or no) rows returned',
+          },
+          { status: 406 }
+        )
+      ),
+      http.post('https://graph.microsoft.com/v1.0/users/:email/events', () => {
+        eventsCalled = true;
+        return HttpResponse.json({});
+      })
+    );
+
+    const result = await executeTool('discard_calendar_event', { draft_id: 'draft-already-sent' }, TOKEN, 'thread-ts');
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/already booked or discarded/);
     expect(eventsCalled).toBe(false);
   });
 
