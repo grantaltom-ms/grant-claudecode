@@ -2239,6 +2239,15 @@ async function executeToolInternal(name, input, token, threadTs) {
       if (action === 'create' && (!input.subject || !input.start_time || !input.end_time)) {
         throw new Error('subject, start_time, and end_time are required to propose a new event.');
       }
+      // start_time/end_time must be bare wall-clock strings paired with
+      // time_zone (Graph's own event dateTime+timeZone contract) -- a
+      // trailing Z/offset means this is really a UTC instant, which would
+      // create the event at the wrong wall-clock time in time_zone. See
+      // migration 025_calendar_event_drafts_text_datetimes.sql for the bug
+      // this once caused when the column silently absorbed the offset.
+      if (/[Zz]$|[+-]\d{2}:\d{2}$/.test(input.start_time || '') || /[Zz]$|[+-]\d{2}:\d{2}$/.test(input.end_time || '')) {
+        throw new Error('start_time/end_time must be a local wall-clock datetime with no timezone offset (e.g. 2026-09-05T14:00:00) -- pair the intended zone via time_zone instead.');
+      }
 
       const { data, error } = await supabase
         .from('calendar_event_drafts')
