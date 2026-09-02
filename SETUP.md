@@ -56,6 +56,7 @@ In Vercel → your project → Settings → Environment Variables:
 | `OWNER_INVESTOR_SUPABASE_URL` / `OWNER_INVESTOR_SUPABASE_SERVICE_ROLE_KEY` | Only needed if syncing owner/investor data from a separate Supabase project (`backfill-owner-investors.js`) | Optional |
 | `SOURCE_MEMORY_SUPABASE_URL` / `SOURCE_MEMORY_SUPABASE_SERVICE_ROLE_KEY` | Only needed if syncing properties/team/schedule data from a separate Supabase project (`backfill-source-memory.js`) | Optional |
 | `INBOX_ASSISTANT_URL` | Only used by `scripts/smoke-memory-status.mjs` when run manually | Optional |
+| `SLACK_APPROVER_USER_ID` | Slack user ID allowed to click calendar approval buttons (`pages/api/inbox-interactions.js`). Defaults to Grant's own ID if unset. | Optional |
 
 > **Note on the Comply bot's Supabase variable name.** `lib/comply-agent.js` reads `SUPABASE_SERVICE_KEY` first and falls back to `SUPABASE_SERVICE_ROLE_KEY` if that's not set. In practice, just setting `SUPABASE_SERVICE_ROLE_KEY` (the variable every other file uses) is enough — you don't need to set both.
 
@@ -68,7 +69,8 @@ In Vercel → your project → Settings → Environment Variables:
    ```
    Slack sends a verification challenge — the endpoint handles it automatically.
 3. Under **Subscribe to bot events**, add `message.channels` (and `message.groups` if the channel is private).
-4. Save and reinstall the app to your workspace if prompted.
+4. Also enable **Interactivity & Shortcuts** with Request URL `.../api/inbox-interactions` (that endpoint handles the calendar ✅ Book it / ✏️ Edit / 🗑️ Discard button clicks). No additional scopes needed — `chat:write` already covers it.
+5. Save and reinstall the app to your workspace if prompted.
 
 If you're also running the Comply-or-Vacate bot, repeat this against its own Slack app with Request URL `.../api/comply-vacate`, and additionally enable **Interactivity & Shortcuts** with Request URL `.../api/comply-interactions` (that endpoint handles the Approve / Request changes button clicks).
 
