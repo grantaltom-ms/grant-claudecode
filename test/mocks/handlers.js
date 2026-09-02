@@ -79,7 +79,7 @@ export const anthropicDefaultHandler = http.post('https://api.anthropic.com/v1/m
   if (system.includes('weekday One Priority')) {
     return textResponse(JSON.stringify({ title: 'Test priority', activity: 'Do the test thing', why_this_matters: 'because tests' }));
   }
-  if (system.includes('email assistant for Grant Carlson')) {
+  if (system.includes('email and calendar assistant for Grant Carlson')) {
     return textResponse('Sure, here is a summary.');
   }
   if (system.includes('Lease Compliance Assistant')) {
