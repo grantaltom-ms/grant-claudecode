@@ -44,6 +44,60 @@ describe('inbox-assistant calendar approval flow', () => {
     ).rejects.toThrow(/subject, start_time, and end_time/);
   });
 
+  it('rejects a start_time/end_time carrying a UTC/offset marker instead of a bare wall-clock string', async () => {
+    await expect(
+      executeTool('propose_calendar_event', {
+        subject: 'Wrong format',
+        start_time: '2026-09-05T14:00:00Z',
+        end_time: '2026-09-05T14:30:00',
+      }, TOKEN, 'thread-ts')
+    ).rejects.toThrow(/local wall-clock datetime with no timezone offset/);
+
+    await expect(
+      executeTool('propose_calendar_event', {
+        subject: 'Wrong format',
+        start_time: '2026-09-05T14:00:00',
+        end_time: '2026-09-05T14:30:00+00:00',
+      }, TOKEN, 'thread-ts')
+    ).rejects.toThrow(/local wall-clock datetime with no timezone offset/);
+  });
+
+  it('apply_calendar_event forwards the staged start_time/end_time to Graph verbatim, with no reinterpretation', async () => {
+    // Regression test for the bug where calendar_event_drafts.start_time was
+    // a timestamptz column: Postgres silently reinterpreted a bare
+    // "2026-09-04T07:00:00" wall-clock string as UTC, so an event meant for
+    // 7am Pacific was created on Graph at 7am UTC (midnight Pacific). The
+    // draft row must carry the string through completely unmodified.
+    const draft = {
+      id: 'draft-tz',
+      action: 'create',
+      target_event_id: null,
+      subject: 'Meet Eden at Blossoming Buds Preschool',
+      start_time: '2026-09-04T07:00:00',
+      end_time: '2026-09-04T08:00:00',
+      time_zone: 'America/Los_Angeles',
+      location: null,
+      body: null,
+      attendees: [],
+      cancel_comment: null,
+      status: 'pending',
+    };
+    let createdEventBody;
+    server.use(
+      http.get('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([draft])),
+      http.patch('https://test-project.supabase.co/rest/v1/calendar_event_drafts', () => HttpResponse.json([])),
+      http.post('https://graph.microsoft.com/v1.0/users/:email/events', async ({ request }) => {
+        createdEventBody = await request.json();
+        return HttpResponse.json({ id: 'evt-tz' });
+      })
+    );
+
+    await executeTool('apply_calendar_event', { draft_id: 'draft-tz' }, TOKEN, 'thread-ts');
+
+    expect(createdEventBody.start).toEqual({ dateTime: '2026-09-04T07:00:00', timeZone: 'America/Los_Angeles' });
+    expect(createdEventBody.end).toEqual({ dateTime: '2026-09-04T08:00:00', timeZone: 'America/Los_Angeles' });
+  });
+
   it('rejects an update/cancel proposal without event_id', async () => {
     await expect(
       executeTool('propose_calendar_event', { action: 'cancel' }, TOKEN, 'thread-ts')
