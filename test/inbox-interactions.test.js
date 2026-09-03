@@ -2,8 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from './mocks/server';
 import { CHANNEL_ID, APPROVER_USER_ID } from '../pages/api/inbox-assistant';
-import { parseInteractionPayload, handleCalendarInteraction } from '../pages/api/inbox-interactions';
-import { CALENDAR_ACTIONS } from '../lib/inbox-blocks';
+import {
+  parseInteractionPayload,
+  handleCalendarInteraction,
+  handleEmailInteraction,
+  handleInteraction,
+} from '../pages/api/inbox-interactions';
+import { CALENDAR_ACTIONS, EMAIL_ACTIONS } from '../lib/inbox-blocks';
 
 const DRAFTS_URL = 'https://test-project.supabase.co/rest/v1/calendar_event_drafts';
 
@@ -246,6 +251,159 @@ describe('handleCalendarInteraction: calendar_edit', () => {
     expect(tracked.calls.filter(c => c.type === 'graph')).toHaveLength(0);
     expect(anthropicCalls).toBe(0);
     expect(tracked.calls.some(c => c.type === 'post' && c.body.text.includes('What should change'))).toBe(true);
+  });
+});
+
+// resolve_digest_item reads digest_runs by slack_thread_ts, then digest_items
+// by (digest_run_id, item_number), then email_messages by graph_message_id.
+function digestLookupHandlers({ item = null } = {}) {
+  return [
+    http.get('https://test-project.supabase.co/rest/v1/digest_runs', () =>
+      HttpResponse.json([{ id: 'run-1', slack_thread_ts: 'digest-ts', status: 'posted' }])
+    ),
+    http.get('https://test-project.supabase.co/rest/v1/digest_items', () =>
+      HttpResponse.json(item ? [item] : [])
+    ),
+    http.get('https://test-project.supabase.co/rest/v1/email_messages', () => HttpResponse.json([])),
+  ];
+}
+
+const DIGEST_ITEM = {
+  id: 'item-3',
+  item_number: 3,
+  graph_message_id: 'AAMkGraphMessageId',
+  graph_conversation_id: 'conv-3',
+  sender_name: 'Scott Sanborn',
+  sender_email: 'scott@alliancelaundry.com',
+  subject: 'Re: Options for high end machines',
+  received_at: '2026-09-03T15:00:00Z',
+  classification: 'digest_candidate',
+  action_status: 'open',
+  raw_digest_input: {},
+};
+
+function buildDigestPayload({
+  itemNumber = 3,
+  userId = APPROVER_USER_ID,
+  channelId = CHANNEL_ID,
+  messageTs = 'digest-ts',
+} = {}) {
+  return {
+    type: 'block_actions',
+    channel: { id: channelId },
+    user: { id: userId },
+    // The digest is a top-level message, so its own ts is the thread ts.
+    message: { ts: messageTs, text: '*🌅 Morning Digest*\n[#3] Scott Sanborn — quote ready' },
+    actions: [
+      {
+        action_id: `${EMAIL_ACTIONS.REPLY}_${itemNumber}`,
+        value: JSON.stringify({ itemNumber }),
+      },
+    ],
+  };
+}
+
+describe('handleEmailInteraction: ✍️ Reply on a digest item', () => {
+  it('opens the conversation in-thread naming the item, sender, and subject', async () => {
+    const tracked = createTrackedHandlers();
+    server.use(...digestLookupHandlers({ item: DIGEST_ITEM }), ...tracked.handlers);
+
+    const result = await handleEmailInteraction(buildDigestPayload());
+
+    expect(result.handled).toBe(true);
+    expect(result.result.success).toBe(true);
+
+    const posts = tracked.calls.filter(c => c.type === 'post');
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body.thread_ts).toBe('digest-ts');
+    expect(posts[0].body.text).toContain('#3');
+    expect(posts[0].body.text).toContain('Scott Sanborn');
+    expect(posts[0].body.text).toContain('Re: Options for high end machines');
+    expect(posts[0].body.text).toMatch(/What do you want to say/);
+  });
+
+  it('drafts nothing and calls neither Graph nor Anthropic -- the typed flow does the drafting', async () => {
+    const tracked = createTrackedHandlers();
+    let anthropicCalls = 0;
+    server.use(
+      ...digestLookupHandlers({ item: DIGEST_ITEM }),
+      ...tracked.handlers,
+      http.post('https://api.anthropic.com/v1/messages', () => {
+        anthropicCalls += 1;
+        return HttpResponse.json({
+          id: 'msg_unexpected',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'should not be called' }],
+          stop_reason: 'end_turn',
+        });
+      })
+    );
+
+    await handleEmailInteraction(buildDigestPayload());
+
+    expect(anthropicCalls).toBe(0);
+    expect(tracked.calls.filter(c => c.type === 'graph')).toHaveLength(0);
+    expect(tracked.calls.filter(c => c.type === 'update')).toHaveLength(0);
+  });
+
+  it('reports a helpful error when the digest item cannot be resolved', async () => {
+    const tracked = createTrackedHandlers();
+    server.use(...digestLookupHandlers({ item: null }), ...tracked.handlers);
+
+    const result = await handleEmailInteraction(buildDigestPayload({ itemNumber: 9 }));
+
+    expect(result.result.success).toBe(false);
+    const posts = tracked.calls.filter(c => c.type === 'post');
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body.text).toMatch(/#9/);
+  });
+
+  it('rejects a click from anyone other than the approver without touching the database', async () => {
+    const tracked = createTrackedHandlers();
+    server.use(...tracked.handlers);
+
+    const result = await handleEmailInteraction(buildDigestPayload({ userId: 'U_SOMEONE_ELSE' }));
+
+    expect(result.result.success).toBe(false);
+    expect(tracked.calls).toHaveLength(1);
+    expect(tracked.calls[0].body.text).toContain('U_SOMEONE_ELSE');
+  });
+
+  it('ignores a click from the wrong channel with zero calls', async () => {
+    const tracked = createTrackedHandlers();
+    server.use(...tracked.handlers);
+
+    const result = await handleEmailInteraction(buildDigestPayload({ channelId: 'C_WRONG' }));
+
+    expect(result.handled).toBe(false);
+    expect(tracked.calls).toHaveLength(0);
+  });
+});
+
+describe('handleInteraction routing', () => {
+  it('routes email_* actions to the email handler', async () => {
+    const tracked = createTrackedHandlers();
+    server.use(...digestLookupHandlers({ item: DIGEST_ITEM }), ...tracked.handlers);
+
+    const result = await handleInteraction(buildDigestPayload());
+
+    expect(result.handled).toBe(true);
+    expect(result.action).toBe(`${EMAIL_ACTIONS.REPLY}_3`);
+    expect(tracked.calls.filter(c => c.type === 'post')[0].body.text).toContain('Scott Sanborn');
+  });
+
+  it('routes calendar_* actions to the calendar handler', async () => {
+    const store = createDraftStore(pendingDraft({ id: 'draft-routed' }));
+    const tracked = createTrackedHandlers();
+    server.use(...store.handlers, ...tracked.handlers);
+
+    const result = await handleInteraction(
+      buildPayload({ actionId: CALENDAR_ACTIONS.DISCARD, draftId: 'draft-routed' })
+    );
+
+    expect(result.handled).toBe(true);
+    expect(store.current.status).toBe('discarded');
   });
 });
 

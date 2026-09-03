@@ -1,8 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   CALENDAR_ACTIONS,
+  EMAIL_ACTIONS,
   formatCalendarSummary,
   buildCalendarApprovalBlocks,
+  buildDigestBlocks,
+  extractDigestItemNumbers,
   formatResolvedMessage,
 } from '../../lib/inbox-blocks';
 
@@ -139,6 +142,77 @@ describe('buildCalendarApprovalBlocks', () => {
     for (const block of sectionBlocks) {
       expect(block.text.text.length).toBeLessThanOrEqual(2900);
     }
+  });
+});
+
+describe('extractDigestItemNumbers', () => {
+  const digest = `*🌅 Morning Digest — Thursday, September 4*
+
+*🔴 Action Required*
+↳ [#1] harperlawoffices@comcast.net — emergency motion filed
+↳ [#2] Gregory Rubio Licht — acknowledged the legal update
+[#5] Scott Sanborn — quote ready for signature
+
+*🟡 FYI / Needs Awareness*
+- Rhoda — insurance renewal planning (no number)
+
+14 emails total — 3 need action`;
+
+  it('pulls the numbered Action Required items out of the finished digest text', () => {
+    expect(extractDigestItemNumbers(digest)).toEqual([1, 2, 5]);
+  });
+
+  it('dedupes repeated references and sorts numerically', () => {
+    expect(extractDigestItemNumbers('[#10] a [#2] b [#10] c')).toEqual([2, 10]);
+  });
+
+  it('returns an empty array when nothing is numbered', () => {
+    expect(extractDigestItemNumbers('*Morning Digest* — nothing actionable today')).toEqual([]);
+    expect(extractDigestItemNumbers('')).toEqual([]);
+    expect(extractDigestItemNumbers(null)).toEqual([]);
+  });
+});
+
+describe('buildDigestBlocks', () => {
+  it('returns null when there are no actionable items, so the digest posts as plain text', () => {
+    expect(buildDigestBlocks('a digest with nothing to do', [])).toBeNull();
+  });
+
+  it('adds one reply button per item, carrying the item number in the value', () => {
+    const blocks = buildDigestBlocks('digest text', [1, 3]);
+    const actionsBlocks = blocks.filter(b => b.type === 'actions');
+    expect(actionsBlocks).toHaveLength(1);
+
+    const elements = actionsBlocks[0].elements;
+    expect(elements).toHaveLength(2);
+    expect(elements.map(el => el.text.text)).toEqual(['✍️ Reply #1', '✍️ Reply #3']);
+    expect(elements.map(el => JSON.parse(el.value))).toEqual([{ itemNumber: 1 }, { itemNumber: 3 }]);
+    expect(elements.every(el => el.action_id.startsWith(EMAIL_ACTIONS.REPLY))).toBe(true);
+  });
+
+  it('gives every button a distinct action_id (Slack requires uniqueness within a block)', () => {
+    const blocks = buildDigestBlocks('digest text', [1, 2, 3, 4, 5]);
+    const ids = blocks
+      .filter(b => b.type === 'actions')
+      .flatMap(b => b.elements.map(el => el.action_id));
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('splits into rows of 5 and caps the total number of buttons', () => {
+    const blocks = buildDigestBlocks('digest text', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    const actionsBlocks = blocks.filter(b => b.type === 'actions');
+    expect(actionsBlocks).toHaveLength(2);
+    expect(actionsBlocks.every(b => b.elements.length <= 5)).toBe(true);
+
+    const total = actionsBlocks.reduce((sum, b) => sum + b.elements.length, 0);
+    expect(total).toBe(10);
+  });
+
+  it('keeps the digest text in section blocks ahead of the buttons', () => {
+    const blocks = buildDigestBlocks('digest text with [#1] in it', [1]);
+    expect(blocks[0].type).toBe('section');
+    expect(blocks[0].text.text).toContain('digest text');
+    expect(blocks[blocks.length - 1].type).toBe('actions');
   });
 });
 

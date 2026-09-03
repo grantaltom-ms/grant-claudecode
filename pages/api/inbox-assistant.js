@@ -2550,6 +2550,7 @@ RULES:
 - import_historical_email is only for genuinely historical correspondence Grant is re-filing with its true original date (e.g. from a legacy system or a paper record) — never use it for anything being sent or drafted now.
 - If the current Slack thread contains a forgotten-items list, follow-up references like "#1", "#2", or "number 3" refer to that forgotten-items list unless Grant explicitly says digest item.
 - When Grant refers to a numbered digest item like "#1", "#2", or "number 3", call resolve_digest_item first and use its message_id for any get_email or create_draft_reply call.
+- A thread message reading "✍️ Reply to #N — <sender>" means Grant clicked the ✍️ Reply button on that digest item (handled outside of you) and his NEXT message is what he wants to say back. Call resolve_digest_item for #N, then create_draft_reply with his instructions, and show him the draft for approval — do not send it without approval.
 - When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading. Save the draft, show it in Slack, then ask: "Send it, edit it, or discard?"
 - If Grant says a numbered digest item is done, waiting, dismissed, or has a draft prepared, call update_digest_item_status.
 - When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
