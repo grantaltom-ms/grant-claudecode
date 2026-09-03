@@ -281,7 +281,9 @@ Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `d
 **There is no rendered "⚪ Low Priority / Noise" section.** The live triage prompt in `digest.js` explicitly instructs the model to silently discard anything that would fall in that bucket (automated confirmations, newsletters, routine system reports, Adobe Acrobat comment notifications, successful daily reports) rather than list it. If you want that content visible again — even as a collapsed/de-emphasized section — that's a prompt change in `digest.js`, not currently how it behaves.
 
 **Followed by thread reply:**
-`Reply here to act on any email — e.g. "draft reply to #1", "what does #3 say"`
+`Hit ✍️ Reply on any numbered item above to start a response, or reply here — e.g. "what does #3 say", "mark #2 as done"`
+
+**Reply buttons.** The digest message carries one `✍️ Reply #N` Block Kit button per numbered Action Required item (`lib/inbox-blocks.js`'s `extractDigestItemNumbers` + `buildDigestBlocks`; capped at 10 buttons, 5 per row). The `[#N]` numbers the triage model emits are the same 1-based positions `saveDigestItems()` writes to `digest_items.item_number` — both index the same `filteredEmails` array — which is what `resolve_digest_item` looks up, so the numbers in the text and the buttons always agree. Clicking is handled by `pages/api/inbox-interactions.js` (`handleEmailInteraction`), which deliberately drafts nothing: it resolves the item and posts "✍️ Reply to #N — sender — subject / What do you want to say?" into the digest thread, and Grant's next message drives the normal typed drafting flow through `create_draft_reply` (send approval still required). Because the button rides on the top-level digest message, `payload.message.ts` is the digest thread ts that `digest_runs.slack_thread_ts` stores. A digest with no numbered items posts as plain text with no blocks, exactly as before.
 
 ### Digest Intelligence Rules
 

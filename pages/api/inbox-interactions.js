@@ -10,7 +10,7 @@ import { waitUntil } from '@vercel/functions';
 import { slackPost as _slackPost, slackUpdateMessage } from '../../lib/slack';
 import { getGraphToken } from '../../lib/graph';
 import { CHANNEL_ID, APPROVER_USER_ID, verifySlackSignature, executeTool } from './inbox-assistant';
-import { CALENDAR_ACTIONS, formatResolvedMessage } from '../../lib/inbox-blocks';
+import { CALENDAR_ACTIONS, EMAIL_ACTIONS, formatResolvedMessage } from '../../lib/inbox-blocks';
 
 export const config = { api: { bodyParser: false } };
 
@@ -132,6 +132,68 @@ export async function handleCalendarInteraction(payload) {
   return { handled: false, reason: 'unknown_calendar_action' };
 }
 
+// ✍️ Reply on a numbered digest item. Deliberately does NOT draft anything:
+// it opens the conversation in-thread and lets the normal typed flow do the
+// drafting, so Grant steers the content from the start. The posted message
+// names the item as "#N" because runAgent rebuilds history from this thread
+// text -- that reference is what lets the model call resolve_digest_item on
+// Grant's next message.
+export async function handleEmailInteraction(payload) {
+  const channelId = payload.channel?.id;
+  if (channelId !== CHANNEL_ID) return { handled: false, reason: 'wrong_channel' };
+
+  const actionId = payload.actions?.[0]?.action_id || '';
+  if (!actionId.startsWith(EMAIL_ACTIONS.REPLY)) {
+    return { handled: false, reason: 'unknown_email_action' };
+  }
+
+  const message = payload.message || {};
+  const threadTs = message.thread_ts || message.ts;
+
+  const clickerId = payload.user?.id;
+  if (clickerId !== APPROVER_USER_ID) {
+    await post(
+      `⚠️ Ignored a button click from <@${clickerId}> — only <@${APPROVER_USER_ID}> can act on digest items.`,
+      threadTs
+    );
+    return { handled: true, action: actionId, result: { success: false, message: 'unauthorized_clicker' } };
+  }
+
+  let value = {};
+  try {
+    value = JSON.parse(payload.actions[0].value || '{}');
+  } catch {
+    value = {};
+  }
+  const itemNumber = value.itemNumber;
+  if (!itemNumber) {
+    await post('⚠️ That button has no digest item attached.', threadTs);
+    return { handled: true, action: actionId, result: { success: false, message: 'missing_item_number' } };
+  }
+
+  try {
+    const resolved = await executeTool('resolve_digest_item', { item_number: itemNumber }, null, threadTs);
+    const item = resolved?.digest_item || {};
+    const who = item.sender_name || item.sender_email || 'the sender';
+    const subject = item.subject ? ` — "${item.subject}"` : '';
+    await post(
+      `✍️ *Reply to #${itemNumber}* — ${who}${subject}\n`
+        + "What do you want to say? Reply in this thread and I'll draft it for your approval.",
+      threadTs
+    );
+    return { handled: true, action: actionId, result: { success: true, item_number: itemNumber } };
+  } catch (err) {
+    await post(`⚠️ Couldn't open a reply for #${itemNumber}: ${err.message}`, threadTs);
+    return { handled: true, action: actionId, result: { success: false, message: err.message } };
+  }
+}
+
+export async function handleInteraction(payload) {
+  const actionId = payload.actions?.[0]?.action_id || '';
+  if (actionId.startsWith('email_')) return handleEmailInteraction(payload);
+  return handleCalendarInteraction(payload);
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
@@ -155,7 +217,7 @@ export default async function handler(req, res) {
   res.status(200).end();
 
   waitUntil(
-    handleCalendarInteraction(payload).catch(err => {
+    handleInteraction(payload).catch(err => {
       console.error('inbox-interactions error:', err);
       const threadTs = payload.message?.thread_ts || payload.message?.ts;
       if (threadTs) {

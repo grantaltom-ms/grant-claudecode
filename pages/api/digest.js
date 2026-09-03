@@ -4,6 +4,7 @@ import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
 import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
 import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
+import { buildDigestBlocks, extractDigestItemNumbers } from '../../lib/inbox-blocks';
 import { callClaude } from '../../lib/claude';
 import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
 
@@ -79,9 +80,9 @@ function qualifiesForHistoryNote(stats) {
 // on failure) -- lib/slack.js's slackPost throws on API failure, which is a
 // deliberate behavior difference from the Comply bot's stricter needs, not
 // something to introduce here as a side effect of consolidation.
-async function slackPost(text, threadTs = null) {
+async function slackPost(text, threadTs = null, blocks = null) {
   try {
-    const data = await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, text, threadTs);
+    const data = await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, text, threadTs, blocks);
     return data.ts;
   } catch (err) {
     console.error('slackPost failed:', err.message);
@@ -952,7 +953,11 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     digest += `\n_🔄 Delta sync cursor expired and was reset — this run used a full pull instead. Re-run \`/api/backfill-inbox-delta\` when convenient to re-establish it._`;
   }
 
-  const digestTs = await slackPost(digest);
+  // One ✍️ Reply button per numbered Action Required item. buildDigestBlocks
+  // returns null when nothing is numbered, in which case this posts exactly
+  // the plain text it always did.
+  const digestItemNumbers = extractDigestItemNumbers(digest);
+  const digestTs = await slackPost(digest, null, buildDigestBlocks(digest, digestItemNumbers));
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
     run_completed_at: new Date().toISOString(),
@@ -972,7 +977,7 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
   });
 
   await slackPost(
-    '_Reply here to act on any email — e.g. "draft reply to #1", "what does #3 say", "mark #2 as done"_',
+    '_Hit ✍️ Reply on any numbered item above to start a response, or reply here — e.g. "what does #3 say", "mark #2 as done"_',
     digestTs
   );
 }
