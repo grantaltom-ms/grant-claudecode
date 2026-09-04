@@ -10,7 +10,12 @@ import { waitUntil } from '@vercel/functions';
 import { slackPost as _slackPost, slackUpdateMessage } from '../../lib/slack';
 import { getGraphToken } from '../../lib/graph';
 import { CHANNEL_ID, APPROVER_USER_ID, verifySlackSignature, executeTool } from './inbox-assistant';
-import { CALENDAR_ACTIONS, EMAIL_ACTIONS, formatResolvedMessage } from '../../lib/inbox-blocks';
+import {
+  CALENDAR_ACTIONS,
+  EMAIL_ACTIONS,
+  formatResolvedMessage,
+  verifyDigestItemNumbers,
+} from '../../lib/inbox-blocks';
 
 export const config = { api: { bodyParser: false } };
 
@@ -174,6 +179,35 @@ export async function handleEmailInteraction(payload) {
   try {
     const resolved = await executeTool('resolve_digest_item', { item_number: itemNumber }, null, threadTs);
     const item = resolved?.digest_item || {};
+
+    // Corroborate at click time, not just when the card was built. A card
+    // carries whatever button values it was posted with, so every digest
+    // already sitting in Slack from before the numbering fix still points at
+    // the wrong rows -- build-time verification cannot reach back and repair
+    // one. message.text is the digest exactly as posted, so checking the
+    // resolved row against the [#N] line the clicker actually read is the
+    // only check that covers a stale card, and it re-checks live cards for
+    // free. Refusing is always better than opening a reply to the wrong
+    // correspondent.
+    const corroborated = verifyDigestItemNumbers(
+      message.text,
+      [{ ...item, item_number: itemNumber }],
+      [itemNumber]
+    );
+    if (corroborated.length === 0) {
+      await post(
+        `⚠️ Not opening that reply: #${itemNumber} on this digest doesn't match what I have saved for it`
+          + ` (I resolved it to "${item.sender_name || item.sender_email || 'an unknown sender'}").`
+          + ' This digest was probably posted before the numbering fix — use the newest digest, or tell me who you want to reply to.',
+        threadTs
+      );
+      return {
+        handled: true,
+        action: actionId,
+        result: { success: false, message: 'item_number_not_corroborated' },
+      };
+    }
+
     const who = item.sender_name || item.sender_email || 'the sender';
     const subject = item.subject ? ` — "${item.subject}"` : '';
     await post(
