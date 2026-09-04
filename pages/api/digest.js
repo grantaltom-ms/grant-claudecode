@@ -4,7 +4,7 @@ import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
 import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
 import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
-import { buildDigestBlocks, extractDigestItemNumbers } from '../../lib/inbox-blocks';
+import { buildDigestBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
 import { callClaude } from '../../lib/claude';
 import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
 
@@ -906,7 +906,8 @@ CATEGORIZATION:
 - Low Priority / Noise emails (automated confirmations, newsletters, routine system reports, daily delinquency reports that ran fine, Adobe Acrobat comment notifications, AppFolio automated confirmations) — SILENTLY DISCARD. Do not include them in any section.
 
 NUMBERING:
-- Assign each email a number [#N] in Action Required items only
+- Every email in the list above is already numbered (the leading "N." on its line). For each Action Required item, reuse THAT email's own number as its [#N]. Never renumber them 1, 2, 3 in the order you list them.
+- The numbers will therefore usually NOT be contiguous — e.g. [#8], [#12], [#37] — which is correct and expected. Do not "tidy" them.
 - Don't number FYI items
 
 CORRESPONDENCE HISTORY:
@@ -953,10 +954,20 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     digest += `\n_🔄 Delta sync cursor expired and was reset — this run used a full pull instead. Re-run \`/api/backfill-inbox-delta\` when convenient to re-establish it._`;
   }
 
-  // One ✍️ Reply button per numbered Action Required item. buildDigestBlocks
-  // returns null when nothing is numbered, in which case this posts exactly
-  // the plain text it always did.
-  const digestItemNumbers = extractDigestItemNumbers(digest);
+  // One ✍️ Reply button per numbered Action Required item -- but only once the
+  // [#N] markers are corroborated against the saved digest_items rows the
+  // click will resolve against. If the triage model renumbered its items
+  // (which it has done), the numbers are meaningless as references and the
+  // buttons would open replies to the wrong correspondents, so we post the
+  // plain text instead. buildDigestBlocks returns null for an empty list.
+  const claimedItemNumbers = extractDigestItemNumbers(digest);
+  const digestItemNumbers = verifyDigestItemNumbers(digest, savedDigestItems, claimedItemNumbers);
+  if (claimedItemNumbers.length > 0 && digestItemNumbers.length === 0) {
+    console.error('Digest item numbering failed verification -- posting without reply buttons', {
+      digest_run_id: digestRun?.id,
+      claimed_item_numbers: claimedItemNumbers,
+    });
+  }
   const digestTs = await slackPost(digest, null, buildDigestBlocks(digest, digestItemNumbers));
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,

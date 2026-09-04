@@ -66,6 +66,18 @@ const ACTIONABLE_DIGEST = `*🌅 Morning Digest — Test Day*
 
 3 emails total — 2 need action`;
 
+// The production failure: the model renumbered its Action Required items 1, 2
+// instead of reusing each email's input-list number. [#1] here claims to be
+// Scott Sanborn, but item 1 is Harper Law -- clicking would open a reply to
+// the wrong correspondent.
+const RENUMBERED_DIGEST = `*🌅 Morning Digest — Test Day*
+
+*🔴 Action Required*
+- [#1] Scott Sanborn — quote ready for signature
+- [#2] Rhoda Carlson — insurance renewal planning
+
+3 emails total — 2 need action`;
+
 const NOTHING_ACTIONABLE_DIGEST = `*🌅 Morning Digest — Test Day*
 
 *🟡 FYI / Needs Awareness*
@@ -79,6 +91,18 @@ function mockDigestNetwork(digestText, posts) {
       HttpResponse.json({ value: EMAILS })
     ),
     digestAnthropicRouter(digestText),
+    // createDigestRun uses .select().single(), so this must be a single object,
+    // not an array. Without a run id, saveDigestItems early-returns and there
+    // would be no saved rows to verify the [#N] markers against.
+    http.post('https://test-project.supabase.co/rest/v1/digest_runs', () =>
+      HttpResponse.json({ id: 'run-test-1' })
+    ),
+    // saveDigestItems inserts with .select(), and the returned rows are what
+    // the [#N] markers are verified against, so they have to come back.
+    http.post('https://test-project.supabase.co/rest/v1/digest_items', async ({ request }) => {
+      const inserted = await request.json();
+      return HttpResponse.json(inserted);
+    }),
     http.post('https://slack.com/api/chat.postMessage', async ({ request }) => {
       const body = await request.json();
       posts.push(body);
@@ -117,6 +141,19 @@ describe('digest reply buttons', () => {
     expect(digestPost.text).toContain('[#1] Harper Law');
     expect(digestPost.text).toContain('[#2] Scott Sanborn');
     expect(digestPost.text).toContain('insurance renewal planning');
+  });
+
+  it('posts NO buttons when the model renumbered its items, rather than wiring them to the wrong emails', async () => {
+    const posts = [];
+    mockDigestNetwork(RENUMBERED_DIGEST, posts);
+
+    await runDigest();
+
+    const digestPost = posts.find(p => p.text?.includes('Morning Digest'));
+    expect(digestPost).toBeDefined();
+    // The digest itself still goes out in full -- only the buttons are withheld.
+    expect(digestPost.text).toContain('[#1] Scott Sanborn');
+    expect(digestPost.blocks).toBeUndefined();
   });
 
   it('posts no blocks at all when the digest has nothing actionable', async () => {

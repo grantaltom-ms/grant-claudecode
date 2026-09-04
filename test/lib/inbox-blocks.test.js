@@ -6,6 +6,7 @@ import {
   buildCalendarApprovalBlocks,
   buildDigestBlocks,
   extractDigestItemNumbers,
+  verifyDigestItemNumbers,
   formatResolvedMessage,
 } from '../../lib/inbox-blocks';
 
@@ -170,6 +171,66 @@ describe('extractDigestItemNumbers', () => {
     expect(extractDigestItemNumbers('*Morning Digest* — nothing actionable today')).toEqual([]);
     expect(extractDigestItemNumbers('')).toEqual([]);
     expect(extractDigestItemNumbers(null)).toEqual([]);
+  });
+});
+
+describe('verifyDigestItemNumbers', () => {
+  // Mirrors the real digest_items ordering: the raw inbox order, which is why
+  // low numbers are routine mail rather than the curated Action Required set.
+  const ITEMS = [
+    { item_number: 1, sender_name: 'Milestone Marketing', sender_email: 'leasing@rentmilestone.com', subject: 'Re: Reference Request for Patrick Pruett' },
+    { item_number: 4, sender_name: 'ensenta.monitor@jackhenry.com', sender_email: 'ensenta.monitor@jackhenry.com', subject: 'Receipt from Seattle Bank' },
+    { item_number: 5, sender_name: 'Githens, Michael', sender_email: 'michael.githens@chase.com', subject: 'RE: [EXTERNAL]Re: Loan Pool Update/ Rate Update' },
+    { item_number: 8, sender_name: 'Scott Sanborn', sender_email: 'Scott.Sanborn@alliancels.com', subject: 'Re: Options for high end machines' },
+  ];
+
+  it('accepts numbering that genuinely points at the right rows', () => {
+    const digest = [
+      '*🔴 Action Required*',
+      '[#5] Githens, Michael (Chase) — Loan Pool Update: waiting on the appraisal',
+      '[#8] Scott Sanborn (Alliance Laundry) — quote ready for signature',
+    ].join('\n');
+
+    expect(verifyDigestItemNumbers(digest, ITEMS, [5, 8])).toEqual([5, 8]);
+  });
+
+  it('rejects the production failure: model renumbered its items 1, 2, 3', () => {
+    // "[#1] Githens" is the bug -- Githens is item 5, so [#1] would resolve to
+    // the Patrick Pruett reference request and open a reply to the wrong person.
+    const digest = [
+      '*🔴 Action Required*',
+      '[#1] Githens, Michael (Chase) — Loan Pool Update: waiting on the appraisal',
+      '[#2] Scott Sanborn (Alliance Laundry) — quote ready for signature',
+    ].join('\n');
+
+    expect(verifyDigestItemNumbers(digest, ITEMS, [1, 2])).toEqual([]);
+  });
+
+  it('is all-or-nothing: one bad item drops the buttons for the whole digest', () => {
+    const digest = [
+      '[#5] Githens, Michael (Chase) — Loan Pool Update',
+      '[#8] Somebody Else Entirely — unrelated subject line',
+    ].join('\n');
+
+    expect(verifyDigestItemNumbers(digest, ITEMS, [5, 8])).toEqual([]);
+  });
+
+  it('corroborates on sender address or subject fragment, not just the name', () => {
+    const byEmail = '[#5] <mailto:michael.githens@chase.com|michael.githens@chase.com> — loan update';
+    expect(verifyDigestItemNumbers(byEmail, ITEMS, [5])).toEqual([5]);
+
+    const bySubject = '[#8] Alliance — Re: Options for high end machines: quote attached';
+    expect(verifyDigestItemNumbers(bySubject, ITEMS, [8])).toEqual([8]);
+  });
+
+  it('rejects a number with no saved row, or a number missing from the text', () => {
+    expect(verifyDigestItemNumbers('[#5] Githens, Michael — loan update', ITEMS, [5, 99])).toEqual([]);
+    expect(verifyDigestItemNumbers('no markers here', ITEMS, [5])).toEqual([]);
+  });
+
+  it('returns an empty list when there is nothing to verify', () => {
+    expect(verifyDigestItemNumbers('a digest', ITEMS, [])).toEqual([]);
+    expect(verifyDigestItemNumbers('a digest', [], [1])).toEqual([]);
   });
 });
 
