@@ -287,13 +287,14 @@ function buildDigestPayload({
   userId = APPROVER_USER_ID,
   channelId = CHANNEL_ID,
   messageTs = 'digest-ts',
+  text = '*🌅 Morning Digest*\n[#3] Scott Sanborn — quote ready',
 } = {}) {
   return {
     type: 'block_actions',
     channel: { id: channelId },
     user: { id: userId },
     // The digest is a top-level message, so its own ts is the thread ts.
-    message: { ts: messageTs, text: '*🌅 Morning Digest*\n[#3] Scott Sanborn — quote ready' },
+    message: { ts: messageTs, text },
     actions: [
       {
         action_id: `${EMAIL_ACTIONS.REPLY}_${itemNumber}`,
@@ -345,6 +346,52 @@ describe('handleEmailInteraction: ✍️ Reply on a digest item', () => {
     expect(anthropicCalls).toBe(0);
     expect(tracked.calls.filter(c => c.type === 'graph')).toHaveLength(0);
     expect(tracked.calls.filter(c => c.type === 'update')).toHaveLength(0);
+  });
+
+  it('refuses a stale card whose [#N] does not match the row it resolves to', async () => {
+    // The real incident: a digest posted before the numbering fix still
+    // carries the old button values, so #7 resolved to Max Ma while the card
+    // Grant was reading showed Marriam Leve at [#7]. The card cannot be
+    // repaired after the fact, so the click itself has to refuse.
+    const staleItem = {
+      ...DIGEST_ITEM,
+      item_number: 7,
+      sender_name: 'Max Ma',
+      subject: 'Re: the applicants you say no to',
+    };
+    const tracked = createTrackedHandlers();
+    server.use(...digestLookupHandlers({ item: staleItem }), ...tracked.handlers);
+
+    const result = await handleEmailInteraction(
+      buildDigestPayload({
+        itemNumber: 7,
+        text: '*🌅 Morning Digest*\n[#7] Marriam Leve — Re: Vancouver B&O Tax',
+      })
+    );
+
+    expect(result.result.success).toBe(false);
+    expect(result.result.message).toBe('item_number_not_corroborated');
+
+    const posts = tracked.calls.filter(c => c.type === 'post');
+    expect(posts).toHaveLength(1);
+    // Names who it would have opened, so the mismatch is obvious.
+    expect(posts[0].body.text).toContain('Max Ma');
+    expect(posts[0].body.text).not.toMatch(/What do you want to say/);
+  });
+
+  it('opens the reply when the card and the resolved row agree', async () => {
+    const tracked = createTrackedHandlers();
+    server.use(...digestLookupHandlers({ item: DIGEST_ITEM }), ...tracked.handlers);
+
+    const result = await handleEmailInteraction(
+      buildDigestPayload({
+        itemNumber: 3,
+        text: '*🌅 Morning Digest*\n[#3] Scott Sanborn (Alliance Laundry) — quote ready for signature',
+      })
+    );
+
+    expect(result.result.success).toBe(true);
+    expect(tracked.calls.filter(c => c.type === 'post')[0].body.text).toMatch(/What do you want to say/);
   });
 
   it('reports a helpful error when the digest item cannot be resolved', async () => {
