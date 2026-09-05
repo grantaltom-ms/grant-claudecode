@@ -87,16 +87,25 @@ export function selectedTasks(req) {
   return [TASKS[dayOfYear() % TASKS.length]];
 }
 
+// The skip flags have to filter, not merely gate the append. CONTEXT_CARD_TASK
+// is itself in the rotation, so on the roughly-one-day-in-TASKS.length that the
+// rotation lands on it, skip_context_cards=1 was silently ignored and the task
+// ran anyway -- which is also why this only ever failed on some days.
+function withOptionalTask(tasks, task, skipped) {
+  if (skipped) return tasks.filter(candidate => candidate.name !== task.name);
+  if (tasks.some(candidate => candidate.name === task.name)) return tasks;
+  return [...tasks, task];
+}
+
 export function tasksForRun(req) {
-  let tasks = selectedTasks(req);
+  const tasks = selectedTasks(req);
   if (!tasks.length) return tasks;
-  if (req.query.skip_context_cards !== '1' && !tasks.some(task => task.name === CONTEXT_CARD_TASK.name)) {
-    tasks = [...tasks, CONTEXT_CARD_TASK];
-  }
-  if (req.query.skip_sent_mail !== '1' && !tasks.some(task => task.name === SENT_MAIL_TASK.name)) {
-    tasks = [...tasks, SENT_MAIL_TASK];
-  }
-  return tasks;
+
+  return withOptionalTask(
+    withOptionalTask(tasks, CONTEXT_CARD_TASK, req.query.skip_context_cards === '1'),
+    SENT_MAIL_TASK,
+    req.query.skip_sent_mail === '1'
+  );
 }
 
 export default async function handler(req, res) {
