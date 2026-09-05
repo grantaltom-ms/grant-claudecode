@@ -206,6 +206,44 @@ describe('verifyDigestItemNumbers', () => {
     expect(verifyDigestItemNumbers(digest, ITEMS, [1, 2])).toEqual([]);
   });
 
+  // Sept 5 production digest: the model correctly reused input numbers
+  // (17, 25, 14, 34, 28, 6 -- non-contiguous) but rendered an address-only
+  // sender as a spaced name, so raw substring matching rejected two
+  // correctly-numbered items and dropped every button on the digest.
+  it('accepts an address-only sender that the model humanized into a spaced name', () => {
+    const items = [
+      { item_number: 17, sender_name: 'harperlawoffices@comcast.net', sender_email: 'harperlawoffices@comcast.net', subject: 'Re: 23020 25th Ave S, B-309' },
+      { item_number: 25, sender_name: 'harperlawoffices@comcast.net', sender_email: 'harperlawoffices@comcast.net', subject: 'Re: 23020 25th Ave S, B-309' },
+      { item_number: 28, sender_name: 'Jawad Habibi', sender_email: 'Jawad.Habibi@becu.org', subject: 'Fw: [EXTERNAL] Re: Annual Review Follow Up Questions/ Documents' },
+    ];
+    const digest = [
+      '↳ [#17] Harper Law Offices — Court granted stay until September 30th',
+      '↳ [#25] Harper Law Offices — Hearing recap: tenant cited accident last October',
+      '- [#28] Jawad Habibi (BECU) — Follow-up on annual review: needs REO confirmation',
+    ].join('\n');
+
+    expect(verifyDigestItemNumbers(digest, items, [17, 25, 28])).toEqual([17, 25, 28]);
+  });
+
+  it('still rejects a genuine mismatch once matching is normalized', () => {
+    const items = [
+      { item_number: 7, sender_name: 'Max Ma', sender_email: 'max@cosignrentals.com', subject: 'Re: the applicants you say no to' },
+    ];
+    const digest = '[#7] Marriam Leve — Re: Vancouver B&O Tax: first time seeing a City of Vancouver license';
+
+    expect(verifyDigestItemNumbers(digest, items, [7])).toEqual([]);
+  });
+
+  it('ignores needles too short to be meaningful', () => {
+    const items = [
+      { item_number: 2, sender_name: 'AR', sender_email: 'ar@x.io', subject: 'Hi' },
+    ];
+    // "ar" appears all over this line, but must not count as corroboration.
+    const digest = '[#2] Barbara Arnold — quarterly market report';
+
+    expect(verifyDigestItemNumbers(digest, items, [2])).toEqual([]);
+  });
+
   it('is all-or-nothing: one bad item drops the buttons for the whole digest', () => {
     const digest = [
       '[#5] Githens, Michael (Chase) — Loan Pool Update',

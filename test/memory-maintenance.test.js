@@ -35,6 +35,23 @@ describe('memory-maintenance task selection', () => {
     expect(tasks.some(t => t.name === SENT_MAIL_TASK.name)).toBe(true);
   });
 
+  // The two tests above only exercise the skip flags against whichever task
+  // the date-based rotation happened to pick, so the context_cards bug was
+  // invisible except on the days the rotation landed on context_cards itself.
+  // These pin it regardless of the date.
+  it('skip_context_cards=1 removes context_cards even when it is the selected task', () => {
+    const tasks = tasksForRun({ query: { task: CONTEXT_CARD_TASK.name, skip_context_cards: '1' } });
+    expect(tasks.some(t => t.name === CONTEXT_CARD_TASK.name)).toBe(false);
+  });
+
+  it('skip flags still apply to ?all=1', () => {
+    const tasks = tasksForRun({ query: { all: '1', skip_context_cards: '1', skip_sent_mail: '1' } });
+    expect(tasks.some(t => t.name === CONTEXT_CARD_TASK.name)).toBe(false);
+    expect(tasks.some(t => t.name === SENT_MAIL_TASK.name)).toBe(false);
+    // Everything else survives.
+    expect(tasks.length).toBe(ALL_TASKS.length - 2);
+  });
+
   it('?task=backfill_sent_mail resolves the sent-mail task individually', () => {
     const tasks = tasksForRun({ query: { task: 'backfill_sent_mail' } });
     expect(tasks.some(t => t.name === SENT_MAIL_TASK.name)).toBe(true);
