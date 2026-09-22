@@ -8,6 +8,8 @@ import {
   extractDigestItemNumbers,
   verifyDigestItemNumbers,
   formatResolvedMessage,
+  formatDraftSummary,
+  DRAFT_APPROVAL_FOOTER,
 } from '../../lib/inbox-blocks';
 
 describe('formatCalendarSummary', () => {
@@ -330,5 +332,62 @@ describe('formatResolvedMessage', () => {
 
   it('uses an explicit fallback over the outcome when given one', () => {
     expect(formatResolvedMessage('', '✅ Booked by Grant', 'fallback text')).toBe('fallback text');
+  });
+});
+
+describe('formatDraftSummary', () => {
+  const reply = {
+    kind: 'reply',
+    subject: 'RE: Your New AppFolio Customer Success Manager',
+    to: ['mia.skolnick@appfolio.com'],
+    cc: ['team@appfolio.com'],
+    body: 'Thanks Mia — happy to set up a call next week.',
+  };
+
+  it('renders a reply with its recipients, body, and the approval prompt', () => {
+    const text = formatDraftSummary(reply);
+    expect(text).toContain('✉️ *Draft reply — RE: Your New AppFolio Customer Success Manager*');
+    expect(text).toContain('To: mia.skolnick@appfolio.com');
+    expect(text).toContain('Cc: team@appfolio.com');
+    expect(text).toContain('Thanks Mia — happy to set up a call next week.');
+    expect(text.endsWith(DRAFT_APPROVAL_FOOTER)).toBe(true);
+  });
+
+  it('labels a brand-new draft differently from a reply', () => {
+    expect(formatDraftSummary({ ...reply, kind: 'new' })).toContain('✉️ *Draft email —');
+  });
+
+  it('omits the Cc line when there are no CC recipients', () => {
+    expect(formatDraftSummary({ ...reply, cc: [] })).not.toContain('Cc:');
+    expect(formatDraftSummary({ ...reply, cc: undefined })).not.toContain('Cc:');
+    // Graph can hand back a recipient with no address at all.
+    expect(formatDraftSummary({ ...reply, cc: [undefined] })).not.toContain('Cc:');
+  });
+
+  it('surfaces first-time recipients and mail tips on the card itself', () => {
+    const text = formatDraftSummary({
+      ...reply,
+      first_time_recipients: ['brand.new@example.com'],
+      mail_tip_warnings: ['mia.skolnick@appfolio.com has an out-of-office reply active'],
+    });
+    expect(text).toContain('⚠️ First time emailing brand.new@example.com');
+    expect(text).toContain('⚠️ mia.skolnick@appfolio.com has an out-of-office reply active');
+    // Warnings go above the prompt, so the last thing Grant reads is the ask.
+    expect(text.endsWith(DRAFT_APPROVAL_FOOTER)).toBe(true);
+  });
+
+  it('is never empty, even with nothing to show', () => {
+    // runAgent replays this text back as conversation history, and Slack
+    // rejects an empty message.
+    const text = formatDraftSummary({});
+    expect(text.trim().length).toBeGreaterThan(0);
+    expect(text).toContain('(no subject)');
+    expect(text).toContain(DRAFT_APPROVAL_FOOTER);
+  });
+
+  it('always carries the approval prompt, which is the whole point', () => {
+    expect(formatDraftSummary(reply)).toContain(DRAFT_APPROVAL_FOOTER);
+    expect(formatDraftSummary({ kind: 'new', subject: 'x', to: ['a@b.c'], body: '' }))
+      .toContain(DRAFT_APPROVAL_FOOTER);
   });
 });

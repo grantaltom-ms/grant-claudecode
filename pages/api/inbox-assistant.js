@@ -8,7 +8,7 @@ import { checkSendRateLimit, recordSend, flagNewRecipients } from '../../lib/sen
 import { listCalendarEvents, getAvailability, freeSlotsFromAvailability, createEvent, updateEvent, cancelEvent } from '../../lib/calendar';
 import { TRIAGE_FOLDERS, listMailFolders, createMailFolder, moveMessageToFolder, resolveTriageFolderId } from '../../lib/mailbox-folders';
 import { importMessage, exportMessageMime } from '../../lib/mail-import';
-import { buildCalendarApprovalBlocks, formatCalendarSummary } from '../../lib/inbox-blocks';
+import { buildCalendarApprovalBlocks, formatCalendarSummary, formatDraftSummary } from '../../lib/inbox-blocks';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -71,7 +71,7 @@ const EMAIL_TOOLS = [
   },
   {
     name: 'create_draft_reply',
-    description: 'Create a saved draft reply to an email. Does NOT send it — Grant must approve first. CC recipients from the original email are automatically preserved — you do not need to specify them.',
+    description: 'Create a saved draft reply to an email, and post it in the Slack thread with the approval prompt. Does NOT send it — Grant must approve first. This is the ONLY way to put a draft in front of Grant; writing the reply in your own message instead saves nothing. CC recipients from the original email are automatically preserved — you do not need to specify them.',
     input_schema: {
       type: 'object',
       properties: {
@@ -93,7 +93,7 @@ const EMAIL_TOOLS = [
   },
   {
     name: 'create_new_draft',
-    description: 'Create a brand new draft email (not a reply) to one or more recipients. Does NOT send — Grant must approve first.',
+    description: 'Create a brand new draft email (not a reply) to one or more recipients, and post it in the Slack thread with the approval prompt. Does NOT send — Grant must approve first. This is the ONLY way to put a draft in front of Grant; writing the email in your own message instead saves nothing.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1968,6 +1968,62 @@ async function recordDraftFeedback(input) {
   return { saved: true, feedback: data };
 }
 
+// What create_draft_reply/create_new_draft tell the model after they have
+// saved a draft AND posted the card that carries the approval question. The
+// model repeating the draft (or the question) is now duplication, not the
+// mechanism -- see DRAFT_APPROVAL_FOOTER in lib/inbox-blocks.js.
+const DRAFT_STAGED_MESSAGE = 'Draft saved to Outlook and posted in Slack with the approval prompt. '
+  + 'Reply with ONE short sentence (e.g. "Drafted — details above."). '
+  + 'Do NOT paste the draft text again and do NOT ask "Send it, edit it, or discard?" — the card already does.';
+
+// Second line of defence behind that card, for the case that actually
+// happened: the model wrote a reply to Mia Skolnick in prose, asked "Send it,
+// edit it, or discard?", and never called create_draft_reply -- so "Send it"
+// found nothing in Drafts. A prompt rule alone cannot rule that out (the same
+// lesson as the digest [#N] numbering), so runAgent checks the finished reply
+// against what the run actually did.
+//
+// Any of these tools having run means the turn has a real draft in view --
+// either one it just created, or one it looked up. The calendar tools are
+// here because the calendar card's own wording ("book, edit, or discard")
+// sits close enough to the email phrasing to be worth exempting outright.
+const APPROVAL_CONTEXT_TOOLS = new Set([
+  'create_draft_reply',
+  'create_new_draft',
+  'get_recent_drafts',
+  'send_draft',
+  'delete_draft',
+  'propose_calendar_event',
+  'get_recent_calendar_drafts',
+  'apply_calendar_event',
+  'discard_calendar_event',
+]);
+
+export function looksLikeEmailSendApproval(text) {
+  const normalized = (text || '').toLowerCase();
+  if (!normalized.includes('discard')) return false;
+  // "book it" is the calendar card's verb, never an email send.
+  if (normalized.includes('book it')) return false;
+  return /\bsend (it|this|that|them|the draft|the reply)\b/.test(normalized);
+}
+
+// True when the model is asking Grant to approve a send but nothing in this
+// run ever touched a draft.
+export function isPhantomDraftApproval(text, toolNamesUsed) {
+  if (!looksLikeEmailSendApproval(text)) return false;
+  return !(toolNamesUsed || []).some(name => APPROVAL_CONTEXT_TOOLS.has(name));
+}
+
+export const PHANTOM_DRAFT_CORRECTION = 'STOP. You just asked Grant to approve sending an email, but you never '
+  + 'called create_draft_reply or create_new_draft in this turn, so nothing is saved in his Drafts folder and '
+  + '"send it" would fail. If you already saved a draft earlier in this thread, call get_recent_drafts to confirm '
+  + 'it is still there rather than creating a duplicate. Otherwise save the draft now with the exact text you just '
+  + 'wrote (create_draft_reply for a reply, using the message ID you already have). If you cannot, tell Grant '
+  + 'plainly that no draft was created and why.';
+
+export const PHANTOM_DRAFT_WARNING = '⚠️ Heads-up: no draft was actually saved to your Drafts folder, '
+  + 'so there is nothing to send yet. Tell me to draft it and I will save it properly.';
+
 async function executeToolInternal(name, input, token, threadTs) {
   const base = `/users/${OWNER_EMAIL}`;
 
@@ -2032,13 +2088,28 @@ async function executeToolInternal(name, input, token, threadTs) {
           return [];
         });
 
+      // Post the draft ourselves so the approval prompt can only exist if the
+      // draft really does. slackPost never throws, so a Slack outage can't
+      // undo a draft that is already saved in Outlook.
+      if (threadTs) {
+        await slackPost(formatDraftSummary({
+          kind: 'reply',
+          subject: draft.subject,
+          to: [original.from?.emailAddress?.address],
+          cc: ccRecipients.map(r => r.emailAddress?.address),
+          body: input.body,
+          first_time_recipients: firstTimeRecipients,
+          mail_tip_warnings: mailTipWarnings,
+        }), threadTs);
+      }
+
       return {
         draft_id: draft.id,
         subject: draft.subject,
         candidate,
         ...(firstTimeRecipients.length && { first_time_recipients: firstTimeRecipients }),
         ...(mailTipWarnings.length && { mail_tip_warnings: mailTipWarnings }),
-        message: 'Draft saved. Awaiting approval.',
+        message: DRAFT_STAGED_MESSAGE,
       };
     }
 
@@ -2074,12 +2145,24 @@ async function executeToolInternal(name, input, token, threadTs) {
           return [];
         });
 
+      if (threadTs) {
+        await slackPost(formatDraftSummary({
+          kind: 'new',
+          subject: draft.subject,
+          to: input.to,
+          cc: input.cc,
+          body: input.body,
+          first_time_recipients: firstTimeRecipients,
+          mail_tip_warnings: mailTipWarnings,
+        }), threadTs);
+      }
+
       return {
         draft_id: draft.id,
         subject: draft.subject,
         ...(firstTimeRecipients.length && { first_time_recipients: firstTimeRecipients }),
         ...(mailTipWarnings.length && { mail_tip_warnings: mailTipWarnings }),
-        message: 'New draft created. Awaiting approval.',
+        message: DRAFT_STAGED_MESSAGE,
       };
     }
 
@@ -2550,13 +2633,12 @@ RULES:
 - import_historical_email is only for genuinely historical correspondence Grant is re-filing with its true original date (e.g. from a legacy system or a paper record) — never use it for anything being sent or drafted now.
 - If the current Slack thread contains a forgotten-items list, follow-up references like "#1", "#2", or "number 3" refer to that forgotten-items list unless Grant explicitly says digest item.
 - When Grant refers to a numbered digest item like "#1", "#2", or "number 3", call resolve_digest_item first and use its message_id for any get_email or create_draft_reply call.
-- A thread message reading "✍️ Reply to #N — <sender>" means Grant clicked the ✍️ Reply button on that digest item (handled outside of you) and his NEXT message is what he wants to say back. Call resolve_digest_item for #N, then create_draft_reply with his instructions, and show him the draft for approval — do not send it without approval.
-- When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading. Save the draft, show it in Slack, then ask: "Send it, edit it, or discard?"
+- A thread message reading "✍️ Reply to #N — <sender>" means Grant clicked the ✍️ Reply button on that digest item (handled outside of you) and his NEXT message is what he wants to say back. Call resolve_digest_item for #N, then create_draft_reply with his instructions. Do not send it without approval.
+- When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading.
+- NEVER write out a draft email in your own message and ask Grant to approve it. Writing the text is not the same as saving it: if you skip create_draft_reply/create_new_draft there is no draft in Outlook, and "send it" will fail. The tool saves the draft AND posts a card showing it with the approval prompt, so a draft Grant can approve only exists once the tool has run. After it runs, reply with ONE short sentence and nothing else — do not repeat the draft, the recipients, or the question.
 - If Grant says a numbered digest item is done, waiting, dismissed, or has a draft prepared, call update_digest_item_status.
 - When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
-- When showing a reply draft, always list who it's going To: and CC: (CC recipients from the original are included automatically)
-- If create_draft_reply or create_new_draft returns first_time_recipients, mention it when showing the draft (e.g. "First time emailing newvendor@example.com") — this is informational, not a reason to withhold the draft or ask extra questions
-- If create_draft_reply or create_new_draft returns mail_tip_warnings (e.g. an out-of-office reply, a full mailbox, a delivery restriction), mention it briefly when showing the draft — this is also informational, not a reason to withhold the draft
+- The draft card already lists To:, Cc:, first_time_recipients, and mail_tip_warnings, so you do not need to repeat any of them. They are informational — never a reason to withhold the draft or ask extra questions.
 - If send_draft returns success: false with a rate-limit message, relay it to Grant exactly as given and stop — do not retry the send
 - When Grant says "send it" in a thread, use get_recent_drafts to find the draft, then send_draft to send it
 - If a thread message refers to earlier context (like "send it"), look at the conversation history provided
@@ -2670,6 +2752,13 @@ export async function runAgent(userMessage, threadTs, threadHistory = []) {
   }
   messages.push({ role: 'user', content: userMessage });
 
+  // Names of tools that completed successfully in this run, so the end_turn
+  // reply can be checked against what actually happened. A tool that threw is
+  // deliberately not recorded -- a failed create_draft_reply means there is no
+  // draft, which is exactly what the guard exists to catch.
+  const toolNamesUsed = [];
+  let correctionAttempted = false;
+
   while (true) {
     const response = await callClaude({
       model: DEFAULT_MODEL,
@@ -2687,7 +2776,20 @@ export async function runAgent(userMessage, threadTs, threadHistory = []) {
         .filter(b => b.type === 'text')
         .map(b => b.text)
         .join('\n');
-      await slackPost(text, threadTs);
+
+      const phantom = isPhantomDraftApproval(text, toolNamesUsed);
+      // One corrective turn, never a loop: if the model still can't produce a
+      // draft, Grant gets its answer plus an explicit warning rather than a
+      // silent stall.
+      if (phantom && !correctionAttempted) {
+        correctionAttempted = true;
+        console.error('Phantom draft approval detected -- forcing one corrective turn', { threadTs });
+        messages.push({ role: 'assistant', content: response.content });
+        messages.push({ role: 'user', content: PHANTOM_DRAFT_CORRECTION });
+        continue;
+      }
+
+      await slackPost(phantom ? `${text}\n\n${PHANTOM_DRAFT_WARNING}` : text, threadTs);
       break;
     }
 
@@ -2698,6 +2800,7 @@ export async function runAgent(userMessage, threadTs, threadHistory = []) {
       for (const tu of toolUses) {
         try {
           const result = await executeTool(tu.name, tu.input, token, threadTs);
+          toolNamesUsed.push(tu.name);
           results.push({
             type: 'tool_result',
             tool_use_id: tu.id,
