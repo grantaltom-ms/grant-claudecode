@@ -43,11 +43,13 @@ export function createFakeSupabase(tables = {}) {
       select(_cols, opts = {}) { if (opts.head && opts.count) countOnly = true; return q; },
       insert(rows) { op = 'insert'; inserted = Array.isArray(rows) ? rows : [rows]; return q; },
       gte(col, v) { filters.push((r) => r[col] >= v); return q; },
+      lt(col, v) { filters.push((r) => r[col] < v); return q; },
       update(p) { op = 'update'; patch = p; return q; },
       eq(col, v) { filters.push((r) => r[col] === v); return q; },
       neq(col, v) { filters.push((r) => r[col] !== v); return q; },
       in(col, vs) { filters.push((r) => vs.includes(r[col])); return q; },
       not(col, operator, list) {
+        if (operator === 'is') { filters.push((r) => r[col] != null); return q; }
         const vs = String(list).replace(/^\(|\)$/g, '').split(',');
         filters.push((r) => !vs.includes(String(r[col])));
         return q;

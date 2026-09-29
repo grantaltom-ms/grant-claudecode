@@ -6,6 +6,7 @@ import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { buildTodoBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
 import { formatCarryOverSection, handoffContacts, itemLabel, loadCarryOver, markActionItems, sweepCarryOver } from '../../lib/todo';
+import { cleanupStaleDrafts, writeAutoDrafts } from '../../lib/auto-drafts';
 import { callClaude, responseText } from '../../lib/claude';
 import { isPacificHour, samePacificDay } from '../../lib/schedule';
 import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
@@ -1006,7 +1007,14 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
   // Running to-do list: save today's verified Action Required items as
   // to-dos, then bring back anything still open from earlier digests
   // (closing the ones Grant has already replied to, and very old ones).
-  const todayTodos = await markActionItems(supabase, savedDigestItems, digestItemNumbers, digest);
+  const markedTodos = await markActionItems(supabase, savedDigestItems, digestItemNumbers, digest);
+
+  // Reply drafts: clear out untouched bot drafts from 3+ days ago, then write
+  // a fresh draft in Grant's voice for each of today's items.
+  const draftCleanup = await cleanupStaleDrafts({ supabase, graph, token, ownerEmail: OWNER_EMAIL });
+  const drafted = await writeAutoDrafts({ supabase, graph, token, ownerEmail: OWNER_EMAIL, callClaude, items: markedTodos });
+  const draftedById = new Map(drafted.map(d => [d.id, d]));
+  const todayTodos = markedTodos.map(t => draftedById.get(t.id) || t);
   const carry = await sweepCarryOver({
     supabase,
     graph,
@@ -1017,6 +1025,12 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
   });
   const carrySection = formatCarryOverSection(carry);
   if (carrySection) digest += `\n${carrySection}`;
+  if (drafted.length > 0) {
+    digest += `\n_📝 ${drafted.length} reply draft${drafted.length > 1 ? 's' : ''} waiting in your Outlook Drafts — tap 📝 Review draft on an item to see or change it._`;
+  }
+  if (draftCleanup.deleted > 0) {
+    digest += `\n_🧹 Removed ${draftCleanup.deleted} unused draft${draftCleanup.deleted > 1 ? 's' : ''} older than 3 days (drafts you edited are kept)._`;
+  }
 
   const digestTs = await slackPost(
     digest,
@@ -1041,7 +1055,9 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       todo_today: todayTodos.length,
       todo_carried_over: carry.stillOpen.length,
       todo_closed_replied: carry.replied.length,
-      todo_expired: carry.expired.length
+      todo_expired: carry.expired.length,
+      auto_drafts_written: drafted.length,
+      auto_drafts_cleaned_up: draftCleanup.deleted
     }
   });
 

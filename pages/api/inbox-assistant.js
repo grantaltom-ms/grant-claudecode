@@ -9,6 +9,8 @@ import { listCalendarEvents, getAvailability, freeSlotsFromAvailability, createE
 import { TRIAGE_FOLDERS, listMailFolders, createMailFolder, moveMessageToFolder, resolveTriageFolderId } from '../../lib/mailbox-folders';
 import { importMessage, exportMessageMime } from '../../lib/mail-import';
 import { buildCalendarApprovalBlocks, formatCalendarSummary, formatDraftSummary } from '../../lib/inbox-blocks';
+import { reviseAutoDraft } from '../../lib/auto-drafts';
+import { loadItem as loadTodoItem } from '../../lib/todo-actions';
 
 // Disable Next.js body parsing — need raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
@@ -139,6 +141,20 @@ const EMAIL_TOOLS = [
           type: 'string',
           description: 'Plain English rule, e.g. "Emails from Crystal Li are always Action Required" or "AppFolio automated notifications are always Low Priority". Required for add/remove.',
         },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'auto_draft',
+    description: "Read or rewrite the reply draft the morning digest auto-wrote for a to-do item. Use action 'get' to see the draft (returns draft_id and body; pass draft_id to send_draft when Grant says to send). Use action 'revise' with the COMPLETE new body when Grant asks for changes (\"shorter\", \"more formal\", \"say we'll decide Friday\"): it saves the new draft in Outlook and removes the old one. Identify the item by item_ref (the id in a `ref: ...` tag in this thread) or by item_number (#N on this digest).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'revise'] },
+        item_ref: { type: 'string', description: 'Item id from a `ref:` tag in the thread.' },
+        item_number: { type: 'number', description: 'The #N on this digest, if there is no ref.' },
+        body: { type: 'string', description: "For revise: the full new plain-text reply body in Grant's voice. Keep [bracketed] blanks for facts you don't know." },
       },
       required: ['action'],
     },
@@ -2241,6 +2257,23 @@ async function executeToolInternal(name, input, token, threadTs) {
       return { rules, message: `Done. ${rules.length} active rule(s). Takes effect on the next morning digest.` };
     }
 
+    case 'auto_draft': {
+      let itemId = input.item_ref;
+      if (!itemId && input.item_number) {
+        itemId = (await resolveDigestItem(threadTs, input.item_number)).digest_item.id;
+      }
+      if (!itemId) return { success: false, message: 'Need item_ref or item_number to find the draft.' };
+      const item = await loadTodoItem(supabase, itemId);
+      if (input.action === 'get') {
+        return item.auto_draft_id
+          ? { success: true, draft_id: item.auto_draft_id, body: item.auto_draft_body, item: { sender: item.sender_name || item.sender_email, subject: item.subject } }
+          : { success: false, message: 'That item has no auto-drafted reply (it may have been sent or deleted). Use create_draft_reply to write one.' };
+      }
+      if (!input.body?.trim()) return { success: false, message: 'revise needs the full new body.' };
+      const revised = await reviseAutoDraft({ supabase, graph, token, ownerEmail: OWNER_EMAIL, item, body: input.body.trim() });
+      return { success: true, draft_id: revised.draft_id, body: input.body.trim(), message: 'Draft updated in Outlook Drafts. Show Grant the new text and ask whether to send it.' };
+    }
+
     case 'delete_draft': {
       await graph(token, `${base}/messages/${input.draft_id}`, 'DELETE');
       const candidate = await markDraftCandidateByDraftId(input.draft_id, 'dismissed');
@@ -2637,6 +2670,7 @@ RULES:
 - When drafting a REPLY, you MUST first search for or retrieve the original email to get its message ID, then use create_draft_reply with that ID. Never use create_new_draft for a reply — this breaks email threading.
 - NEVER write out a draft email in your own message and ask Grant to approve it. Writing the text is not the same as saving it: if you skip create_draft_reply/create_new_draft there is no draft in Outlook, and "send it" will fail. The tool saves the draft AND posts a card showing it with the approval prompt, so a draft Grant can approve only exists once the tool has run. After it runs, reply with ONE short sentence and nothing else — do not repeat the draft, the recipients, or the question.
 - If Grant says a numbered digest item is done, waiting, dismissed, or has a draft prepared, call update_digest_item_status.
+- The morning digest auto-writes reply drafts for to-do items. When Grant asks to change one ("make it shorter", "add that we'll decide Friday"), call auto_draft with action 'revise' and the complete rewritten body, then show him the new text in full. When he says "send it" for an auto-draft, call auto_draft 'get' for the draft_id if you don't already have it, then send_draft. If his correction is about his general style (not just this email), also call record_draft_feedback so future drafts learn it.
 - When Grant says "discard", "delete the draft", or "never mind", use get_recent_drafts to find the draft ID, then use delete_draft to remove it.
 - The draft card already lists To:, Cc:, first_time_recipients, and mail_tip_warnings, so you do not need to repeat any of them. They are informational — never a reason to withhold the draft or ask extra questions.
 - If send_draft returns success: false with a rate-limit message, relay it to Grant exactly as given and stop — do not retry the send
