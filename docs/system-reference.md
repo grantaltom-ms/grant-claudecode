@@ -465,3 +465,17 @@ An item closes when Grant clicks Done (`done`), hands it off (`handed_off`, the 
 Each morning, after the to-do list is built, the digest writes a reply draft for each of today's Action Required items (up to 8, 3 at a time) and saves it as a real Outlook reply draft via `createReply` (threaded, CCs preserved). Voice comes from Grant's recent Sent Items (quoted history stripped), his earlier messages in the thread, and `draft_feedback`. The prompt forbids invented facts: unknown amounts, dates, and decisions are left as `[bracketed]` blanks. Nothing is sent; `send_draft` still requires Grant's approval.
 
 Rows with a draft show **📝 Review draft** (posts the text with a `ref:` tag) and **🗑 Delete draft** (confirm-protected). In the thread, the `auto_draft` tool reads (`get`) or rewrites (`revise`, which writes the new draft before deleting the old one) a draft. Done/hand-off removes an untouched draft. Each morning `cleanupStaleDrafts` deletes bot drafts older than 3 days **only if** Graph's `lastModifiedDateTime` still matches what the bot saved, so drafts Grant edited are never deleted. Columns: migration `027_digest_auto_drafts.sql`.
+
+### Auto-filing noise (`lib/auto-file.js`)
+
+Each morning, after triage, the model proposes clear noise from the day's emails: automated confirmations, newsletters, receipts, and auto-replies. Hard rules in `keepReason()` have the final say and keep an email in the Inbox if any of these apply:
+- Grant has ever written to the sender.
+- The digest text mentions it.
+- It failed the payment-spoofing auth check.
+- It's marked high importance.
+- It mentions money, a deadline, legal matters, or an emergency (invoice, past due, motion, attorney, leak, and so on).
+- Its sender is in `auto_file_exceptions`.
+
+Kept emails move into the Outlook folder **Filed by Bot**, a child of Inbox created on first use. It's `TRIAGE_FOLDERS.filed_by_bot`. The limit is 40 per day. If the exceptions list can't be read, nothing is filed.
+
+The digest footer says how many emails were filed, and a **🗂 See what I filed** button lists them in the thread, each with **↩️ Put back**. Put back moves the email to the Inbox and adds its sender to `auto_file_exceptions`. Graph gives a moved message a new id, so it's stored in `filed_message_id` (migration `028_digest_auto_file.sql`).

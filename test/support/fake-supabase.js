@@ -15,10 +15,19 @@ export function createFakeSupabase(tables = {}) {
     let single = false;
     let countOnly = false;
     let inserted = null;
+    let conflictKeys = [];
 
     const matches = (row) => filters.every((f) => f(row));
     const run = () => {
       const rows = db[table] || (db[table] = []);
+      if (op === 'upsert') {
+        for (const r of inserted) {
+          const existing = rows.find((x) => conflictKeys.every((k) => x[k] === r[k]));
+          if (existing) Object.assign(existing, r);
+          else rows.push({ ...r });
+        }
+        return { data: null, error: null };
+      }
       if (op === 'insert') {
         rows.push(...inserted.map((r) => ({ ...r })));
         return { data: null, error: null };
@@ -42,6 +51,12 @@ export function createFakeSupabase(tables = {}) {
     const q = {
       select(_cols, opts = {}) { if (opts.head && opts.count) countOnly = true; return q; },
       insert(rows) { op = 'insert'; inserted = Array.isArray(rows) ? rows : [rows]; return q; },
+      upsert(rows, { onConflict = 'id' } = {}) {
+        op = 'upsert';
+        inserted = Array.isArray(rows) ? rows : [rows];
+        conflictKeys = onConflict.split(',').map((k) => k.trim());
+        return q;
+      },
       gte(col, v) { filters.push((r) => r[col] >= v); return q; },
       lt(col, v) { filters.push((r) => r[col] < v); return q; },
       update(p) { op = 'update'; patch = p; return q; },
