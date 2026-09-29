@@ -28,7 +28,7 @@ Everything lives in a single Next.js project deployed on Vercel. The system is b
 | Runtime | Vercel Serverless Functions (Node.js) |
 | Framework | Next.js 14 (Pages Router) |
 | Email source | Microsoft 365 Outlook via Microsoft Graph API |
-| AI | Anthropic Claude (claude-sonnet-4-6) |
+| AI | Anthropic Claude (claude-sonnet-5-5) |
 | Interface | Slack (Bot in #inbox-digest, channel ID: C0AS84GA607) |
 | Scheduling | Vercel Cron (Pro plan required) |
 | Background tasks | `@vercel/functions` `waitUntil` |
