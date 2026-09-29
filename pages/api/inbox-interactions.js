@@ -8,7 +8,10 @@
 
 import { waitUntil } from '@vercel/functions';
 import { slackPost as _slackPost, slackUpdateMessage } from '../../lib/slack';
-import { getGraphToken } from '../../lib/graph';
+import { getGraphToken, graph } from '../../lib/graph';
+import { supabase } from '../../lib/supabase';
+import { isTodoAction, runTodoAction, resolveTodoRow, loadItem } from '../../lib/todo-actions';
+import { itemLabel } from '../../lib/todo';
 import { CHANNEL_ID, APPROVER_USER_ID, verifySlackSignature, executeTool } from './inbox-assistant';
 import {
   CALENDAR_ACTIONS,
@@ -170,6 +173,28 @@ export async function handleEmailInteraction(payload) {
   } catch {
     value = {};
   }
+
+  // To-do rows carry the exact digest_items id, so there is no [#N] mapping
+  // to corroborate -- and carried-over items belong to an older digest, where
+  // their #N would point at the wrong row on today's thread.
+  if (value.itemId) {
+    try {
+      const item = await loadItem(supabase, value.itemId);
+      const received = item.received_at
+        ? ` (received ${new Date(item.received_at).toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric' })})`
+        : '';
+      await post(
+        `✍️ *Reply to ${itemLabel(item)}*${received}\n`
+          + "What do you want to say? Reply in this thread and I'll draft it for your approval.",
+        threadTs
+      );
+      return { handled: true, action: actionId, result: { success: true, item_id: item.id } };
+    } catch (err) {
+      await post(`⚠️ Couldn't open that reply: ${err.message}`, threadTs);
+      return { handled: true, action: actionId, result: { success: false, message: err.message } };
+    }
+  }
+
   const itemNumber = value.itemNumber;
   if (!itemNumber) {
     await post('⚠️ That button has no digest item attached.', threadTs);
@@ -222,8 +247,51 @@ export async function handleEmailInteraction(payload) {
   }
 }
 
+const OWNER_EMAIL = 'grant@milestoneproperties.net';
+
+// ✅ Done / 💤 Tomorrow / Hand off on a digest to-do row.
+export async function handleTodoInteraction(payload) {
+  if (payload.channel?.id !== CHANNEL_ID) return { handled: false, reason: 'wrong_channel' };
+  const message = payload.message || {};
+  const threadTs = message.thread_ts || message.ts;
+  const actionId = payload.actions?.[0]?.action_id || '';
+
+  if (payload.user?.id !== APPROVER_USER_ID) {
+    await post(`⚠️ Ignored a button click from <@${payload.user?.id}> — only <@${APPROVER_USER_ID}> can act on digest items.`, threadTs);
+    return { handled: true, action: actionId, result: { success: false, message: 'unauthorized_clicker' } };
+  }
+
+  try {
+    const { itemId, outcome } = await runTodoAction({
+      payload,
+      supabase,
+      graph,
+      getToken: getGraphToken,
+      ownerEmail: OWNER_EMAIL,
+    });
+    try {
+      await slackUpdateMessage(
+        process.env.SLACK_BOT_TOKEN,
+        CHANNEL_ID,
+        message.ts,
+        message.text,
+        resolveTodoRow(message.blocks, itemId, outcome)
+      );
+    } catch (err) {
+      // The status change already happened; say so in the thread instead.
+      console.error('todo row update failed:', err.message);
+      await post(outcome, threadTs);
+    }
+    return { handled: true, action: actionId, result: { success: true, item_id: itemId } };
+  } catch (err) {
+    await post(`⚠️ ${err.message}`, threadTs);
+    return { handled: true, action: actionId, result: { success: false, message: err.message } };
+  }
+}
+
 export async function handleInteraction(payload) {
   const actionId = payload.actions?.[0]?.action_id || '';
+  if (isTodoAction(actionId)) return handleTodoInteraction(payload);
   if (actionId.startsWith('email_')) return handleEmailInteraction(payload);
   return handleCalendarInteraction(payload);
 }

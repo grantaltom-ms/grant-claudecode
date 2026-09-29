@@ -4,7 +4,8 @@ import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
 import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
 import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
-import { buildDigestBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
+import { buildTodoBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
+import { formatCarryOverSection, handoffContacts, itemLabel, loadCarryOver, markActionItems, sweepCarryOver } from '../../lib/todo';
 import { callClaude, responseText } from '../../lib/claude';
 import { isPacificHour, samePacificDay } from '../../lib/schedule';
 import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
@@ -1002,7 +1003,26 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       claimed_item_numbers: claimedItemNumbers,
     });
   }
-  const digestTs = await slackPost(digest, null, buildDigestBlocks(digest, digestItemNumbers));
+  // Running to-do list: save today's verified Action Required items as
+  // to-dos, then bring back anything still open from earlier digests
+  // (closing the ones Grant has already replied to, and very old ones).
+  const todayTodos = await markActionItems(supabase, savedDigestItems, digestItemNumbers, digest);
+  const carry = await sweepCarryOver({
+    supabase,
+    graph,
+    token,
+    ownerEmail: OWNER_EMAIL,
+    items: (await loadCarryOver(supabase, digestRun?.id))
+      .filter(item => !todayTodos.some(t => t.graph_conversation_id && t.graph_conversation_id === item.graph_conversation_id)),
+  });
+  const carrySection = formatCarryOverSection(carry);
+  if (carrySection) digest += `\n${carrySection}`;
+
+  const digestTs = await slackPost(
+    digest,
+    null,
+    buildTodoBlocks(digest, todayTodos, carry.stillOpen, handoffContacts(), itemLabel)
+  );
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
     run_completed_at: new Date().toISOString(),
@@ -1017,12 +1037,16 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       skipped_entity_extractions: skippedEntityCount,
       auth_flagged_count: authFlaggedEmails.length,
       history_enriched_count: historyEnrichedCount,
-      delta_resynced: deltaResynced
+      delta_resynced: deltaResynced,
+      todo_today: todayTodos.length,
+      todo_carried_over: carry.stillOpen.length,
+      todo_closed_replied: carry.replied.length,
+      todo_expired: carry.expired.length
     }
   });
 
   await slackPost(
-    '_Hit ✍️ Reply on any numbered item above to start a response, or reply here — e.g. "what does #3 say", "mark #2 as done"_',
+    '_Each item above has buttons: ✍️ Reply, ✅ Done, 💤 Tomorrow, or hand it off. Anything left open comes back tomorrow under 📌 Still open. You can also reply here — e.g. "what does #3 say"._',
     digestTs
   );
 }
