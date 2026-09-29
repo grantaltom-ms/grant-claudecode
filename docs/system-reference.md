@@ -11,7 +11,7 @@ _Last verified against code: 2026-07-27._
 
 This is a fully custom AI email assistant for Grant Carlson (grant@milestoneproperties.net) at Milestone Properties. It has three parts:
 
-1. **Morning Digest** — a Vercel Cron job (`0 18 * * *` UTC — 11:00 AM PDT / 10:00 AM PST, see "Cron Schedule" below) that reads the last 24 hours of email, filters spam, triages the rest into priority categories, and posts a structured summary to the Slack channel #inbox-digest.
+1. **Morning Digest** — a Vercel Cron job at 6:30 AM Pacific year-round (fires at 13:30 and 14:30 UTC and runs only in the 6 AM Pacific hour; at most one digest per day, `?force=1` to re-run; see "Cron Schedule" below) that reads the last 24 hours of email, filters spam, triages the rest into priority categories, and posts a structured summary to the Slack channel #inbox-digest.
 
 2. **Interactive Assistant** — Grant can message the bot directly in #inbox-digest at any time. The bot can read, search, summarize, and draft emails, then send them after Grant explicitly approves.
 
@@ -123,9 +123,9 @@ Defined in `vercel.json`, which is the source of truth — see that file directl
 
 | Job | UTC schedule | Pacific time (PDT) | Pacific time (PST) |
 |---|---|---|---|
-| `/api/digest` | `0 18 * * *` | 11:00 AM | 10:00 AM |
+| `/api/digest` | `30 13,14 * * *` (runs only in the 6 AM Pacific hour) | 6:30 AM | 6:30 AM |
 | `/api/memory-maintenance` | `0 19 * * *` | 12:00 PM | 11:00 AM |
-| `/api/weekday-one-priority` | `0 16 * * 1-5` | 9:00 AM (weekdays) | 8:00 AM (weekdays) |
+| `/api/weekday-one-priority` | `25 13,14 * * 1-5` (runs only in the 6 AM Pacific hour) | 6:25 AM (weekdays) | 6:25 AM (weekdays) |
 
 Vercel Cron runs on UTC with no daylight-saving adjustment, so each job's Pacific time shifts an hour twice a year. Cron requires a Vercel Pro plan. `vercel.json` also sets explicit `maxDuration` values per function under its `functions` block — check that file for current values, since digest and the backfill endpoints do enough sequential Claude/Graph work that they need more than Vercel's default timeout.
 

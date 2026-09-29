@@ -6,6 +6,7 @@ import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { buildDigestBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
 import { callClaude, responseText } from '../../lib/claude';
+import { isPacificHour, samePacificDay } from '../../lib/schedule';
 import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
@@ -141,6 +142,32 @@ async function saveEmailToMemory(email) {
   }
 
   return data;
+}
+
+// Decides whether this cron fire should post a digest. Vercel fires at both
+// 13:30 and 14:30 UTC (see vercel.json) so exactly one lands at 6:30 AM
+// Pacific whether or not daylight saving is on; the other is skipped here.
+// A day that already has a posted digest is skipped too -- the 9/28 digest
+// was posted twice. ?force=1 bypasses both, for a manual re-run.
+export async function digestGate(force = false, now = new Date()) {
+  if (force) return { run: true, reason: 'forced' };
+  if (!isPacificHour(now, 6)) return { run: false, reason: 'not the 6 AM Pacific hour' };
+  const { data, error } = await supabase
+    .from('digest_runs')
+    .select('run_started_at, status')
+    .eq('owner_email', OWNER_EMAIL)
+    .eq('status', 'posted')
+    .order('run_started_at', { ascending: false })
+    .limit(1);
+  if (error) {
+    // Fail open: a missed digest is worse than a rare duplicate.
+    console.error('digestGate: could not check for an earlier run', { error });
+    return { run: true, reason: 'run check failed; posting anyway' };
+  }
+  if (samePacificDay(data?.[0]?.run_started_at, now)) {
+    return { run: false, reason: 'already posted today' };
+  }
+  return { run: true, reason: 'scheduled' };
 }
 
 async function createDigestRun({ totalEmails, savedEmails }) {
@@ -1006,6 +1033,9 @@ export default async function handler(req, res) {
   if (req.method !== 'POST' && req.method !== 'GET') return res.status(405).end();
 
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+
+  const gate = await digestGate(req.query?.force === '1');
+  if (!gate.run) return res.status(200).json({ ok: true, skipped: true, reason: gate.reason });
 
   res.status(200).json({ ok: true });
 

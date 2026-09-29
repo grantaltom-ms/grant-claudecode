@@ -21,7 +21,7 @@
   "crons": [
     {
       "path": "/api/digest",
-      "schedule": "0 18 * * *"
+      "schedule": "30 13,14 * * *"
     },
     {
       "path": "/api/memory-maintenance",
@@ -29,7 +29,7 @@
     },
     {
       "path": "/api/weekday-one-priority",
-      "schedule": "0 16 * * 1-5"
+      "schedule": "25 13,14 * * 1-5"
     }
   ]
 }

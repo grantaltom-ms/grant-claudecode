@@ -1,5 +1,6 @@
 import { supabase } from '../../lib/supabase';
 import { callClaude } from '../../lib/claude';
+import { clampScore, isPacificHour } from '../../lib/schedule';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
@@ -324,7 +325,10 @@ Choose one concrete activity, not a vague theme. Optimize for organization-level
 Do not choose routine email triage unless it clearly unlocks a bigger outcome. Prefer an activity that Grant can start today. Be evidence-based and humble.`,
     messages: [{
       role: 'user',
-      content: `Today is ${suggestionDate} in ${TIME_ZONE}.
+      content: `Today is ${suggestionDate} in ${TIME_ZONE}. This is posted at about 6:25 AM, before Grant starts work.
+
+Rules for "suggested_time_block": it must be a specific window TODAY that starts at 7:00 AM or later (e.g. "8:00-9:00 AM"). Never suggest a time that has already passed.
+Rules for "scoring": every score is an integer from 1 (lowest) to 5 (highest); "total" is the sum of the other six.
 
 Return ONLY valid JSON with this shape:
 {
@@ -354,10 +358,9 @@ ${JSON.stringify(compact, null, 2)}`,
   return parsed;
 }
 
-function formatSlackMessage(suggestion, suggestionDate) {
-  const confidence = suggestion.scoring?.confidence
-    ? `*Confidence:* ${suggestion.scoring.confidence}/5`
-    : null;
+export function formatSlackMessage(suggestion, suggestionDate) {
+  const score = clampScore(suggestion.scoring?.confidence);
+  const confidence = score ? `*Confidence:* ${score}/5` : null;
   return [
     `*One Priority* (${suggestionDate})`,
     `*${truncate(suggestion.title || 'Highest-leverage activity', 80)}*`,
@@ -423,6 +426,11 @@ export default async function handler(req, res) {
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
 
   const local = localDateParts();
+  // Scheduled at both 13:25 and 14:25 UTC (vercel.json) so one run lands at
+  // 6:25 AM Pacific year-round, just before the 6:30 digest; skip the other.
+  if (req.query.force !== '1' && !isPacificHour(new Date(), 6)) {
+    return res.status(200).json({ ok: true, skipped: true, reason: 'not the 6 AM Pacific hour' });
+  }
   if (!isWeekday(local.weekday) && req.query.force !== '1') {
     return res.status(200).json({
       ok: true,

@@ -95,9 +95,9 @@ Set in `vercel.json`. Vercel Cron runs on UTC, which is worth knowing because th
 
 | Job | UTC schedule | Pacific time (PDT, summer) | Pacific time (PST, winter) |
 |---|---|---|---|
-| `/api/digest` | `0 18 * * *` | 11:00 AM | 10:00 AM |
+| `/api/digest` | `30 13,14 * * *` (runs only in the 6 AM Pacific hour) | 6:30 AM | 6:30 AM |
 | `/api/memory-maintenance` | `0 19 * * *` | 12:00 PM | 11:00 AM |
-| `/api/weekday-one-priority` | `0 16 * * 1-5` | 9:00 AM (weekdays) | 8:00 AM (weekdays) |
+| `/api/weekday-one-priority` | `25 13,14 * * 1-5` (runs only in the 6 AM Pacific hour) | 6:25 AM (weekdays) | 6:25 AM (weekdays) |
 
 If you want the digest at a specific Pacific time year-round, you'll need to update the UTC expression twice a year, or accept the hour drift.
 
