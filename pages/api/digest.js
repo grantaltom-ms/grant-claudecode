@@ -4,7 +4,9 @@ import { getGraphToken, graph, walkDeltaPages } from '../../lib/graph';
 import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/email-parse';
 import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
-import { buildTodoBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
+import { buildTodoBlocks, extractDigestItemNumbers, filedButtonBlock, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
+import { autoFileNoise } from '../../lib/auto-file';
+import { resolveTriageFolderId } from '../../lib/mailbox-folders';
 import { formatCarryOverSection, handoffContacts, itemLabel, loadCarryOver, markActionItems, sweepCarryOver } from '../../lib/todo';
 import { cleanupStaleDrafts, writeAutoDrafts } from '../../lib/auto-drafts';
 import { callClaude, responseText } from '../../lib/claude';
@@ -1032,10 +1034,29 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     digest += `\n_🧹 Removed ${draftCleanup.deleted} unused draft${draftCleanup.deleted > 1 ? 's' : ''} older than 3 days (drafts you edited are kept)._`;
   }
 
+  // Auto-file clear noise into "Filed by Bot" (never anything the digest
+  // surfaced, anyone Grant writes to, or anything about money/deadlines).
+  const filing = await autoFileNoise({
+    supabase,
+    graph,
+    token,
+    ownerEmail: OWNER_EMAIL,
+    callClaude,
+    emails: filteredEmails,
+    savedItems: savedDigestItems,
+    correspondentStats,
+    surfacedText: digest,
+    authFlaggedIds: new Set(authFlaggedEmails.map(({ email }) => email.id)),
+    resolveFolderId: () => resolveTriageFolderId(supabase, token, OWNER_EMAIL, 'filed_by_bot'),
+  });
+  if (filing.filed.length > 0) {
+    digest += `\n_🗂 Filed ${filing.filed.length} email${filing.filed.length > 1 ? 's' : ''} into *Filed by Bot* in Outlook (receipts, newsletters, automated notices). Nothing was deleted._`;
+  }
+
   const digestTs = await slackPost(
     digest,
     null,
-    buildTodoBlocks(digest, todayTodos, carry.stillOpen, handoffContacts(), itemLabel)
+    buildTodoBlocks(digest, todayTodos, carry.stillOpen, handoffContacts(), itemLabel, filedButtonBlock(digestRun?.id, filing.filed.length))
   );
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
@@ -1057,7 +1078,9 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
       todo_closed_replied: carry.replied.length,
       todo_expired: carry.expired.length,
       auto_drafts_written: drafted.length,
-      auto_drafts_cleaned_up: draftCleanup.deleted
+      auto_drafts_cleaned_up: draftCleanup.deleted,
+      auto_filed: filing.filed.length,
+      auto_file_kept: filing.kept.length
     }
   });
 

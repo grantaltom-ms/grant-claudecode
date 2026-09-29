@@ -228,3 +228,59 @@ describe('digest auto-drafts', () => {
     for (const row of rows) expect(row.elements[0].text.text).toBe('📝 Review draft');
   });
 });
+
+describe('digest auto-filing', () => {
+  function mockFiling(digestText, posts, moves) {
+    mockDigestNetwork(digestText, posts);
+    server.use(
+      http.post('https://api.anthropic.com/v1/messages', async ({ request }) => {
+        const body = await request.json();
+        const system = typeof body.system === 'string' ? body.system : (body.system?.[0]?.text || '');
+        const reply = (text) => HttpResponse.json({
+          id: 'm', type: 'message', role: 'assistant',
+          content: [{ type: 'thinking', thinking: '', signature: 's' }, { type: 'text', text }],
+          stop_reason: 'end_turn',
+        });
+        if (system.includes('CLEAR inbox noise')) return reply('[0, 1, 2]'); // model over-reaches on purpose
+        if (system.includes('You draft email replies')) return reply(JSON.stringify({ needs_reply: false, body: '' }));
+        if (system.includes('spam filter')) return reply('[]');
+        if (system.includes('Extract durable business entities')) return reply('[]');
+        if (system.includes('summarize business email threads')) return reply(JSON.stringify({ current_summary: 's', open_items: [], status: 'active' }));
+        if (system.includes('morning email triage assistant')) return reply(digestText);
+        return reply('(unhandled)');
+      }),
+      http.get('https://graph.microsoft.com/v1.0/users/:email/messages', () => HttpResponse.json({ value: [] })),
+      http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/Inbox/childFolders', () => HttpResponse.json({ value: [] })),
+      http.post('https://graph.microsoft.com/v1.0/users/:email/mailFolders/Inbox/childFolders', () => HttpResponse.json({ id: 'folder-filed', displayName: 'Filed by Bot' })),
+      http.post('https://graph.microsoft.com/v1.0/users/:email/messages/:id/move', async ({ params, request }) => {
+        moves.push({ id: params.id, to: (await request.json()).destinationId });
+        return HttpResponse.json({ id: `moved-${params.id}` });
+      })
+    );
+  }
+
+  it('never files anything the digest showed, even if the model suggests it', async () => {
+    const posts = [];
+    const moves = [];
+    mockFiling(ACTIONABLE_DIGEST, posts, moves); // mentions Harper, Scott, and Rhoda
+    await runDigest();
+    expect(moves).toEqual([]);
+    const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
+    expect(digestPost.text).not.toContain('Filed');
+  });
+
+  it('files unmentioned noise into Filed by Bot and offers "See what I filed"', async () => {
+    const posts = [];
+    const moves = [];
+    mockFiling(NOTHING_ACTIONABLE_DIGEST.replace('- Rhoda Carlson — insurance renewal planning', ''), posts, moves);
+    await runDigest();
+    // e1 is a law firm's "Emergency motion filed" -- kept by the hard rules
+    // even though the model suggested it.
+    expect(moves.map((m) => m.id).sort()).toEqual(['e2', 'e3']);
+    expect(moves.every((m) => m.to === 'folder-filed')).toBe(true);
+    const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
+    expect(digestPost.text).toContain('Filed 2 emails into *Filed by Bot*');
+    const btn = digestPost.blocks.find((b) => b.block_id === 'filed_list').elements[0];
+    expect(btn.text.text).toBe('🗂 See what I filed (2)');
+  });
+});

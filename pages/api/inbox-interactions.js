@@ -12,6 +12,8 @@ import { getGraphToken, graph } from '../../lib/graph';
 import { supabase } from '../../lib/supabase';
 import { isTodoAction, runTodoAction, resolveTodoRow, dropDraftFromRow, loadItem } from '../../lib/todo-actions';
 import { itemLabel } from '../../lib/todo';
+import { putBack } from '../../lib/auto-file';
+import { buildFiledListBlocks, markFiledRowRestored } from '../../lib/inbox-blocks';
 import { CHANNEL_ID, APPROVER_USER_ID, verifySlackSignature, executeTool } from './inbox-assistant';
 import {
   CALENDAR_ACTIONS,
@@ -296,8 +298,55 @@ export async function handleTodoInteraction(payload) {
   }
 }
 
+// 🗂 See what I filed / ↩️ Put back.
+export async function handleFiledInteraction(payload) {
+  if (payload.channel?.id !== CHANNEL_ID) return { handled: false, reason: 'wrong_channel' };
+  const message = payload.message || {};
+  const threadTs = message.thread_ts || message.ts;
+  const actionId = payload.actions?.[0]?.action_id || '';
+  if (payload.user?.id !== APPROVER_USER_ID) {
+    await post(`⚠️ Ignored a button click from <@${payload.user?.id}> — only <@${APPROVER_USER_ID}> can act on digest items.`, threadTs);
+    return { handled: true, action: actionId, result: { success: false, message: 'unauthorized_clicker' } };
+  }
+  let value = {};
+  try { value = JSON.parse(payload.actions[0].value || '{}'); } catch { value = {}; }
+
+  try {
+    if (actionId.startsWith(EMAIL_ACTIONS.FILED_LIST)) {
+      const { data, error } = await supabase
+        .from('digest_items')
+        .select('id, sender_name, sender_email, subject')
+        .eq('digest_run_id', value.runId)
+        .eq('action_status', 'filed')
+        .order('item_number', { ascending: true });
+      if (error) throw new Error(`Couldn't load the filed list: ${error.message}`);
+      if (!data?.length) {
+        await post('Nothing from this digest is still in Filed by Bot.', threadTs);
+      } else {
+        await _slackPost(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, `🗂 Filed by Bot — ${data.length} emails`, threadTs, buildFiledListBlocks(data));
+      }
+      return { handled: true, action: actionId, result: { success: true, count: data?.length || 0 } };
+    }
+
+    const item = await loadItem(supabase, value.itemId);
+    const { data: full } = await supabase
+      .from('digest_items')
+      .select('id, action_status, filed_message_id, graph_message_id, sender_email')
+      .eq('id', value.itemId)
+      .maybeSingle();
+    await putBack({ supabase, graph, token: await getGraphToken(), ownerEmail: OWNER_EMAIL, item: { ...item, ...full } });
+    await slackUpdateMessage(process.env.SLACK_BOT_TOKEN, CHANNEL_ID, message.ts, message.text, markFiledRowRestored(message.blocks, value.itemId))
+      .catch(() => post(`↩️ Put back: ${itemLabel(item)}. I won't file that sender again.`, threadTs));
+    return { handled: true, action: actionId, result: { success: true, item_id: value.itemId } };
+  } catch (err) {
+    await post(`⚠️ ${err.message}`, threadTs);
+    return { handled: true, action: actionId, result: { success: false, message: err.message } };
+  }
+}
+
 export async function handleInteraction(payload) {
   const actionId = payload.actions?.[0]?.action_id || '';
+  if (actionId.startsWith('email_filed_')) return handleFiledInteraction(payload);
   if (isTodoAction(actionId)) return handleTodoInteraction(payload);
   if (actionId.startsWith('email_')) return handleEmailInteraction(payload);
   return handleCalendarInteraction(payload);
