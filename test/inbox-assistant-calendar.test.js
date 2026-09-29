@@ -322,7 +322,7 @@ describe('runAgent grounds relative dates in the real current date', () => {
           id: 'msg_test',
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'text', text: 'ok' }],
+          content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'ok' }],
           stop_reason: 'end_turn',
         });
       })
