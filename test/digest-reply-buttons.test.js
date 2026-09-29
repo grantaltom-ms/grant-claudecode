@@ -187,3 +187,44 @@ describe('digest reply buttons', () => {
     expect(followUp).toBeDefined();
   });
 });
+
+describe('digest auto-drafts', () => {
+  it('writes a reply draft for each Action Required item and offers 📝 Review draft', async () => {
+    const posts = [];
+    const createReplies = [];
+    mockDigestNetwork(ACTIONABLE_DIGEST, posts);
+    server.use(
+      http.post('https://api.anthropic.com/v1/messages', async ({ request }) => {
+        const body = await request.json();
+        const system = typeof body.system === 'string' ? body.system : (body.system?.[0]?.text || '');
+        const reply = (text) => HttpResponse.json({
+          id: 'm', type: 'message', role: 'assistant',
+          content: [{ type: 'thinking', thinking: '', signature: 's' }, { type: 'text', text }],
+          stop_reason: 'end_turn',
+        });
+        if (system.includes('You draft email replies')) {
+          return reply(JSON.stringify({ needs_reply: true, body: 'Thanks — on it.\n\nGrant', blanks: [] }));
+        }
+        if (system.includes('spam filter')) return reply('[]');
+        if (system.includes('Extract durable business entities')) return reply('[]');
+        if (system.includes('summarize business email threads')) return reply(JSON.stringify({ current_summary: 's', open_items: [], status: 'active' }));
+        if (system.includes('morning email triage assistant')) return reply(ACTIONABLE_DIGEST);
+        return reply('(unhandled)');
+      }),
+      http.get('https://graph.microsoft.com/v1.0/users/:email/messages', () => HttpResponse.json({ value: [] })),
+      http.post('https://graph.microsoft.com/v1.0/users/:email/messages/:id/createReply', async ({ params, request }) => {
+        createReplies.push({ id: params.id, body: await request.json() });
+        return HttpResponse.json({ id: `draft-for-${params.id}`, lastModifiedDateTime: '2026-10-01T13:31:00Z' });
+      })
+    );
+
+    await runDigest();
+
+    expect(createReplies.map((c) => c.id).sort()).toEqual(['e1', 'e2']);
+    expect(createReplies[0].body.comment).toContain('Thanks — on it.');
+    const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
+    expect(digestPost.text).toContain('2 reply drafts waiting in your Outlook Drafts');
+    const rows = digestPost.blocks.filter((b) => b.type === 'actions');
+    for (const row of rows) expect(row.elements[0].text.text).toBe('📝 Review draft');
+  });
+});

@@ -10,7 +10,7 @@ import { waitUntil } from '@vercel/functions';
 import { slackPost as _slackPost, slackUpdateMessage } from '../../lib/slack';
 import { getGraphToken, graph } from '../../lib/graph';
 import { supabase } from '../../lib/supabase';
-import { isTodoAction, runTodoAction, resolveTodoRow, loadItem } from '../../lib/todo-actions';
+import { isTodoAction, runTodoAction, resolveTodoRow, dropDraftFromRow, loadItem } from '../../lib/todo-actions';
 import { itemLabel } from '../../lib/todo';
 import { CHANNEL_ID, APPROVER_USER_ID, verifySlackSignature, executeTool } from './inbox-assistant';
 import {
@@ -262,21 +262,28 @@ export async function handleTodoInteraction(payload) {
   }
 
   try {
-    const { itemId, outcome } = await runTodoAction({
+    const { itemId, outcome, mode } = await runTodoAction({
       payload,
       supabase,
       graph,
       getToken: getGraphToken,
       ownerEmail: OWNER_EMAIL,
     });
+    if (mode === 'post') {
+      await post(outcome, threadTs);
+      return { handled: true, action: actionId, result: { success: true, item_id: itemId } };
+    }
     try {
       await slackUpdateMessage(
         process.env.SLACK_BOT_TOKEN,
         CHANNEL_ID,
         message.ts,
         message.text,
-        resolveTodoRow(message.blocks, itemId, outcome)
+        mode === 'dropDraft'
+          ? dropDraftFromRow(message.blocks, itemId)
+          : resolveTodoRow(message.blocks, itemId, outcome)
       );
+      if (mode === 'dropDraft') await post(outcome, threadTs);
     } catch (err) {
       // The status change already happened; say so in the thread instead.
       console.error('todo row update failed:', err.message);
