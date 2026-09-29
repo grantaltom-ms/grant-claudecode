@@ -9,7 +9,7 @@ function textResponse(text) {
     id: 'msg_test',
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text }],
+    content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text }],
     stop_reason: 'end_turn',
   });
 }
@@ -71,6 +71,7 @@ describe('digest triage classification', () => {
     // Structure, not exact wording: the deadline email is present under Action Required...
     expect(digest).toContain('🔴 Action Required');
     expect(digest).toContain('BECU Loan Documents');
+    expect(digest).not.toMatch(/undefined/);
 
     // ...the obvious spam/cold-pitch sender never appears in the posted digest...
     expect(digest).not.toContain('Totally Legit Marketing');
@@ -105,5 +106,10 @@ describe('digest triage classification', () => {
     const digest = posts.find(text => text.includes('Morning Digest'));
     expect(digest).toBeDefined();
     expect(digest).toMatch(/Volume cap hit today/i);
+    // Regression (2026-09-29): Sonnet 5.5 replies start with a thinking block,
+    // and reading content[0].text posted the cap note under a bare "undefined"
+    // with the whole triage missing.
+    expect(digest).not.toMatch(/undefined/);
+    expect(digest).toContain('🔴 Action Required');
   });
 });

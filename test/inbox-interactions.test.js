@@ -237,7 +237,7 @@ describe('handleCalendarInteraction: calendar_edit', () => {
           id: 'msg_unexpected',
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'text', text: 'should not be called' }],
+          content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'should not be called' }],
           stop_reason: 'end_turn',
         });
       })
@@ -335,7 +335,7 @@ describe('handleEmailInteraction: ✍️ Reply on a digest item', () => {
           id: 'msg_unexpected',
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'text', text: 'should not be called' }],
+          content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'should not be called' }],
           stop_reason: 'end_turn',
         });
       })

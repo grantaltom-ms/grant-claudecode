@@ -216,17 +216,17 @@ describe('runAgent refuses to ship a draft-approval prompt with no draft behind 
     );
 
     const { seen } = scriptAnthropic([
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: PHANTOM_TEXT }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: PHANTOM_TEXT }] },
       {
         stop_reason: 'tool_use',
-        content: [{
+        content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, {
           type: 'tool_use',
           id: 'toolu_1',
           name: 'create_draft_reply',
           input: { message_id: 'msg-mia', body: 'Hi Mia — thanks for reaching out.' },
         }],
       },
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Drafted — details above.' }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'Drafted — details above.' }] },
     ]);
 
     await runAgent('reply to Mia Skolnick', 'thread-ts', []);
@@ -247,8 +247,8 @@ describe('runAgent refuses to ship a draft-approval prompt with no draft behind 
   it('warns Grant outright if the model still will not save a draft', async () => {
     const posts = captureSlackPosts();
     scriptAnthropic([
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: PHANTOM_TEXT }] },
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: PHANTOM_TEXT }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: PHANTOM_TEXT }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: PHANTOM_TEXT }] },
     ]);
 
     await runAgent('reply to Mia Skolnick', 'thread-ts', []);
@@ -260,9 +260,9 @@ describe('runAgent refuses to ship a draft-approval prompt with no draft behind 
   it('corrects at most once, so a stubborn model cannot loop', async () => {
     captureSlackPosts();
     const { remaining } = scriptAnthropic([
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: PHANTOM_TEXT }] },
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: PHANTOM_TEXT }] },
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: PHANTOM_TEXT }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: PHANTOM_TEXT }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: PHANTOM_TEXT }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: PHANTOM_TEXT }] },
     ]);
 
     await runAgent('reply to Mia Skolnick', 'thread-ts', []);
@@ -273,7 +273,7 @@ describe('runAgent refuses to ship a draft-approval prompt with no draft behind 
   it('posts a normal reply untouched', async () => {
     const posts = captureSlackPosts();
     scriptAnthropic([
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: 'You have 3 unread emails.' }] },
+      { stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'You have 3 unread emails.' }] },
     ]);
 
     await runAgent('how many unread?', 'thread-ts', []);

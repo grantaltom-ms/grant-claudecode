@@ -10,7 +10,7 @@ function textResponse(text) {
     id: 'msg_test',
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text }],
+    content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text }],
     stop_reason: 'end_turn',
   });
 }

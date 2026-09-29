@@ -47,12 +47,18 @@ export const graphAttachmentsHandler = http.get(
 // individual tests when a specific canned response is needed (e.g. the
 // Comply bot's multi-turn tool-use loop).
 
+// Claude Sonnet 5.5 thinks by default, and its replies can START with a
+// `thinking` block (empty text + a signature) before any text. Every mocked
+// reply here does exactly that, so code that grabs `content[0].text` fails in
+// tests the same way it fails in production.
+const THINKING_BLOCK = { type: 'thinking', thinking: '', signature: 'test-signature' };
+
 function textResponse(text) {
   return HttpResponse.json({
     id: 'msg_test',
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text }],
+    content: [THINKING_BLOCK, { type: 'text', text }],
     stop_reason: 'end_turn',
   });
 }
@@ -95,7 +101,7 @@ export function anthropicToolUseHandler(toolName, input, { id = 'toolu_test' } =
       id: 'msg_test_tool_use',
       type: 'message',
       role: 'assistant',
-      content: [{ type: 'tool_use', id, name: toolName, input }],
+      content: [THINKING_BLOCK, { type: 'tool_use', id, name: toolName, input }],
       stop_reason: 'tool_use',
     })
   );

@@ -37,7 +37,7 @@ describe('callClaude sanitizes outbound request bodies', () => {
           id: 'msg_test',
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'text', text: 'ok' }],
+          content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'ok' }],
           stop_reason: 'end_turn',
         });
       })
@@ -69,7 +69,7 @@ describe('callClaude sanitizes outbound request bodies', () => {
           id: 'msg_test',
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'text', text: 'ok' }],
+          content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text: 'ok' }],
           stop_reason: 'end_turn',
         });
       })

@@ -5,7 +5,7 @@ import { extractBodyFields, parseAuthResults, isAuthFailure } from '../../lib/em
 import { upsertThreadMemory } from '../../lib/email-thread-memory';
 import { slackPost as _slackPost } from '../../lib/slack';
 import { buildDigestBlocks, extractDigestItemNumbers, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
-import { callClaude } from '../../lib/claude';
+import { callClaude, responseText } from '../../lib/claude';
 import { loadCorrespondentStatsMap, normalizeEmail } from '../../lib/correspondent-history';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
@@ -766,7 +766,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   let filteredSpamCount = 0;
   let filteredEmails = emails;
   try {
-    const spamIndices = JSON.parse(spamResponse.content[0].text.trim());
+    const spamIndices = JSON.parse(responseText(spamResponse));
     if (Array.isArray(spamIndices) && spamIndices.length > 0) {
       filteredSpamCount = spamIndices.filter(i => emails[i]).length;
       if (process.env.AUTO_ARCHIVE_SPAM === 'true') {
@@ -921,7 +921,14 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
     }],
   });
 
-  let digest = response.content[0].text;
+  let digest = responseText(response);
+  if (!digest) {
+    // Never post a blank or "undefined" digest again: say plainly that the
+    // model gave no text, and why, so the run is visibly failed rather than
+    // silently empty.
+    console.error('Digest triage returned no text', { stop_reason: response.stop_reason });
+    digest = `*🌅 Morning Digest*\n_⚠️ Claude returned no digest text today (stop reason: ${response.stop_reason || 'unknown'}). Re-run \`/api/digest\` to try again._`;
+  }
 
   if (authFlaggedEmails.length > 0) {
     const banner = authFlaggedEmails.map(({ email, number, auth }) => {

@@ -4,11 +4,11 @@ import { server } from '../mocks/server';
 import { runAgent } from '../../lib/comply-agent';
 
 function textResponse(text) {
-  return { id: 'msg_test', type: 'message', role: 'assistant', content: [{ type: 'text', text }], stop_reason: 'end_turn' };
+  return { id: 'msg_test', type: 'message', role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'text', text }], stop_reason: 'end_turn' };
 }
 
 function toolUseResponse(name, input, id = 'toolu_test') {
-  return { id: 'msg_test_tool', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id, name, input }], stop_reason: 'tool_use' };
+  return { id: 'msg_test_tool', type: 'message', role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 'test-signature' }, { type: 'tool_use', id, name, input }], stop_reason: 'tool_use' };
 }
 
 // Returns each response in order on successive calls to the Anthropic endpoint,
