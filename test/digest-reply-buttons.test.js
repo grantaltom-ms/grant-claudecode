@@ -101,7 +101,7 @@ function mockDigestNetwork(digestText, posts) {
     // the [#N] markers are verified against, so they have to come back.
     http.post('https://test-project.supabase.co/rest/v1/digest_items', async ({ request }) => {
       const inserted = await request.json();
-      return HttpResponse.json(inserted);
+      return HttpResponse.json(inserted.map((row) => ({ id: `item-${row.item_number}`, ...row })));
     }),
     http.post('https://slack.com/api/chat.postMessage', async ({ request }) => {
       const body = await request.json();
@@ -112,7 +112,7 @@ function mockDigestNetwork(digestText, posts) {
 }
 
 describe('digest reply buttons', () => {
-  it('posts one ✍️ Reply button per numbered Action Required item', async () => {
+  it('posts a to-do row (Reply / Done / Tomorrow) for each numbered Action Required item', async () => {
     const posts = [];
     mockDigestNetwork(ACTIONABLE_DIGEST, posts);
 
@@ -121,14 +121,19 @@ describe('digest reply buttons', () => {
     const digestPost = posts.find(p => p.text?.includes('Morning Digest'));
     expect(digestPost).toBeDefined();
 
-    const actionsBlocks = (digestPost.blocks || []).filter(b => b.type === 'actions');
-    expect(actionsBlocks).toHaveLength(1);
-
-    const elements = actionsBlocks[0].elements;
-    expect(elements).toHaveLength(2);
-    expect(elements.map(el => el.text.text)).toEqual(['✍️ Reply #1', '✍️ Reply #2']);
-    expect(elements.map(el => JSON.parse(el.value))).toEqual([{ itemNumber: 1 }, { itemNumber: 2 }]);
-    expect(elements.every(el => el.action_id.startsWith(EMAIL_ACTIONS.REPLY))).toBe(true);
+    const rows = (digestPost.blocks || []).filter(b => b.type === 'actions');
+    expect(rows.map(r => r.block_id)).toEqual(['todo_item-1', 'todo_item-2']);
+    for (const row of rows) {
+      expect(row.elements.map(el => el.text?.text).filter(Boolean)).toEqual(['✍️ Reply', '✅ Done', '💤 Tomorrow']);
+    }
+    const labels = (digestPost.blocks || []).filter(b => b.type === 'context').map(b => b.elements[0].text);
+    expect(labels[0]).toContain('#1');
+    expect(labels[0]).toContain('Harper Law');
+    expect(labels[1]).toContain('#2');
+    expect(labels[1]).toContain('Scott Sanborn');
+    // Values carry the saved row id, so a click acts on exactly this item.
+    expect(JSON.parse(rows[0].elements[0].value)).toEqual({ itemId: 'item-1', itemNumber: 1 });
+    expect(rows[0].elements[0].action_id.startsWith(EMAIL_ACTIONS.REPLY)).toBe(true);
   });
 
   it('keeps the full digest text as the message text, so nothing is lost if blocks are rejected', async () => {

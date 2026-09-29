@@ -42,6 +42,7 @@ In Vercel → your project → Settings → Environment Variables:
 | `AZURE_CLIENT_ID` | Azure app registration client ID | Yes |
 | `AZURE_CLIENT_SECRET` | Azure app registration client secret | Yes |
 | `SUPABASE_URL` | Supabase project URL (the memory pipeline's database) | Yes |
+| `HANDOFF_CONTACTS` | JSON list of people the digest's "Hand off…" menu can forward an item to, e.g. `[{"key":"conor","name":"Conor","email":"…"},{"key":"sabrina","name":"Sabrina","email":"…"}]`. Unset = no hand-off menu | No |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key — used by everything except the Comply bot | Yes |
 | `SLACK_BOT_TOKEN` | Bot token for the inbox-digest Slack app (`xoxb-...`) | Yes |
 | `SLACK_SIGNING_SECRET` | Signing secret for the same Slack app | Yes |

@@ -73,6 +73,7 @@ See `SETUP.md` for the complete, verified environment variable table (it also co
 | `TRIAGE_RULES` | JSON array of custom triage rules (managed by bot) |
 | `MAX_SENDS_PER_DAY` | Optional. Hard cap on `send_draft` calls per rolling 24h (default 25) — see "Send safety" below |
 | `TRUSTED_DOMAINS` | Optional. Comma-separated domains exempt from the first-time-recipient flag (default `milestoneproperties.net`) |
+| `HANDOFF_CONTACTS` | Optional. JSON list of `{key, name, email}` the digest's "Hand off…" menu forwards to. Unset = menu hidden. See "Running to-do list" below |
 | `DIGEST_HISTORY_MIN_EXCHANGES` / `DIGEST_HISTORY_WINDOW_DAYS` / `DIGEST_HISTORY_MAX_MESSAGES` | Optional. Tune the digest's correspondent-history enrichment (defaults 3 / 180 / 1000) — see "Correspondent History Enrichment" below |
 
 Don't commit actual Azure tenant/client IDs, project IDs, or team IDs to this doc or any other file in the repo — reference them by variable name only. (This revision removes IDs that a previous version of this file had inlined directly.)
@@ -449,3 +450,12 @@ A separate routine agent (not part of this codebase) reads emails after the morn
 - Read-status tracking (mark emails as read after drafting a reply)
 
 For a fuller, verified-against-code list of reliability gaps and a step-by-step plan to close them, see `docs/PLAN-tier1-2-reliability.md` and `docs/PLAN-tier3-structural.md`.
+
+
+---
+
+## Running to-do list (`lib/todo.js`, `lib/todo-actions.js`)
+
+Every verified Action Required item is saved as a `digest_items` row with `classification = 'action_required'` (migration `026_digest_todo_list.sql`). Each digest shows today's items plus anything still open from earlier under **📌 Still open from earlier**, each with **✍️ Reply / ✅ Done / 💤 Tomorrow / Hand off…** buttons (values carry the row id, so clicks are exact even on old digests).
+
+An item closes when Grant clicks Done (`done`), hands it off (`handed_off`, the email is forwarded via Graph with a short note and counted against the send limit), replies to the thread from Outlook (`replied`, checked in Sent Items each morning; a failed check never closes anything), when a newer digest lists the same thread (`carried`), or after 14 days (`expired`). 💤 Tomorrow sets `snoozed_until` to the next Seattle date.
