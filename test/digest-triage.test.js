@@ -76,12 +76,11 @@ describe('digest triage classification', () => {
     // ...the obvious spam/cold-pitch sender never appears in the posted digest...
     expect(digest).not.toContain('Totally Legit Marketing');
 
-    // ...and the footer reflects that spam was filtered (not archived, since
-    // AUTO_ARCHIVE_SPAM isn't set in this test's environment).
-    expect(digest).toMatch(/spam.*filtered from this digest; not archived/i);
+    // ...and no system footer about filtered spam is posted anymore.
+    expect(digest).not.toMatch(/suspected spam|not archived/i);
   });
 
-  it('flags a busy day above the volume cap in the digest footer', async () => {
+  it('does not post volume-cap system notes in the digest', async () => {
     const manyEmails = Array.from({ length: 60 }, (_, i) => ({
       ...DIGEST_FIXTURE_EMAILS[i % DIGEST_FIXTURE_EMAILS.length],
       id: `bulk-${i}`,
@@ -105,7 +104,7 @@ describe('digest triage classification', () => {
 
     const digest = posts.find(text => text.includes('Morning Digest'));
     expect(digest).toBeDefined();
-    expect(digest).toMatch(/Volume cap hit today/i);
+    expect(digest).not.toMatch(/Volume cap|memory-maintenance/i);
     // Regression (2026-09-29): Sonnet 5.5 replies start with a thinking block,
     // and reading content[0].text posted the cap note under a bare "undefined"
     // with the whole triage missing.

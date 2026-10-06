@@ -818,9 +818,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   if (filteredEmails.length === 0) {
     const archivedNote = archivedCount > 0
       ? ` (${archivedCount} spam emails auto-archived${archiveFailedCount > 0 ? `, ${archiveFailedCount} failed to archive` : ''})`
-      : filteredSpamCount > 0
-        ? ` (${filteredSpamCount} suspected spam/noise emails filtered but not archived)`
-        : '';
+      : '';
     const digestTs = await slackPost(`*Morning Digest* — No actionable emails in the last 24 hours.${archivedNote} ✅`);
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
@@ -886,7 +884,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     maxTokens: 2000,
     system: `You are a morning email triage assistant for Grant Carlson at Milestone Properties, a property management company in the Seattle/Burien/SeaTac area.
 
-Analyze his emails and produce a concise, well-organized Slack digest.
+Analyze his emails and produce a SHORT Slack digest. Brevity is the priority: every item is one line of roughly 20 words or fewer, with no filler and no restating the subject.
 
 FORMAT:
 *🌅 Morning Digest — [Day, Month Date]*
@@ -910,13 +908,15 @@ SENDER IDENTIFICATION:
 - If the sender name is "Milestone Properties" or a generic company name, identify the actual source from the subject/preview (e.g. "AppFolio", "DocuSign", "Internal — [topic]")
 - Always use the person's name when available, not just the company
 
-GROUPING:
-- Group multiple emails about the same deal, property, or topic under a single indented block
-- Format grouped items like:
-  *9275 Renton Ave S — Closing*
-  ↳ [#1] Merritt Hess — Review and signature requested
-  ↳ [#2] Emily Hess — Home inspection report ready
-- Only group if 2+ emails clearly relate to the same thing
+GROUPING (one entry per thread or topic, never one per reply):
+- When 2+ emails belong to the same thread, deal, property, or topic, write ONE header and ONE line that summarizes the whole exchange in a sentence or two: where it stands and what Grant needs to do, if anything. Do NOT list each reply separately.
+- Use the number [#N] and sender of the NEWEST email in the group.
+- Example:
+  *Astra Plaza: Purchase Agreement*
+  ↳ [#30] Scott Morasch: Data looks good; wants you to execute and send the PA so his parents can sign tomorrow morning. Checking on status.
+
+  *First Interstate Bank: New Market Leader Intro*
+  ↳ [#7] Greg Rafuse: Proposed Thursday 12:30 (Rhoda said Thursday or Friday works) and will send an invite. Confirm that works for you.
 
 PROPERTY TAGGING:
 - When an email is clearly about a specific property, append a tag: [Renton], [Burien], [SeaTac], [Tukwila], etc.
@@ -973,19 +973,15 @@ OMIT sections with no emails entirely.${triageRulesSection}`,
 
   if (archivedCount > 0) {
     digest += `\n_🗑️ ${archivedCount} spam email${archivedCount > 1 ? 's' : ''} auto-archived_`;
-  } else if (filteredSpamCount > 0) {
-    digest += `\n_🧹 ${filteredSpamCount} suspected spam/noise email${filteredSpamCount > 1 ? 's' : ''} filtered from this digest; not archived_`;
   }
 
   if (archiveFailedCount > 0) {
     digest += `\n_⚠️ ${archiveFailedCount} spam email${archiveFailedCount > 1 ? 's' : ''} failed to archive — still in Inbox_`;
   }
 
-  const capNotes = [];
-  if (skippedThreadCount > 0) capNotes.push(`${skippedThreadCount} thread${skippedThreadCount > 1 ? 's' : ''} not summarized`);
-  if (skippedEntityCount > 0) capNotes.push(`${skippedEntityCount} email${skippedEntityCount > 1 ? 's' : ''} not scanned for entities`);
-  if (capNotes.length > 0) {
-    digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 10 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
+  // Volume-cap details stay in the logs and digest_runs, not in Slack.
+  if (skippedThreadCount > 0 || skippedEntityCount > 0) {
+    console.log('Digest volume cap hit', { skippedThreadCount, skippedEntityCount });
   }
 
   if (deltaResynced) {

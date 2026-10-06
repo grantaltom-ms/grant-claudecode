@@ -67,6 +67,31 @@ function fakeClaude(reply = { needs_reply: true, body: 'Hi Marla,\n\nWill send i
   return { call, prompts };
 }
 
+describe('one draft per thread', () => {
+  it('drafts only the newest item when several action items share a conversation', async () => {
+    const supabase = createFakeSupabase({ digest_items: [
+      item(1, { graph_conversation_id: 'conv-A', received_at: '2026-10-01T10:00:00Z' }),
+      item(2, { graph_conversation_id: 'conv-A', received_at: '2026-10-02T10:00:00Z' }),
+      item(3, { graph_conversation_id: 'conv-B', received_at: '2026-10-02T09:00:00Z' }),
+    ] });
+    const outlook = fakeOutlook();
+    const drafted = await writeAutoDrafts({ supabase, graph: outlook.graph, token: 't', ownerEmail: OWNER, callClaude: fakeClaude().call, items: supabase.db.digest_items });
+    expect(drafted.map((d) => d.id).sort()).toEqual([2, 3]);
+    expect(outlook.drafts.size).toBe(2);
+  });
+
+  it('skips a thread that already has a bot draft from an earlier digest', async () => {
+    const supabase = createFakeSupabase({ digest_items: [
+      item(1, { graph_conversation_id: 'conv-A', auto_draft_id: 'old-draft' }),
+      item(2, { graph_conversation_id: 'conv-A' }),
+    ] });
+    const outlook = fakeOutlook();
+    const drafted = await writeAutoDrafts({ supabase, graph: outlook.graph, token: 't', ownerEmail: OWNER, callClaude: fakeClaude().call, items: [supabase.db.digest_items[1]] });
+    expect(drafted).toEqual([]);
+    expect(outlook.drafts.size).toBe(0);
+  });
+});
+
 describe('writing drafts', () => {
   it('writes a threaded reply draft per item, keeps CCs, and links it to the to-do', async () => {
     const supabase = createFakeSupabase({ digest_items: [item('a'), item('b')], draft_feedback: [
