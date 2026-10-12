@@ -105,10 +105,10 @@ describe('running to-do list across several mornings', () => {
     const byConv = Object.fromEntries(supabase.db.digest_items.map((r) => [r.graph_conversation_id, r.action_status]));
     expect(byConv).toMatchObject({ A: 'done', B: 'snoozed', C: 'replied', D: 'open', E: 'handed_off' });
 
-    // Day 20: B has been open 19 days -> dropped, and the digest says so.
+    // Day 20: B has been open 19 days (past the 3-day limit) -> dropped, and the digest says so.
     const d20 = await runMorning(supabase, graph, 'run20', day(20), [], []);
     expect(d20.carry.stillOpen).toEqual([]);
-    expect(d20.text).toContain('1 dropped after 14 days');
+    expect(d20.text).toContain('1 dropped after 3 days');
   });
 
   it('the same email thread never shows twice (today\'s row replaces yesterday\'s)', async () => {
