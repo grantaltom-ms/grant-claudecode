@@ -458,7 +458,7 @@ For a fuller, verified-against-code list of reliability gaps and a step-by-step 
 
 Every verified Action Required item is saved as a `digest_items` row with `classification = 'action_required'` (migration `026_digest_todo_list.sql`). Each digest shows today's items plus anything still open from earlier under **📌 Still open from earlier**, each with **✍️ Reply / ✅ Done / 💤 Tomorrow / Hand off…** buttons (values carry the row id, so clicks are exact even on old digests).
 
-An item closes when Grant clicks Done (`done`), hands it off (`handed_off`, the email is forwarded via Graph with a short note and counted against the send limit), replies to the thread from Outlook (`replied`, checked in Sent Items each morning; a failed check never closes anything), when a newer digest lists the same thread (`carried`), or after 14 days (`expired`). 💤 Tomorrow sets `snoozed_until` to the next Seattle date.
+An item closes when Grant clicks Done (`done`), hands it off (`handed_off`, the email is forwarded via Graph with a short note and counted against the send limit), replies to the thread from Outlook (`replied`, checked in Sent Items each morning; a failed check never closes anything), when a newer digest lists the same thread (`carried`), or after 3 days (`expired`). 💤 Tomorrow sets `snoozed_until` to the next Seattle date.
 
 ### Auto-drafted replies (`lib/auto-drafts.js`)
 
