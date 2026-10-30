@@ -12,7 +12,7 @@ import {
   loadState,
   saveState,
   runAgent,
-  generateNoticePdf,
+  generateCompletedNotice,
   uploadPdfToSlack,
 } from '../../lib/comply-agent.js';
 import {
@@ -133,8 +133,9 @@ export default async function handler(req, res) {
                 const today = new Date().toISOString().split('T')[0];
                 const lastName = (newState.tenantName || 'Tenant').split(/[\s,]+/).filter(Boolean).pop();
                 const pdfFilename = `${today} - ${newState.propertyName || 'Property'} Unit ${newState.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
-                const pdfBuffer = await generateNoticePdf(newState);
+                const { pdfBuffer, reviewNote } = await generateCompletedNotice(newState);
                 await uploadPdfToSlack(pdfBuffer, pdfFilename, thread_ts);
+                await slackPost(COMPLY_CHANNEL_ID, reviewNote, thread_ts);
               } catch (pdfErr) {
                 console.error('PDF generation/upload error:', pdfErr);
               }

@@ -10,7 +10,7 @@ import {
   slackUpdateMessage,
   getThreadHistory,
   getBotUserId,
-  generateNoticePdf,
+  generateCompletedNotice,
   uploadPdfToSlack,
   loadState,
   saveState,
@@ -49,8 +49,9 @@ async function maybeUploadCompletedNotice(state, threadTs) {
     const today = new Date().toISOString().split('T')[0];
     const lastName = (state.tenantName || 'Tenant').split(/[\s,]+/).filter(Boolean).pop();
     const pdfFilename = `${today} - ${state.propertyName || 'Property'} Unit ${state.unitNumber || ''} - ${lastName} - Comply Notice.pdf`;
-    const pdfBuffer = await generateNoticePdf(state);
+    const { pdfBuffer, reviewNote } = await generateCompletedNotice(state);
     await uploadPdfToSlack(pdfBuffer, pdfFilename, threadTs);
+    await slackPost(COMPLY_CHANNEL_ID, reviewNote, threadTs);
   } catch (pdfErr) {
     console.error('PDF error in comply-interactions:', pdfErr);
   }

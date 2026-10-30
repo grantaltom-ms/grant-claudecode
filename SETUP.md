@@ -49,6 +49,8 @@ In Vercel → your project → Settings → Environment Variables:
 | `CRON_SECRET` | Shared bearer token for all cron and backfill endpoints — pick any long random string | Yes |
 | `COMPLY_SLACK_BOT_TOKEN` | Bot token for the separate Comply-or-Vacate Slack app | Only if using the Comply bot |
 | `COMPLY_SLACK_SIGNING_SECRET` | Signing secret for the Comply-or-Vacate Slack app | Only if using the Comply bot |
+| `RULES_API_URL` | Base URL of POV-app (the notice rulebook), e.g. its production domain. The comply bot reads legal text from `/api/rules/resolve` | Only if using the Comply bot |
+| `RULES_API_SECRET` | Same value as `RULES_API_SECRET` in POV-app. Without these two, the bot uses its bundled copy of the legal text and says so on every notice | Only if using the Comply bot |
 | `VERCEL_TOKEN` | Vercel API token — lets the assistant save triage rules it learns from you via its own deployment's env vars | Only if you want `update_triage_rules` to work |
 | `TRIAGE_RULES` | JSON array of custom triage rules, e.g. `["Emails from Crystal Li are always Action Required"]` — the bot manages this itself once `VERCEL_TOKEN` is set | Optional, bot-managed |
 | `OPENAI_API_KEY` | Embeddings for semantic memory search — without it the system falls back to keyword-only search | Optional |
