@@ -13,7 +13,8 @@ import {
   generateCompletedNotice,
   uploadPdfToSlack,
   loadState,
-  saveState,
+  updateState,
+  stateChangesFromAgent,
   runAgent,
 } from '../../lib/comply-agent.js';
 import {
@@ -73,20 +74,13 @@ async function handleAgentRun({ threadTs, userChoice, skipMessageTs }) {
     state
   );
 
-  const newState = state || {};
-  if (managerName) newState.managerName = managerName;
-  if (tenantData) Object.assign(newState, tenantData);
-  for (const { section_number, content } of sectionApprovals) {
-    newState[`section${section_number}`] = content;
-  }
-
   const blocks =
     buildApprovalBlocks(agentResponse, threadTs) ??
     buildChoiceBlocks(agentResponse, threadTs);
 
-  await Promise.all([
+  const [, newState] = await Promise.all([
     slackPost(COMPLY_CHANNEL_ID, agentResponse, threadTs, blocks),
-    saveState(threadTs, newState),
+    updateState(threadTs, stateChangesFromAgent({ managerName, tenantData, sectionApprovals })),
   ]);
 
   await maybeUploadCompletedNotice(newState, threadTs);
