@@ -10,7 +10,8 @@ import {
   getThreadHistory,
   getBotUserId,
   loadState,
-  saveState,
+  updateState,
+  stateChangesFromAgent,
   runAgent,
   generateCompletedNotice,
   uploadPdfToSlack,
@@ -109,24 +110,17 @@ export default async function handler(req, res) {
               state
             );
 
-            let newState = state || {};
-            if (managerName) newState.managerName = managerName;
-            if (tenantData) Object.assign(newState, tenantData);
-            for (const { section_number, content } of sectionApprovals) {
-              newState[`section${section_number}`] = content;
-            }
-
-            const allSectionsApproved = newState.section1 && newState.section2 && newState.section3;
-
             // Attach interactive blocks when appropriate
             const blocks =
               buildApprovalBlocks(agentResponse, thread_ts) ??
               buildChoiceBlocks(agentResponse, thread_ts);
 
-            await Promise.all([
+            const [, newState] = await Promise.all([
               slackPost(COMPLY_CHANNEL_ID, agentResponse, thread_ts, blocks),
-              saveState(thread_ts, newState),
+              updateState(thread_ts, stateChangesFromAgent({ managerName, tenantData, sectionApprovals })),
             ]);
+
+            const allSectionsApproved = newState.section1 && newState.section2 && newState.section3;
 
             if (allSectionsApproved) {
               try {
