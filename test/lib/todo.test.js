@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createFakeSupabase } from '../support/fake-supabase';
 import {
   markActionItems, loadCarryOver, sweepCarryOver, formatCarryOverSection,
-  handoffContacts, tomorrowPacific, sinceLabel,
+  handoffContacts, tomorrowPacific, sinceLabel, dropRepliedEmails, EXPIRE_AFTER_DAYS,
 } from '../../lib/todo';
 import { runTodoAction } from '../../lib/todo-actions';
 import { buildTodoBlocks, resolveTodoRow, EMAIL_ACTIONS } from '../../lib/inbox-blocks';
@@ -101,14 +101,33 @@ describe('running to-do list across several mornings', () => {
     const d3 = await runMorning(supabase, graph, 'run3', day(3), [], []);
     expect(d3.carry.stillOpen.map((i) => i.graph_conversation_id)).toEqual(['B']);
     expect(d3.carry.replied.map((i) => i.graph_conversation_id)).toEqual(['C']);
-    expect(d3.text).toContain('1 closed because you replied');
+    // Closures are done quietly: the digest reports no counts for them.
+    expect(d3.text).not.toMatch(/closed because you replied|To-do list/);
     const byConv = Object.fromEntries(supabase.db.digest_items.map((r) => [r.graph_conversation_id, r.action_status]));
     expect(byConv).toMatchObject({ A: 'done', B: 'snoozed', C: 'replied', D: 'open', E: 'handed_off' });
 
-    // Day 20: B has been open 19 days (past the 3-day limit) -> dropped, and the digest says so.
+    // Day 20: B has been open 19 days (past the 7-day limit) -> dropped quietly.
     const d20 = await runMorning(supabase, graph, 'run20', day(20), [], []);
     expect(d20.carry.stillOpen).toEqual([]);
-    expect(d20.text).toContain('1 dropped after 3 days');
+    expect(d20.carry.expired.map((i) => i.graph_conversation_id)).toEqual(['B']);
+    expect(d20.text).toBe('');
+  });
+
+  it('keeps an unanswered item for 7 days, then drops it', async () => {
+    expect(EXPIRE_AFTER_DAYS).toBe(7);
+    const supabase = createFakeSupabase({ digest_items: [] });
+    const graph = fakeGraph();
+    await runMorning(supabase, graph, 'run1', day(1), [savedRow('run1', 1, 'K', day(1))], [1]);
+
+    // 6 days later it is still on the list (it used to be gone after 3)...
+    const d7 = await runMorning(supabase, graph, 'run7', day(7), [], []);
+    expect(d7.carry.stillOpen.map((i) => i.graph_conversation_id)).toEqual(['K']);
+    expect(d7.carry.expired).toEqual([]);
+
+    // ...and 8 days later it has aged out.
+    const d9 = await runMorning(supabase, graph, 'run9', day(9), [], []);
+    expect(d9.carry.stillOpen).toEqual([]);
+    expect(d9.carry.expired.map((i) => i.graph_conversation_id)).toEqual(['K']);
   });
 
   it('the same email thread never shows twice (today\'s row replaces yesterday\'s)', async () => {
@@ -182,5 +201,73 @@ describe('to-do blocks', () => {
     expect(sinceLabel(day(1).toISOString(), day(9))).toBe('8 days');
     // 11 PM Pacific on Oct 1 is Oct 2 in UTC; tomorrow is still Oct 2 locally.
     expect(tomorrowPacific(new Date('2026-10-02T06:00:00Z'))).toBe('2026-10-02');
+  });
+});
+
+describe('dropping threads Grant already replied to (digest, before anything is rendered or saved)', () => {
+  // Graph's Sent Items lookup, keyed by conversation: the times Grant sent on that thread.
+  function sentItemsGraph(sentByConversation, { failFor = new Set(), calls = [] } = {}) {
+    return async (_token, path) => {
+      const conv = decodeURIComponent(path).match(/conversationId eq '([^']+)'/)[1];
+      calls.push(conv);
+      if (failFor.has(conv)) throw new Error('Graph is down');
+      return { value: (sentByConversation[conv] || []).map((sentDateTime) => ({ sentDateTime })) };
+    };
+  }
+  const mail = (id, receivedDateTime, conversationId = `conv-${id}`) => ({ id, conversationId, receivedDateTime });
+
+  it('drops a thread Grant replied to the same day it arrived, keeps the rest', async () => {
+    const calls = [];
+    const emails = [
+      mail('replied-same-day', '2026-11-05T01:00:00Z'),
+      mail('unreplied', '2026-11-05T01:05:00Z'),
+      mail('read-but-unreplied', '2026-11-05T01:10:00Z'),
+    ];
+    const graph = sentItemsGraph({ 'conv-replied-same-day': ['2026-11-05T03:30:00Z'] }, { calls });
+
+    const { kept, dropped, failed } = await dropRepliedEmails({ graph, token: 't', ownerEmail: OWNER, emails });
+
+    expect(dropped.map((e) => e.id)).toEqual(['replied-same-day']);
+    expect(kept.map((e) => e.id)).toEqual(['unreplied', 'read-but-unreplied']);
+    expect(failed).toBe(0);
+  });
+
+  it('only counts a reply sent AFTER the email arrived (a newer message on the thread is new work)', async () => {
+    const emails = [
+      mail('old-one', '2026-11-04T10:00:00Z', 'conv-thread'),
+      mail('new-one', '2026-11-05T09:00:00Z', 'conv-thread'),
+    ];
+    // Grant answered the first message in the evening; the other side wrote back this morning.
+    const graph = sentItemsGraph({ 'conv-thread': ['2026-11-04T20:00:00Z'] });
+
+    const { kept, dropped } = await dropRepliedEmails({ graph, token: 't', ownerEmail: OWNER, emails });
+
+    expect(dropped.map((e) => e.id)).toEqual(['old-one']);
+    expect(kept.map((e) => e.id)).toEqual(['new-one']);
+  });
+
+  it('asks Graph once per thread, not once per email', async () => {
+    const calls = [];
+    const emails = [mail('a', '2026-11-05T01:00:00Z', 'conv-x'), mail('b', '2026-11-05T02:00:00Z', 'conv-x'), mail('c', '2026-11-05T03:00:00Z')];
+    await dropRepliedEmails({ graph: sentItemsGraph({}, { calls }), token: 't', ownerEmail: OWNER, emails });
+    expect(calls.sort()).toEqual(['conv-c', 'conv-x']);
+  });
+
+  it('never drops on a guess: a failed Sent Items check keeps the email', async () => {
+    const emails = [mail('a', '2026-11-05T01:00:00Z'), mail('b', '2026-11-05T01:00:00Z')];
+    const graph = sentItemsGraph({ 'conv-a': ['2026-11-05T05:00:00Z'], 'conv-b': ['2026-11-05T05:00:00Z'] }, { failFor: new Set(['conv-a']) });
+
+    const { kept, dropped, failed } = await dropRepliedEmails({ graph, token: 't', ownerEmail: OWNER, emails });
+
+    expect(kept.map((e) => e.id)).toEqual(['a']);
+    expect(dropped.map((e) => e.id)).toEqual(['b']);
+    expect(failed).toBe(1);
+  });
+
+  it('handles an email with no thread id and an empty list', async () => {
+    const graph = sentItemsGraph({});
+    const noThread = { id: 'x', receivedDateTime: '2026-11-05T01:00:00Z' };
+    expect((await dropRepliedEmails({ graph, token: 't', ownerEmail: OWNER, emails: [noThread] })).kept).toEqual([noThread]);
+    expect(await dropRepliedEmails({ graph, token: 't', ownerEmail: OWNER, emails: [] })).toEqual({ kept: [], dropped: [], failed: 0 });
   });
 });

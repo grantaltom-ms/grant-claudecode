@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from './mocks/server';
+import { graphSentItemsHandler } from './mocks/handlers';
 import { runDigest } from '../pages/api/digest';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
@@ -84,6 +85,7 @@ describe('digest inbox fetch: delta sync', () => {
   it('uses the fixed-window fetch when no delta cursor is bootstrapped', async () => {
     const posts = [];
     server.use(
+      graphSentItemsHandler(),
       deltaStateHandler(null),
       http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/:folder/messages', () =>
         HttpResponse.json({ value: [RECENT] })
@@ -143,6 +145,7 @@ describe('digest inbox fetch: delta sync', () => {
     let resetPayload;
 
     server.use(
+      graphSentItemsHandler(),
       deltaStateHandler({ owner_email: OWNER_EMAIL, cursor_url: 'https://graph.microsoft.com/v1.0/expired-cursor', is_bootstrapped: true }),
       http.get('https://graph.microsoft.com/v1.0/expired-cursor', () =>
         HttpResponse.json({ error: { message: 'The delta token is expired.' } }, { status: 410 })

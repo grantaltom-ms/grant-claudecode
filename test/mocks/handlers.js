@@ -14,6 +14,20 @@ export function graphMessagesHandler(emails = []) {
   );
 }
 
+// Grant's Sent Items, answered per conversation: pass { 'conv-id': ['2026-11-05T03:30:00Z', ...] }
+// (the times he sent on that thread). Default: he has replied to nothing. Tests
+// that register a broad .../mailFolders/:folder/messages handler for the Inbox
+// must list this FIRST in server.use(...), or that handler also answers the
+// Sent Items lookup the digest makes for every thread.
+export function graphSentItemsHandler(sentByConversation = {}) {
+  return http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/sentitems/messages', ({ request }) => {
+    const filter = new URL(request.url).searchParams.get('$filter') || '';
+    const conversationId = filter.match(/conversationId eq '([^']+)'/)?.[1];
+    const times = sentByConversation[conversationId] || [];
+    return HttpResponse.json({ value: times.map((sentDateTime) => ({ sentDateTime })) });
+  });
+}
+
 export const graphMessageGetHandler = http.get(
   'https://graph.microsoft.com/v1.0/users/:email/messages/:id',
   () => HttpResponse.json({ id: 'test-message-id', subject: 'Test', body: { content: '', contentType: 'text' } })
@@ -82,9 +96,6 @@ export const anthropicDefaultHandler = http.post('https://api.anthropic.com/v1/m
   if (system.includes('extract durable operating memory')) {
     return textResponse(JSON.stringify({ decisions: [], commitments: [], open_loops: [] }));
   }
-  if (system.includes('weekday One Priority')) {
-    return textResponse(JSON.stringify({ title: 'Test priority', activity: 'Do the test thing', why_this_matters: 'because tests' }));
-  }
   if (system.includes('email and calendar assistant for Grant Carlson')) {
     return textResponse('Sure, here is a summary.');
   }
@@ -152,6 +163,7 @@ export const supabaseRpcHandler = http.post('https://test-project.supabase.co/re
 
 export const handlers = [
   graphTokenHandler,
+  graphSentItemsHandler(),
   graphMessagesHandler([]),
   graphMessageGetHandler,
   graphMoveHandler,

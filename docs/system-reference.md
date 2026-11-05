@@ -11,7 +11,7 @@ _Last verified against code: 2026-07-27._
 
 This is a fully custom AI email assistant for Grant Carlson (grant@milestoneproperties.net) at Milestone Properties. It has three parts:
 
-1. **Morning Digest** — a Vercel Cron job at 6:30 AM Pacific year-round (fires at 13:30 and 14:30 UTC and runs only in the 6 AM Pacific hour; at most one digest per day, `?force=1` to re-run; see "Cron Schedule" below) that reads the last 24 hours of email, filters spam, triages the rest into priority categories, and posts a structured summary to the Slack channel #inbox-digest.
+1. **Morning Digest** — a Vercel Cron job at 7:30 AM Pacific, Monday to Friday, year-round (fires at 14:30 and 15:30 UTC and runs only in the 7 AM Pacific hour; at most one digest per day, `?force=1` to re-run; see "Cron Schedule" below) that reads the email that has arrived since the last digest, filters spam, drops work-order mail and threads Grant has already replied to, triages the rest into Action Required / Watching / FYI, and posts a short summary to the Slack channel #inbox-digest.
 
 2. **Interactive Assistant** — Grant can message the bot directly in #inbox-digest at any time. The bot can read, search, summarize, and draft emails, then send them after Grant explicitly approves.
 
@@ -120,13 +120,14 @@ Admin consent must be granted after adding permissions. Delegated permissions wi
 
 ## Cron Schedule
 
-Defined in `vercel.json`, which is the source of truth — see that file directly rather than trusting a copy pasted here. As of this revision there are three jobs:
+Defined in `vercel.json`, which is the source of truth — see that file directly rather than trusting a copy pasted here. As of this revision there are two jobs:
 
 | Job | UTC schedule | Pacific time (PDT) | Pacific time (PST) |
 |---|---|---|---|
-| `/api/digest` | `30 13,14 * * *` (runs only in the 6 AM Pacific hour) | 6:30 AM | 6:30 AM |
+| `/api/digest` | `30 14,15 * * 1-5` (Mon–Fri; runs only in the 7 AM Pacific hour) | 7:30 AM | 7:30 AM |
 | `/api/memory-maintenance` | `0 19 * * *` | 12:00 PM | 11:00 AM |
-| `/api/weekday-one-priority` | `25 13,14 * * 1-5` (runs only in the 6 AM Pacific hour) | 6:25 AM (weekdays) | 6:25 AM (weekdays) |
+
+The digest is scheduled at both UTC candidates because one of them is 7:30 AM Pacific in summer (14:30 UTC, PDT) and the other in winter (15:30 UTC, PST); `digestGate` runs only the one that lands in the 7 AM Pacific hour. (The two hours must be 14 and 15 — 15 and 16 would be 8:30 and 9:30 AM in summer and the gate would skip both.) The Weekday One Priority post was retired; its table `daily_priority_suggestions` is left in place.
 
 Vercel Cron runs on UTC with no daylight-saving adjustment, so each job's Pacific time shifts an hour twice a year. Cron requires a Vercel Pro plan. `vercel.json` also sets explicit `maxDuration` values per function under its `functions` block — check that file for current values, since digest and the backfill endpoints do enough sequential Claude/Graph work that they need more than Vercel's default timeout.
 
@@ -231,18 +232,38 @@ Claude is instructed to:
 
 ## File 2: `pages/api/digest.js`
 
-Runs every morning at 7 AM PT via Vercel Cron. Generates and posts the morning email digest.
+Runs at 7:30 AM Pacific, Monday to Friday, via Vercel Cron. Generates and posts the morning email digest.
 
 ### Flow
 
 1. Verifies `Authorization: Bearer {CRON_SECRET}` header
-2. Returns 200 immediately, runs digest in background via `waitUntil`
-3. Fetches last 24 hours of inbox emails via `fetchInboxEmails` — a fixed-window pull (up to 50, no pagination) by default, or delta sync once bootstrapped; see "Inbox fetch: delta sync" below
-4. Loads custom `TRIAGE_RULES` from environment
-5. **Spam pre-pass:** sends email list to Claude for spam classification, archives identified spam via Graph API, removes from working set
-6. **Triage pass:** sends filtered email list to Claude with full formatting instructions
-7. Posts digest to #inbox-digest, appending spam archived count if any
-8. Posts a quick-action prompt as a thread reply
+2. `digestGate` skips the off-hour cron fire and any day that already has a posted digest (`?force=1` bypasses both); returns 200 immediately, runs digest in background via `waitUntil`
+3. **Works out the lookback window** (`resolveWindow`, `lib/digest-rules.js`): from the end of the last successful digest run to now — about 24h on a normal weekday, about 72h on Monday so the weekend is covered, longer after a missed day, never more than 96h; 24h if no earlier coverage time is stored. See "Lookback window" below.
+4. Fetches that window of inbox mail via `fetchInboxEmails` — a fixed-window pull by default (cap scales with the window: about 40 per 24h, never below 50, at most 150), or delta sync once bootstrapped; see "Inbox fetch: delta sync" below. `toRecipients` and `ccRecipients` are fetched too.
+5. Loads custom `TRIAGE_RULES` from environment
+6. **Spam pre-pass:** sends email list to Claude for spam classification, archives identified spam via Graph API (only when `AUTO_ARCHIVE_SPAM=true`), removes from working set. Mail from the named priority people is never treated as spam.
+7. Memory upkeep on everything that passed the spam filter (thread summaries, entity extraction) — unchanged
+8. **Drops** (before anything is rendered or saved): all work-order mail, and every email on a thread Grant has already replied to — see "What never reaches the digest" below
+9. Saves the remaining emails as `digest_items` (numbered 1..N — the `[#N]` contract below), and **triage pass:** sends them to Claude with full formatting instructions, including each email's `To:` and `Cc:` lines
+10. `lib/digest-format.js` turns the model's reply into the posted digest: buckets in order, 5-item caps, hard floors, nothing after the last bucket
+11. Saves verified Action Required items to the to-do list, runs the stale-draft cleanup, appends **📌 Still open**, posts to #inbox-digest, and stores this run's coverage end time
+
+### Lookback window
+
+Each digest covers "since the end of the last successful digest run", not a fixed 24 hours. A successful run (`status` `posted`, `no_emails` or `no_actionable`) stores `coverage_end` in its `digest_runs.metadata` — the moment its fetch started, so mail arriving while the digest runs is picked up next time rather than skipped. The next run loads the newest `digest_runs` row that has one (no new table or migration) and looks back from there.
+
+| Situation | Window |
+|---|---|
+| Normal weekday | ≈ 24h |
+| Monday | ≈ 72h (covers the weekend) |
+| After a missed day | longer, e.g. ≈ 48h |
+| Anything longer than 4 days | capped at 96h |
+| No stored coverage time at all (the first run after this change is deployed) | 24h |
+| `?force=1` right after a normal run | at least 24h (so a manual re-run is not an empty digest) |
+
+`coverage_end` is deliberately NOT stored when the Slack post failed or the triage model returned no text; the next run then starts from the most recent run that did store one, so that mail is still covered.
+
+The fetch cap scales with the window (`fetchCapForWindow`: 24h → 50, 48h → 80, 72h → 120, 96h → 150). If a window still has more mail than the cap, the newest mail up to the cap is reviewed and the digest ends with a warning: `⚠️ Too much mail for one pass: only the newest N emails from the last H hours were reviewed…` (also `fetch_truncated` in the run's metadata).
 
 ### Spam Filtering
 
@@ -252,47 +273,78 @@ The spam pre-pass uses a separate lightweight Claude call that returns only a JS
 - Anything property/tenant/deal related
 - Government or legal notices
 
-Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `destinationId: 'archive'`. As of this revision, archive failures are logged and counted (not silently discarded) — a failed-archive count appears in both the Slack digest footer and the `digest_runs` row's metadata.
+Identified spam is archived via `POST /users/{email}/messages/{id}/move` with `destinationId: 'archive'`. Archive failures are logged and counted (not silently discarded): a failed archive produces a warning line at the end of the digest (`⚠️ N spam emails failed to archive — still in Inbox`) and is recorded in the `digest_runs` row's metadata. Successful archives and filtered-spam counts are not printed. Mail from the named priority people (see "Hard floors") is never marked spam.
 
 ### Inbox fetch: delta sync
 
 `fetchInboxEmails` (top of `digest.js`) checks `inbox_delta_state` for this mailbox before deciding how to fetch:
 - **No bootstrapped cursor (default today):** falls back to `fetchInboxViaFixedWindow` — the same `$filter=receivedDateTime ge {since}` pull this system has always used, unchanged.
-- **Bootstrapped cursor present:** walks it forward via `walkDeltaPages` (`lib/graph.js`), filters out `@removed` entries and anything outside the 24h window in code (Graph's mail delta query doesn't support filtering by `receivedDateTime`), and persists the advanced cursor back to `inbox_delta_state` for next time.
-- **Cursor expired (`410 Gone`):** resets `inbox_delta_state` (`is_bootstrapped: false`, `cursor_url: null`), falls back to the fixed-window pull for that run, and records the resync in both the digest footer and `digest_runs.metadata.delta_resynced` — not just a server log.
+- **Bootstrapped cursor present:** walks it forward via `walkDeltaPages` (`lib/graph.js`), filters out `@removed` entries and anything outside the lookback window in code (Graph's mail delta query doesn't support filtering by `receivedDateTime`), and persists the advanced cursor back to `inbox_delta_state` for next time.
+- **Cursor expired (`410 Gone`):** resets `inbox_delta_state` (`is_bootstrapped: false`, `cursor_url: null`), falls back to the fixed-window pull for that run, and records the resync in both a warning line at the end of the digest and `digest_runs.metadata.delta_resynced` — not just a server log.
 
 **Bootstrapping:** call `/api/backfill-inbox-delta` (Bearer `$CRON_SECRET`) repeatedly until it responds `bootstrap_complete: true`. Establishing the first cursor requires walking the *entire* Inbox once — Graph's mail delta query has no way to scope the initial call to a recent window — so on a mailbox with years of history this can take many calls. Each call processes up to `max_pages` (default 20, query param) and picks up where the last one left off. This is deliberately decoupled from the digest cron: `digest.js`'s fetch path doesn't change until bootstrap finishes.
 
 ### Digest Format
 
 ```
-🌅 Morning Digest — [Day, Month Date]
+🚨 AUTHENTICATION FAILURE DETECTED …     (only when the fraud check fires)
 
-🔧 System Alerts
-• [Source] — [Issue]: summary
+🌅 Morning Digest — [Weekday, Month Day]
 
 🔴 Action Required
-• [#N] [Sender] — [Subject] [Property tag]: summary
+• [#N] [Sender] — [Subject] [Property tag]: summary          (uncapped, with buttons)
 
   *Grouped deal:*
   ↳ [#1] Sender — action needed
   ↳ [#2] Sender — action needed
 
-🟡 FYI / Needs Awareness
-• [Sender] — [Subject]: summary
+👀 Watching
+• [Sender] — [Subject]: summary (owner: [Name])              (max 5, no buttons)
+  _…and N more, not listed_
 
-[N] emails total — [X] need action
-🗑️ N spam emails auto-archived
+🟡 FYI / Needs Awareness
+• [Sender] — [Subject]: summary                              (max 5)
+  _…and N more, not listed_
+
+📌 Still open from earlier                                  (carried-over to-dos)
+• …
+
+⚠️ …                                                        (warnings only, when something went wrong)
 ```
 
-**There is no rendered "⚪ Low Priority / Noise" section.** The live triage prompt in `digest.js` explicitly instructs the model to silently discard anything that would fall in that bucket (automated confirmations, newsletters, routine system reports, Adobe Acrobat comment notifications, successful daily reports) rather than list it. If you want that content visible again — even as a collapsed/de-emphasized section — that's a prompt change in `digest.js`, not currently how it behaves.
+The post **ends after the last bucket**. There is no "N emails total" line, no spam/filtered/archived/filed/draft count footnotes, no "to-do list: N closed" line, and no follow-up thread message explaining the buttons. Mail that is discarded is simply absent. The only things allowed after the buckets are genuine warnings: a failed archive, a window cut short by the fetch cap, the volume-cap (thread/entity) note, and an expired delta cursor. Buttons stay on the Action Required items, plus the **🗂 See what I filed** button when the auto-filer moved anything.
 
-**Followed by thread reply:**
-`Hit ✍️ Reply on any numbered item above to start a response, or reply here — e.g. "what does #3 say", "mark #2 as done"`
+There is **no 🔧 System Alerts bucket** and no rendered "⚪ Low Priority / Noise" section. The triage prompt tells the model to silently discard routine confirmations, newsletters, routine system reports, Adobe Acrobat comment notifications, AppFolio automated confirmations and system/automation mail (Zapier etc.), unless that mail independently qualifies as Action Required under the normal rules. If the model writes either section anyway, `finalizeDigest` drops it.
+
+**What the model decides vs. what the code decides.** The model sorts mail into buckets and writes the one-line summaries. `lib/digest-format.js`'s `finalizeDigest` owns the rules that must hold every day, because a prompt alone can't promise them: it writes the dated title itself (the model is given today's date but its title is ignored), orders the buckets, caps 👀 Watching and 🟡 FYI at 5, adds the single `…and N more, not listed` line to each bucket that overflows, adds back any must-show email the model left out, removes `[#N]` markers from Watching/FYI lines, and strips any closing count line or footnote the model writes anyway. The model puts each email's own `[#N]` on every line in every bucket (that is how a line is tied back to an email); only Action Required keeps its numbers in the post.
+
+**Buckets and the addressee rule.** Each email in the prompt shows `To:` and `Cc:` lines (and `Grant is only cc'd` when he is in Cc but not To). If Grant is only cc'd, or the ask in the email is addressed to someone else, the item is NOT Action Required: it goes under 👀 Watching with `(owner: [the person the ask is addressed to])` (a Watching line with no owner is marked `(owner: unclear)`). The exception — it involves money, a legal matter, or a deadline within 48 hours — keeps it in Action Required. Watching items get no buttons, are **not** saved to the to-do list (no `digest_items` row is marked `action_required`, so there is no new `classification` value and no migration), and never carry over.
+
+**Caps.** 👀 Watching and 🟡 FYI show at most 5 items each, most important first, with the hard-floor items ranked in before the cap is applied. If a bucket has more, its last line is `…and N more, not listed`. Action Required is never capped. If a bucket has more than 5 hard-floor items, all of them still show (a floor is a promise); the cap then leaves room for no one else. Items the cap hides still count as "shown" for the auto-filer, so they are never filed away unseen.
+
+#### What never reaches the digest
+
+Dropped before triage, so they are never rendered, never saved as digest items, and never added to the to-do list:
+
+- **Work-order mail** — every kind (notifications, requests, updates, completions), from any sender or system including AppFolio, no exceptions. Detected in code (`isWorkOrderMail`): "work order" / "work-order" / "workorder" in the subject, the first lines of the body, or the sender's display name. Not overridden by the hard floors. (The fraud check below still looks at it.)
+- **Threads Grant already replied to** — including a reply sent the same day the email arrived. `dropRepliedEmails` (`lib/todo.js`) runs the same Sent Items check the carry-over sweep uses (`loadSentTimes` + `repliedAfter`: any message Grant sent on the email's `conversationId` after the email arrived), once per thread. A reply sent *before* the email arrived does not count, so a newer message on an old thread is still shown. A failed check keeps the email (never drop on a guess). Read-but-unreplied mail is judged normally.
+
+#### Hard floors
+
+Some mail must always appear in the digest, at least as FYI, even if the model would have discarded it. The model is told about them (each such email's line is tagged `🔒 MUST APPEAR (reason)`), and `finalizeDigest` adds back anything the model left out.
+
+- **(a) Mail about money, legal, government, or insurance** — a keyword check in `lib/digest-rules.js` (`floorTopic`) aimed at things that ask something of Grant or put something at stake (invoices, past due, wire/banking details, loans, taxes; attorney, court, eviction, subpoena, notice to vacate; city/county/state notices, permits, any `.gov` sender; insurance, policy, premium, claim, coverage). Routine receipts such as "payment received" are deliberately not floored.
+- **(b) Mail from Rhoda Altom, Conor Murphy, Caitlin Brisson, or Helmut Hummes** — matched by sender **email address**, never by display name (so Caitlin Sogn at College Club does not match Caitlin Brisson). The addresses live in `DEFAULT_PRIORITY_SENDERS` in `lib/digest-rules.js` plus the `DIGEST_PRIORITY_SENDERS` environment variable (JSON; see SETUP.md). Anyone with no address on file is logged on every run (`priority_senders_without_address` in the run's metadata too). Mail from these four is also never marked spam.
+
+A floor guarantees the item appears; which bucket it lands in still follows the addressee rule, the work-order drop and the already-replied drop.
+
+#### Authentication forensics are not affected by the drops
+
+The deterministic phishing banner (see "Authentication Forensics") looks at everything that passed the spam filter, including mail the work-order and already-replied drops keep out of the digest — a spoofed payment-change request is no less dangerous for being labelled a work order. Such an item appears in the banner without a `[#N]`.
 
 **Reply buttons.** The digest message carries one `✍️ Reply #N` Block Kit button per numbered Action Required item (`lib/inbox-blocks.js`'s `extractDigestItemNumbers` + `buildDigestBlocks`; capped at 10 buttons, 5 per row). Clicking is handled by `pages/api/inbox-interactions.js` (`handleEmailInteraction`), which deliberately drafts nothing: it resolves the item and posts "✍️ Reply to #N — sender — subject / What do you want to say?" into the digest thread, and Grant's next message drives the normal typed drafting flow through `create_draft_reply` (send approval still required). Because the button rides on the top-level digest message, `payload.message.ts` is the digest thread ts that `digest_runs.slack_thread_ts` stores. A digest with no numbered items posts as plain text with no blocks.
 
-**The `[#N]` numbering contract — and why it is verified, not assumed.** `resolve_digest_item` looks up `digest_items.item_number`, which `saveDigestItems()` writes as the 1-based position in the `filteredEmails` array — the same position the triage prompt renders as the leading `N.` on each email line. So `[#N]` in the digest text only resolves correctly if the model **reuses that input number** rather than renumbering its Action Required items 1, 2, 3. Nothing structurally enforces that: in production the model did renumber, so `✍️ Reply #5` opened a reply to a different email than the one displayed as `[#5]` (and the older typed path — "draft reply to #1" — was mis-resolving the same way, silently, before the buttons existed). Two things now hold the contract together: the NUMBERING section of the triage prompt in `digest.js` explicitly requires reusing the email's own number and warns that the resulting numbers are usually non-contiguous, and `verifyDigestItemNumbers()` corroborates every `[#N]` against the saved `digest_items` row (sender name, sender address, or a subject fragment appearing on that item's line) before any button is built. Verification is fail-closed and all-or-nothing — one uncorroborated item drops the buttons for the whole digest and logs `Digest item numbering failed verification`, since a systematic renumber corrupts every mapping, not just one. Sending Grant one click away from replying to the wrong correspondent is worse than shipping no buttons that day.
+**The `[#N]` numbering contract — and why it is verified, not assumed.** `resolve_digest_item` looks up `digest_items.item_number`, which `saveDigestItems()` writes as the 1-based position in the list of digest candidates (the emails that survive the spam filter, the work-order drop and the already-replied drop — so numbers can skip) — the same position the triage prompt renders as the leading `N.` on each email line. So `[#N]` in the digest text only resolves correctly if the model **reuses that input number** rather than renumbering its Action Required items 1, 2, 3. Nothing structurally enforces that: in production the model did renumber, so `✍️ Reply #5` opened a reply to a different email than the one displayed as `[#5]` (and the older typed path — "draft reply to #1" — was mis-resolving the same way, silently, before the buttons existed). Two things now hold the contract together: the NUMBERING section of the triage prompt in `digest.js` explicitly requires reusing the email's own number and warns that the resulting numbers are usually non-contiguous, and `verifyDigestItemNumbers()` corroborates every `[#N]` against the saved `digest_items` row (sender name, sender address, or a subject fragment appearing on that item's line) before any button is built. Verification is fail-closed and all-or-nothing — one uncorroborated item drops the buttons for the whole digest and logs `Digest item numbering failed verification`, since a systematic renumber corrupts every mapping, not just one. Sending Grant one click away from replying to the wrong correspondent is worse than shipping no buttons that day.
 
 The same check also runs **at click time** in `handleEmailInteraction`, against `payload.message.text` — the digest exactly as it was posted. This is not redundant: a Slack message carries whatever button values it was posted with, so every digest posted before the numbering fix still points at the wrong rows and no build-time check can reach back and repair one. A click whose resolved row doesn't match the `[#N]` line the reader actually saw is refused with a message naming who it *would* have opened, rather than opening it.
 
@@ -301,14 +353,18 @@ The same check also runs **at click time** in `handleEmailInteraction`, against 
 | Signal | Behavior |
 |---|---|
 | Sender = "Milestone Properties" (generic) | Resolve to actual source: AppFolio, Internal, etc. |
-| 2+ emails about same deal/property | Group under shared header with ↳ arrows |
+| 2+ Action Required emails about same deal/property | Group under shared header with ↳ arrows (never grouped in Watching / FYI) |
 | Property address in subject/body | Append [Renton], [Burien], [SeaTac] tag |
 | Invoice past due date | Prepend ⚠️ OVERDUE |
 | Deadline within 48h | Prepend 🕐 DUE SOON |
-| Automation error (Zapier, etc.) | Route to 🔧 System Alerts |
+| Grant only cc'd, or the ask is addressed to someone else | 👀 Watching with `(owner: …)` — unless money, legal, or a deadline within 48h, then Action Required |
+| Work-order mail (any kind, any sender) | Dropped in code before triage; never shown |
+| Thread Grant already replied to (even same day) | Dropped in code before triage; never shown, saved, or added to the to-do list |
+| Mail about money / legal / government / insurance; mail from the four named people | Always shown, at least as FYI (hard floors) |
+| Automation error (Zapier, etc.) and other system mail | Discarded unless it independently qualifies as Action Required |
 | Successful daily reports | Silently discarded (not shown anywhere in the digest) |
 | Adobe Acrobat comment notifications | Silently discarded unless a reply is explicitly required |
-| Custom TRIAGE_RULES in env | Applied before any other categorization |
+| Custom TRIAGE_RULES in env | Applied before other categorization, but they cannot override the hard floors or the work-order rule |
 | SPF/DMARC auth failure + payment/banking/wire language | Prepends a `🚨 AUTHENTICATION FAILURE DETECTED` banner ahead of the whole digest — a deterministic code check, not the triage model's judgment (see "Authentication forensics" below) |
 | Sender crosses the correspondence-history threshold (3+ prior exchanges, at least one sent) | That line's `History:` note is available to the triage model, which is instructed to write a context-aware one-liner instead of restating the subject (see "Correspondent History Enrichment" below) |
 
@@ -347,7 +403,7 @@ This shares its underlying stats logic (`lib/correspondent-history.js`) with `ba
 
 Grant can update email triage rules by messaging the bot in Slack:
 > "Emails from Crystal Li should always be Action Required"
-> "AppFolio automated notifications should always be Low Priority"
+> "AppFolio automated notifications should always be discarded"
 > "What are my current triage rules?"
 
 The bot uses the `update_triage_rules` tool which:
@@ -436,7 +492,7 @@ A separate routine agent (not part of this codebase) reads emails after the morn
 ## Known Limitations & Future Improvements
 
 - **Triage rules are the one thing still stored in env vars** (`TRIAGE_RULES`) rather than Supabase — everything else (email, memory, digest history, conversation state for the Comply bot) is in the database. Interactive-assistant conversation history is still reconstructed from the live Slack thread on each message rather than stored separately.
-- **50 email cap** per digest, with no pagination — on a busy day the oldest emails in the 24h window are silently dropped rather than the least important ones. As of this revision, when this cap (or the 12-thread-summary or 20-email-entity-extraction caps) is hit, the digest posts a footer noting it — previously this was only logged server-side and invisible in Slack. Fixing the cap itself (adding pagination) is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5. **This cap only applies to the fixed-window fetch path** — see "Inbox fetch: delta sync" below for the alternative that sidesteps it once bootstrapped, though it isn't a substitute for pagination on the fixed-window path itself.
+- **Fetch cap per digest** — the fixed-window pull is a single page (no pagination): about 40 emails per 24h of lookback, never fewer than 50, at most 150 (a Monday run of ~72h gets 120). When a window still has more mail than that, the newest mail up to the cap is triaged, the older mail is not, and the digest ends with a `Too much mail for one pass` warning (and the 12-thread-summary and 20-email-entity-extraction caps post their own `Volume cap hit` note). Adding real pagination is tracked in `docs/PLAN-tier1-2-reliability.md`, item 5. The cap only applies to the fixed-window fetch path; the delta path reports a cut-off when it stops at its page limit.
 - **Spam filter is conservative by design** — borderline emails are not archived; when `AUTO_ARCHIVE_SPAM` isn't set to `true`, they're filtered out of the digest entirely and don't appear anywhere (not routed to a visible section).
 - **Triage rule updates require `VERCEL_TOKEN`** — without this, the bot can read rules but not save new ones.
 - **Thread context limited to 20 messages** — very long Slack threads may lose early context.
@@ -458,13 +514,13 @@ For a fuller, verified-against-code list of reliability gaps and a step-by-step 
 
 Every verified Action Required item is saved as a `digest_items` row with `classification = 'action_required'` (migration `026_digest_todo_list.sql`). Each digest shows today's items plus anything still open from earlier under **📌 Still open from earlier**, each with **✍️ Reply / ✅ Done / 💤 Tomorrow / Hand off…** buttons (values carry the row id, so clicks are exact even on old digests).
 
-An item closes when Grant clicks Done (`done`), hands it off (`handed_off`, the email is forwarded via Graph with a short note and counted against the send limit), replies to the thread from Outlook (`replied`, checked in Sent Items each morning; a failed check never closes anything), when a newer digest lists the same thread (`carried`), or after 3 days (`expired`). 💤 Tomorrow sets `snoozed_until` to the next Seattle date.
+An item closes when Grant clicks Done (`done`), hands it off (`handed_off`, the email is forwarded via Graph with a short note and counted against the send limit), replies to the thread from Outlook (`replied`, checked in Sent Items each morning; a failed check never closes anything), when a newer digest lists the same thread (`carried`), or after 7 days (`expired`). Closures happen quietly: the digest does not print how many items were closed or dropped. Only Action Required items are saved here — 👀 Watching and 🟡 FYI items are not, and do not carry over. 💤 Tomorrow sets `snoozed_until` to the next Seattle date.
 
-### Auto-drafted replies (`lib/auto-drafts.js`)
+### Auto-drafted replies (`lib/auto-drafts.js`) — no longer written by the digest
 
-Each morning, after the to-do list is built, the digest writes a reply draft for each of today's Action Required items (up to 8, 3 at a time) and saves it as a real Outlook reply draft via `createReply` (threaded, CCs preserved). Voice comes from Grant's recent Sent Items (quoted history stripped), his earlier messages in the thread, and `draft_feedback`. The prompt forbids invented facts: unknown amounts, dates, and decisions are left as `[bracketed]` blanks. Nothing is sent; `send_draft` still requires Grant's approval.
+The digest used to write a reply draft for every Action Required item each morning. It **no longer does**: the `writeAutoDrafts` call was removed from the digest run (the function is still in `lib/auto-drafts.js`, unused by the digest). Replies are drafted on request only — the **✍️ Reply** button and the thread assistant (`create_draft_reply`) still write drafts, and sending still needs Grant's explicit approval.
 
-Rows with a draft show **📝 Review draft** (posts the text with a `ref:` tag) and **🗑 Delete draft** (confirm-protected). In the thread, the `auto_draft` tool reads (`get`) or rewrites (`revise`, which writes the new draft before deleting the old one) a draft. Done/hand-off removes an untouched draft. Each morning `cleanupStaleDrafts` deletes bot drafts older than 3 days **only if** Graph's `lastModifiedDateTime` still matches what the bot saved, so drafts Grant edited are never deleted. Columns: migration `027_digest_auto_drafts.sql`.
+What remains is the clean-up for drafts that already exist. Each morning `cleanupStaleDrafts` still deletes bot drafts older than 3 days **only if** Graph's `lastModifiedDateTime` still matches what the bot saved, so drafts Grant edited are never deleted — the drafts already sitting in Outlook age out on their own, silently (no count is posted). Rows that still carry a draft keep their **📝 Review draft** / **🗑 Delete draft** buttons, and the thread's `auto_draft` tool (`get`, `revise`) still works on them; new rows show a plain **✍️ Reply**. Columns: migration `027_digest_auto_drafts.sql`.
 
 ### Auto-filing noise (`lib/auto-file.js`)
 
@@ -478,4 +534,4 @@ Each morning, after triage, the model proposes clear noise from the day's emails
 
 Kept emails move into the Outlook folder **Filed by Bot**, a child of Inbox created on first use. It's `TRIAGE_FOLDERS.filed_by_bot`. The limit is 40 per day. If the exceptions list can't be read, nothing is filed.
 
-The digest footer says how many emails were filed, and a **🗂 See what I filed** button lists them in the thread, each with **↩️ Put back**. Put back moves the email to the Inbox and adds its sender to `auto_file_exceptions`. Graph gives a moved message a new id, so it's stored in `filed_message_id` (migration `028_digest_auto_file.sql`).
+The digest no longer prints a count of what was filed; the **🗂 See what I filed (N)** button under the digest lists them in the thread, each with **↩️ Put back**. Only emails that were digest candidates can be filed, so work-order mail and threads Grant already replied to are left where they are. Put back moves the email to the Inbox and adds its sender to `auto_file_exceptions`. Graph gives a moved message a new id, so it's stored in `filed_message_id` (migration `028_digest_auto_file.sql`).

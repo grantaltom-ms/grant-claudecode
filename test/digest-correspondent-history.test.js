@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from './mocks/server';
+import { graphSentItemsHandler } from './mocks/handlers';
 import { runDigest } from '../pages/api/digest';
 
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
@@ -109,6 +110,7 @@ describe('digest correspondent history enrichment', () => {
     const capture = {};
 
     server.use(
+      graphSentItemsHandler(),
       http.get('https://test-project.supabase.co/rest/v1/inbox_delta_state', () => HttpResponse.json([])),
       http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/:folder/messages', () =>
         HttpResponse.json({ value: [TODAY_FROM_A, TODAY_FROM_B] })
@@ -155,6 +157,7 @@ describe('digest correspondent history enrichment', () => {
     const capture = {};
 
     server.use(
+      graphSentItemsHandler(),
       http.get('https://test-project.supabase.co/rest/v1/inbox_delta_state', () => HttpResponse.json([])),
       http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/:folder/messages', () =>
         HttpResponse.json({ value: [TODAY_FROM_B] })
