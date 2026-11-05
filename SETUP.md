@@ -7,7 +7,7 @@ _Last verified against code: 2026-07-27._
 Inbox Assistant is a Next.js app deployed to Vercel that runs three things for Grant Carlson at Milestone Properties:
 
 1. **Interactive Slack bot** (`pages/api/inbox-assistant.js`) — post a message in `#inbox-digest` and Claude reads/searches/drafts/sends your Outlook mail through Microsoft Graph. Drafts require explicit approval before sending.
-2. **Morning digest cron** (`pages/api/digest.js`) — triages the last 24 hours of inbox into priority buckets and posts to `#inbox-digest`.
+2. **Morning digest cron** (`pages/api/digest.js`) — at 7:30 AM Pacific, Monday to Friday, triages everything that arrived since the last digest into 🔴 Action Required / 👀 Watching / 🟡 FYI and posts to `#inbox-digest`.
 3. **Memory pipeline** (`pages/api/backfill-*.js`, `memory-maintenance.js`) — ingests email into Supabase so the assistant has long-term context (entities, projects, commitments, open loops).
 
 There's also a separate Comply-or-Vacate legal-notice bot (`pages/api/comply-vacate.js`) running in its own Slack channel with its own credentials — see `docs/inbox-memory-architecture.md` for that system.
@@ -55,6 +55,7 @@ In Vercel → your project → Settings → Environment Variables:
 | `TRIAGE_RULES` | JSON array of custom triage rules, e.g. `["Emails from Crystal Li are always Action Required"]` — the bot manages this itself once `VERCEL_TOKEN` is set | Optional, bot-managed |
 | `OPENAI_API_KEY` | Embeddings for semantic memory search — without it the system falls back to keyword-only search | Optional |
 | `EMBEDDING_MODEL` | Defaults to `text-embedding-3-small` | Optional |
+| `DIGEST_PRIORITY_SENDERS` | JSON list of people whose mail always appears in the morning digest, matched by sender **email address** (never by display name): `[{"name":"Caitlin Brisson","emails":["…"]},{"name":"Helmut Hummes","emails":["…"]}]`. Added to the built-in list in `lib/digest-rules.js` (Rhoda Altom, Conor Murphy, Caitlin Brisson, Helmut Hummes); anyone with no address is logged on every run | Optional (but Caitlin and Helmut need it) |
 | `AUTO_ARCHIVE_SPAM` | Set to the string `true` to have the digest actually archive detected spam. Any other value (or unset) filters spam out of the digest without touching the Inbox. | Optional |
 | `OWNER_INVESTOR_SUPABASE_URL` / `OWNER_INVESTOR_SUPABASE_SERVICE_ROLE_KEY` | Only needed if syncing owner/investor data from a separate Supabase project (`backfill-owner-investors.js`) | Optional |
 | `SOURCE_MEMORY_SUPABASE_URL` / `SOURCE_MEMORY_SUPABASE_SERVICE_ROLE_KEY` | Only needed if syncing properties/team/schedule data from a separate Supabase project (`backfill-source-memory.js`) | Optional |
@@ -98,9 +99,8 @@ Set in `vercel.json`. Vercel Cron runs on UTC, which is worth knowing because th
 
 | Job | UTC schedule | Pacific time (PDT, summer) | Pacific time (PST, winter) |
 |---|---|---|---|
-| `/api/digest` | `30 13,14 * * *` (runs only in the 6 AM Pacific hour) | 6:30 AM | 6:30 AM |
+| `/api/digest` | `30 14,15 * * 1-5` (Mon–Fri; runs only in the 7 AM Pacific hour) | 7:30 AM | 7:30 AM |
 | `/api/memory-maintenance` | `0 19 * * *` | 12:00 PM | 11:00 AM |
-| `/api/weekday-one-priority` | `25 13,14 * * 1-5` (runs only in the 6 AM Pacific hour) | 6:25 AM (weekdays) | 6:25 AM (weekdays) |
 
 If you want the digest at a specific Pacific time year-round, you'll need to update the UTC expression twice a year, or accept the hour drift.
 

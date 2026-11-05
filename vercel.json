@@ -21,15 +21,11 @@
   "crons": [
     {
       "path": "/api/digest",
-      "schedule": "30 13,14 * * *"
+      "schedule": "30 14,15 * * 1-5"
     },
     {
       "path": "/api/memory-maintenance",
       "schedule": "0 19 * * *"
-    },
-    {
-      "path": "/api/weekday-one-priority",
-      "schedule": "25 13,14 * * 1-5"
     }
   ]
 }

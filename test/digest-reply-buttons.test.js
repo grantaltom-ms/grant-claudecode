@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from './mocks/server';
+import { graphSentItemsHandler } from './mocks/handlers';
 import { runDigest } from '../pages/api/digest';
 import { EMAIL_ACTIONS } from '../lib/inbox-blocks';
 
@@ -29,6 +30,8 @@ function digestAnthropicRouter(digestText) {
   });
 }
 
+const ARRIVED_AT = new Date().toISOString();
+
 function fixtureEmail(id, senderName, senderEmail, subject) {
   return {
     id,
@@ -38,8 +41,8 @@ function fixtureEmail(id, senderName, senderEmail, subject) {
     from: { emailAddress: { name: senderName, address: senderEmail } },
     toRecipients: [{ emailAddress: { name: 'Grant Carlson', address: 'grant@milestoneproperties.net' } }],
     ccRecipients: [],
-    receivedDateTime: new Date().toISOString(),
-    sentDateTime: new Date().toISOString(),
+    receivedDateTime: ARRIVED_AT,
+    sentDateTime: ARRIVED_AT,
     isRead: false,
     hasAttachments: false,
     importance: 'normal',
@@ -62,7 +65,7 @@ const ACTIONABLE_DIGEST = `*🌅 Morning Digest — Test Day*
 - [#2] Scott Sanborn — quote ready for signature
 
 *🟡 FYI / Needs Awareness*
-- Rhoda Carlson — insurance renewal planning
+- [#3] Rhoda Carlson — insurance renewal planning
 
 3 emails total — 2 need action`;
 
@@ -81,12 +84,13 @@ const RENUMBERED_DIGEST = `*🌅 Morning Digest — Test Day*
 const NOTHING_ACTIONABLE_DIGEST = `*🌅 Morning Digest — Test Day*
 
 *🟡 FYI / Needs Awareness*
-- Rhoda Carlson — insurance renewal planning
+- [#3] Rhoda Carlson — insurance renewal planning
 
 3 emails total — 0 need action`;
 
 function mockDigestNetwork(digestText, posts) {
   server.use(
+    graphSentItemsHandler(),
     http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/:folder/messages', () =>
       HttpResponse.json({ value: EMAILS })
     ),
@@ -146,6 +150,8 @@ describe('digest reply buttons', () => {
     expect(digestPost.text).toContain('[#1] Harper Law');
     expect(digestPost.text).toContain('[#2] Scott Sanborn');
     expect(digestPost.text).toContain('insurance renewal planning');
+    // Only Action Required items are numbered; the FYI line is not.
+    expect(digestPost.text).not.toContain('[#3]');
   });
 
   it('posts NO buttons when the model renumbered its items, rather than wiring them to the wrong emails', async () => {
@@ -183,15 +189,17 @@ describe('digest reply buttons', () => {
     // digest_runs.slack_thread_ts stores and resolve_digest_item looks up.
     expect(digestPost.thread_ts).toBeUndefined();
 
-    const followUp = posts.find(p => p.text?.includes('Reply'));
-    expect(followUp).toBeDefined();
+    // The old thread message explaining the buttons is gone: the digest is the only post.
+    expect(posts).toHaveLength(1);
+    expect(posts.some(p => p.text?.includes('Each item above has buttons'))).toBe(false);
   });
 });
 
-describe('digest auto-drafts', () => {
-  it('writes a reply draft for each Action Required item and offers 📝 Review draft', async () => {
+describe('digest no longer writes auto-drafts', () => {
+  it('creates no reply drafts, so every Action Required row offers a plain ✍️ Reply', async () => {
     const posts = [];
     const createReplies = [];
+    let draftWriterCalled = false;
     mockDigestNetwork(ACTIONABLE_DIGEST, posts);
     server.use(
       http.post('https://api.anthropic.com/v1/messages', async ({ request }) => {
@@ -203,6 +211,7 @@ describe('digest auto-drafts', () => {
           stop_reason: 'end_turn',
         });
         if (system.includes('You draft email replies')) {
+          draftWriterCalled = true;
           return reply(JSON.stringify({ needs_reply: true, body: 'Thanks — on it.\n\nGrant', blanks: [] }));
         }
         if (system.includes('spam filter')) return reply('[]');
@@ -220,12 +229,49 @@ describe('digest auto-drafts', () => {
 
     await runDigest();
 
-    expect(createReplies.map((c) => c.id).sort()).toEqual(['e1', 'e2']);
-    expect(createReplies[0].body.comment).toContain('Thanks — on it.');
+    expect(draftWriterCalled).toBe(false);
+    expect(createReplies).toEqual([]);
     const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
-    expect(digestPost.text).toContain('2 reply drafts waiting in your Outlook Drafts');
+    expect(digestPost.text).not.toMatch(/draft/i);
     const rows = digestPost.blocks.filter((b) => b.type === 'actions');
-    for (const row of rows) expect(row.elements[0].text.text).toBe('📝 Review draft');
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(row.elements[0].text.text).toBe('✍️ Reply');
+  });
+
+  it('still clears out untouched bot drafts older than 3 days, quietly', async () => {
+    const posts = [];
+    const deleted = [];
+    const unlinked = [];
+    mockDigestNetwork(ACTIONABLE_DIGEST, posts);
+    server.use(
+      // The stale-draft query is the digest_items read that filters on auto_draft_created_at.
+      http.get('https://test-project.supabase.co/rest/v1/digest_items', ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.has('auto_draft_created_at')) {
+          return HttpResponse.json([{ id: 'old-1', auto_draft_id: 'draft-old-1', auto_draft_modified_at: 'T1', auto_draft_created_at: '2026-10-01T00:00:00Z' }]);
+        }
+        return HttpResponse.json([]);
+      }),
+      http.patch('https://test-project.supabase.co/rest/v1/digest_items', async ({ request }) => {
+        const body = await request.json();
+        if ('auto_draft_id' in body) unlinked.push(body);
+        return HttpResponse.json([]);
+      }),
+      http.get('https://graph.microsoft.com/v1.0/users/:email/messages/draft-old-1', () =>
+        HttpResponse.json({ isDraft: true, lastModifiedDateTime: 'T1' })
+      ),
+      http.delete('https://graph.microsoft.com/v1.0/users/:email/messages/:id', ({ params }) => {
+        deleted.push(params.id);
+        return new HttpResponse(null, { status: 204 });
+      })
+    );
+
+    await runDigest();
+
+    expect(deleted).toEqual(['draft-old-1']);
+    expect(unlinked).toHaveLength(1);
+    const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
+    expect(digestPost.text).not.toMatch(/Removed \d+ unused draft|older than 3 days/);
   });
 });
 
@@ -269,18 +315,22 @@ describe('digest auto-filing', () => {
     expect(digestPost.text).not.toContain('Filed');
   });
 
-  it('files unmentioned noise into Filed by Bot and offers "See what I filed"', async () => {
+  it('files unmentioned noise into Filed by Bot, without a count line, and offers "See what I filed"', async () => {
     const posts = [];
     const moves = [];
-    mockFiling(NOTHING_ACTIONABLE_DIGEST.replace('- Rhoda Carlson — insurance renewal planning', ''), posts, moves);
+    mockFiling(NOTHING_ACTIONABLE_DIGEST.replace('- [#3] Rhoda Carlson — insurance renewal planning', ''), posts, moves);
     await runDigest();
-    // e1 is a law firm's "Emergency motion filed" -- kept by the hard rules
-    // even though the model suggested it.
-    expect(moves.map((m) => m.id).sort()).toEqual(['e2', 'e3']);
+    // e1 is a law firm's "Emergency motion filed" and e3 is Rhoda's insurance
+    // email: the hard floors put both in the digest, so neither is filed even
+    // though the model suggested all three. Only e2 is real noise.
+    expect(moves.map((m) => m.id)).toEqual(['e2']);
     expect(moves.every((m) => m.to === 'folder-filed')).toBe(true);
     const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
-    expect(digestPost.text).toContain('Filed 2 emails into *Filed by Bot*');
+    expect(digestPost.text).toContain('Harper Law');
+    expect(digestPost.text).toContain('Rhoda Carlson');
+    // Filing is silent in the text; the button is how Grant finds what was filed.
+    expect(digestPost.text).not.toMatch(/Filed by Bot|Nothing was deleted|Filed \d+/);
     const btn = digestPost.blocks.find((b) => b.block_id === 'filed_list').elements[0];
-    expect(btn.text.text).toBe('🗂 See what I filed (2)');
+    expect(btn.text.text).toBe('🗂 See what I filed (1)');
   });
 });

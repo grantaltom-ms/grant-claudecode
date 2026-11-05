@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { server } from './mocks/server';
+import { graphSentItemsHandler } from './mocks/handlers';
 import { runDigest } from '../pages/api/digest';
 
 function textResponse(text) {
@@ -84,6 +85,7 @@ const CLEAN_EMAIL = fixtureEmail({
 
 function mockDigestNetwork(emails, posts) {
   server.use(
+    graphSentItemsHandler(),
     http.get('https://graph.microsoft.com/v1.0/users/:email/mailFolders/:folder/messages', () =>
       HttpResponse.json({ value: emails })
     ),
