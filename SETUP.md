@@ -110,6 +110,13 @@ curl -X POST https://your-vercel-url.vercel.app/api/digest \
   -H "Authorization: Bearer $CRON_SECRET"
 ```
 
+**To see what the digest looks like without posting anything**, add `?preview=1`. It runs the whole digest on your real mail and prints the result in your terminal. Nothing is posted to Slack, saved, filed, archived or changed, and the next real digest is unaffected:
+```bash
+curl -X POST "https://your-vercel-url.vercel.app/api/digest?preview=1" \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+It takes up to a minute or two and answers in plain text. (`?force=1`, by contrast, is a real run: it posts a second digest and can file mail.)
+
 ## Example requests to the interactive assistant
 
 - `What needs my attention today?`

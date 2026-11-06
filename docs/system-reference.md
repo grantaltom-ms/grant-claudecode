@@ -265,6 +265,14 @@ Each digest covers "since the end of the last successful digest run", not a fixe
 
 The fetch cap scales with the window (`fetchCapForWindow`: about 100 per 24h, never below 50, at most 150 — so 24h → 100 and anything from 48h up → 150). It counts everything in the inbox, including work-order mail that is dropped afterwards. If a window still has more mail than the cap, the newest mail up to the cap is reviewed and the older mail is not; this is **not** announced in Slack (the owner chose a clean post), but it is logged and recorded as `fetch_truncated` in the run's `digest_runs.metadata`.
 
+### Previewing the digest (read-only)
+
+`/api/digest?preview=1` (same `Authorization: Bearer {CRON_SECRET}` as the cron) runs the whole digest on real mail and answers with the result as plain text instead of posting it. It exists so the owner can see what a digest looks like at any time without a real run's side effects. If `force=1` is added too, preview wins.
+
+A preview **does**: fetch the inbox (always the plain fixed-window pull, never the delta cursor), look back at least 24 hours (so there is something to show even right after a real run), run the spam question and the triage question to Claude, drop work orders and already-replied threads, apply the hard floors, and render the main post, the must-show reply, the list of buttons that would appear, and a few counts of what was left out.
+
+A preview **does not**: post to Slack, write to the database (no `digest_runs` row, no `digest_items`, no `email_messages` or thread/entity memory, no to-do marking), move, file, archive or delete any mail (`AUTO_ARCHIVE_SPAM` is ignored), clean up old drafts, sweep the to-do list, or advance `inbox_delta_state`. So it cannot change the next real digest's lookback. Not simulated: the auto-filer's "Filed by Bot" step and the to-do sweep. The code is `runDigest({ preview: true })` and `lib/digest-preview.js`; `test/digest-preview.test.js` records every write to every outside service and asserts there are none, and that the preview's text is identical to what a real run posts.
+
 ### Spam Filtering
 
 The spam pre-pass uses a separate lightweight Claude call that returns only a JSON array of indices (`[0, 3, 7]`). It is intentionally conservative — only marks emails as spam when they are clearly cold solicitations, mass marketing, or phishing. It never marks:

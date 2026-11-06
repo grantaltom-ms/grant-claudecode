@@ -17,6 +17,7 @@ import {
   prioritySenderFor, resolvePrioritySenders, resolveWindow, sendersMissingAddresses,
 } from '../../lib/digest-rules';
 import { finalizeDigest } from '../../lib/digest-format';
+import { formatPreview } from '../../lib/digest-preview';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
 const OWNER_EMAIL = 'grant@milestoneproperties.net';
@@ -259,6 +260,25 @@ async function saveDigestItems(digestRunId, emails) {
   }
 
   return data || [];
+}
+
+// A preview has no database rows to number against, so it builds the same shape
+// in memory: item N here is [#N] in the prompt, exactly as saveDigestItems would
+// have numbered it. This lets the [#N] check and the button list run for real.
+function previewDigestItems(emails) {
+  return emails.map((email, index) => {
+    const sender = email.from?.emailAddress || {};
+    return {
+      id: `preview-${index + 1}`,
+      item_number: index + 1,
+      graph_message_id: email.id,
+      graph_conversation_id: email.conversationId || null,
+      sender_name: sender.name || null,
+      sender_email: sender.address || null,
+      subject: email.subject || null,
+      received_at: email.receivedDateTime || null,
+    };
+  });
 }
 
 function parseJsonObject(text) {
@@ -636,7 +656,13 @@ async function fetchInboxViaFixedWindow(token, since, cap) {
 // back to the same fixed-window pull the digest has always used, so a
 // missing/broken delta cursor degrades to today's known-good behavior
 // rather than breaking the digest.
-async function fetchInboxEmails(token, since, cap) {
+async function fetchInboxEmails(token, since, cap, { readOnly = false } = {}) {
+  // A preview must not advance the delta cursor (that would make the next real
+  // digest skip the mail this one read), so it always uses the plain pull.
+  if (readOnly) {
+    return { ...(await fetchInboxViaFixedWindow(token, since, cap)), deltaResynced: false };
+  }
+
   const { data: deltaState, error: loadError } = await supabase
     .from('inbox_delta_state')
     .select('cursor_url, is_bootstrapped')
@@ -728,7 +754,10 @@ function lookbackPhrase(lookback) {
   return lookback.source === 'since_last_digest' ? 'since the last digest' : 'in the last 24 hours';
 }
 
-export async function runDigest({ force = false } = {}) {
+// `preview: true` runs everything read-only and RETURNS the digest instead of
+// posting it (see lib/digest-preview.js): no Slack post, no database writes, no
+// mail moved, filed, archived or deleted, no change to the next lookback.
+export async function runDigest({ force = false, preview = false } = {}) {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Missing Supabase environment variables: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY');
   }
@@ -740,7 +769,7 @@ export async function runDigest({ force = false } = {}) {
   // `windowEnd` is taken BEFORE the fetch and stored as this run's coverage end,
   // so mail that lands while the digest runs is picked up tomorrow, not skipped.
   const windowEnd = new Date();
-  const lookback = resolveWindow(await loadLastCoverageEnd(), windowEnd, { force });
+  const lookback = resolveWindow(await loadLastCoverageEnd(), windowEnd, { force: force || preview });
   const fetchCap = fetchCapForWindow(lookback.hours);
   console.log(`Digest window: ${lookback.hours.toFixed(1)}h (${lookback.source}${lookback.cappedAtMax ? ', capped at 96h' : ''}), fetch cap ${fetchCap}.`);
 
@@ -757,7 +786,7 @@ export async function runDigest({ force = false } = {}) {
   // misclassifying a true first-time sender who sends 2-3 emails in one day
   // as a frequent contact.
   const [{ emails, deltaResynced, truncated }, correspondentStats] = await Promise.all([
-    fetchInboxEmails(token, lookback.since, fetchCap),
+    fetchInboxEmails(token, lookback.since, fetchCap, { readOnly: preview }),
     loadCorrespondentStatsMap(supabase, OWNER_EMAIL, {
       days: resolveHistoryWindowDays(),
       maxMessages: resolveHistoryMaxMessages(),
@@ -795,24 +824,38 @@ export async function runDigest({ force = false } = {}) {
   const savedEmails = [];
   const savedThreads = [];
 
-  for (const email of emails) {
-    const saved = await saveEmailToMemory(email);
-    if (saved) {
-      savedEmails.push(saved);
-      const savedThread = await upsertThreadMemory(supabase, OWNER_EMAIL, email);
-      if (savedThread) savedThreads.push(savedThread);
+  if (!preview) {
+    for (const email of emails) {
+      const saved = await saveEmailToMemory(email);
+      if (saved) {
+        savedEmails.push(saved);
+        const savedThread = await upsertThreadMemory(supabase, OWNER_EMAIL, email);
+        if (savedThread) savedThreads.push(savedThread);
+      }
     }
+
+    console.log(`Saved ${savedEmails.length}/${emails.length} emails to memory.`);
+    console.log(`Updated ${savedThreads.length}/${savedEmails.length} thread memories.`);
   }
 
-  console.log(`Saved ${savedEmails.length}/${emails.length} emails to memory.`);
-  console.log(`Updated ${savedThreads.length}/${savedEmails.length} thread memories.`);
-
-  const digestRun = await createDigestRun({
+  const digestRun = preview ? null : await createDigestRun({
     totalEmails: emails.length,
     savedEmails: savedEmails.length
   });
 
+  // What a preview hands back (see lib/digest-preview.js).
+  const previewBase = {
+    preview: true,
+    lookback: { hours: lookback.hours, source: lookback.source },
+    fetched: emails.length,
+    fetchCap,
+    truncated,
+  };
+
   if (emails.length === 0) {
+    if (preview) {
+      return { ...previewBase, main: `*Morning Digest* — No new emails ${lookbackPhrase(lookback)}. ✅`, thread: '', buttons: [], counts: {} };
+    }
     const digestTs = await slackPost(`*Morning Digest* — No new emails ${lookbackPhrase(lookback)}. ✅`);
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
@@ -879,7 +922,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
       // The hard floor for the named people outranks the spam filter too: mail
       // from them is never marked spam, never archived.
       const spamList = spamIndices.filter(i => emails[i] && !prioritySenderFor(emails[i], prioritySenders));
-      if (process.env.AUTO_ARCHIVE_SPAM === 'true') {
+      if (process.env.AUTO_ARCHIVE_SPAM === 'true' && !preview) {
         const results = await Promise.all(spamList.map(i => archiveEmail(token, emails[i].id)));
         archivedCount = results.filter(r => r.ok).length;
         archiveFailedCount = results.filter(r => !r.ok).length;
@@ -896,6 +939,15 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     : '';
 
   if (filteredEmails.length === 0) {
+    if (preview) {
+      return {
+        ...previewBase,
+        main: '*Morning Digest* — Nothing needs your action today. ✅',
+        thread: '',
+        buttons: [],
+        counts: { spam_filtered: emails.length },
+      };
+    }
     const digestTs = await slackPost(`*Morning Digest* — Nothing needs your action today. ✅${archiveFailedNote}`);
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
@@ -916,11 +968,18 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   // Memory upkeep (thread summaries, entities) covers everything that passed
   // the spam filter, exactly as before; the drops below only decide what the
   // digest itself shows.
-  const { threads: summarizedThreads, skippedCount: skippedThreadCount } = await summarizeThreadMemories(filteredEmails);
-  console.log(`Summarized ${summarizedThreads.length} thread memories.`);
+  // (A preview skips this: it only writes to memory, and it is the slow part.)
+  let skippedThreadCount = 0;
+  let skippedEntityCount = 0;
+  if (!preview) {
+    const { threads: summarizedThreads, skippedCount } = await summarizeThreadMemories(filteredEmails);
+    skippedThreadCount = skippedCount;
+    console.log(`Summarized ${summarizedThreads.length} thread memories.`);
 
-  const { entities: savedEntities, skippedCount: skippedEntityCount } = await extractEntitiesFromEmails(filteredEmails);
-  console.log(`Saved ${savedEntities.length} entity mentions.`);
+    const { entities: savedEntities, skippedCount: skippedEntities } = await extractEntitiesFromEmails(filteredEmails);
+    skippedEntityCount = skippedEntities;
+    console.log(`Saved ${savedEntities.length} entity mentions.`);
+  }
 
   // Dropped before anything is rendered or saved (neither shown, nor saved as a
   // digest item, nor added to the to-do list):
@@ -935,8 +994,8 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   const candidates = replyFilter.kept;
   console.log(`Digest candidates: ${candidates.length} of ${filteredEmails.length} (work orders dropped: ${workOrdersDropped}, already replied: ${replyFilter.dropped.length}, reply checks failed: ${replyFilter.failed}).`);
 
-  const savedDigestItems = await saveDigestItems(digestRun?.id, candidates);
-  console.log(`Saved ${savedDigestItems.length}/${candidates.length} digest item mappings.`);
+  const savedDigestItems = preview ? previewDigestItems(candidates) : await saveDigestItems(digestRun?.id, candidates);
+  console.log(`${preview ? 'Previewing' : 'Saved'} ${savedDigestItems.length}/${candidates.length} digest item mappings.`);
 
   const historyWindowDays = resolveHistoryWindowDays();
   let historyEnrichedCount = 0;
@@ -1127,13 +1186,15 @@ OMIT buckets with no emails entirely.${triageRulesSection}`,
   // to-dos (Watching and FYI items are NOT saved to it), then bring back
   // anything still open from earlier digests (closing the ones Grant has
   // already replied to, and very old ones).
-  const markedTodos = await markActionItems(supabase, savedDigestItems, digestItemNumbers, digest);
+  const markedTodos = preview
+    ? savedDigestItems.filter(item => digestItemNumbers.includes(item.item_number))
+    : await markActionItems(supabase, savedDigestItems, digestItemNumbers, digest);
 
   // The digest no longer writes reply drafts of its own (the ✍️ Reply button
   // and the thread assistant still draft on request). Drafts already sitting
   // in Outlook still age out: untouched bot drafts from 3+ days ago are deleted.
-  const draftCleanup = await cleanupStaleDrafts({ supabase, graph, token, ownerEmail: OWNER_EMAIL });
-  const carry = await sweepCarryOver({
+  const draftCleanup = preview ? { deleted: 0, kept: 0 } : await cleanupStaleDrafts({ supabase, graph, token, ownerEmail: OWNER_EMAIL });
+  const carry = preview ? { stillOpen: [], replied: [], expired: [], overflow: 0 } : await sweepCarryOver({
     supabase,
     graph,
     token,
@@ -1158,7 +1219,7 @@ OMIT buckets with no emails entirely.${triageRulesSection}`,
   // surfaced -- including the Watching / FYI items that are no longer posted -- anyone Grant writes to,
   // or anything about money/deadlines). The count is not printed; the
   // "See what I filed" button is how Grant finds it.
-  const filing = await autoFileNoise({
+  const filing = preview ? { filed: [], kept: [] } : await autoFileNoise({
     supabase,
     graph,
     token,
@@ -1171,6 +1232,24 @@ OMIT buckets with no emails entirely.${triageRulesSection}`,
     authFlaggedIds: new Set(authFlaggedEmails.map(({ email }) => email.id)),
     resolveFolderId: () => resolveTriageFolderId(supabase, token, OWNER_EMAIL, 'filed_by_bot'),
   });
+
+  // A preview stops here: hand the digest back instead of posting it.
+  if (preview) {
+    return {
+      ...previewBase,
+      main: digest,
+      thread: finalized.thread || '',
+      buttons: markedTodos.map(item => `#${item.item_number} · ${itemLabel(item)}`),
+      counts: {
+        work_orders_dropped: workOrdersDropped,
+        replied_dropped: replyFilter.dropped.length,
+        spam_filtered: emails.length - filteredEmails.length,
+        hidden_watching: finalized.stats?.hidden_watching ?? 0,
+        hidden_fyi: finalized.stats?.hidden_fyi ?? 0,
+        triage_failed: triageFailed,
+      },
+    };
+  }
 
   // Buttons only for today's Action Required items (no carried-over rows now).
   const digestTs = await slackPost(
@@ -1225,6 +1304,22 @@ export default async function handler(req, res) {
   if (req.method !== 'POST' && req.method !== 'GET') return res.status(405).end();
 
   if (!verifyCronRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Preview: the same digest on real mail, read-only. Answers with the result
+  // (plain text) instead of posting it, so it needs no gate and cannot change
+  // anything. If both preview=1 and force=1 are given, preview wins.
+  if (req.query?.preview === '1') {
+    try {
+      const result = await runDigest({ preview: true });
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(200).send(formatPreview(result));
+    } catch (err) {
+      console.error('Digest preview error:', err);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.status(500).send(`Preview failed (nothing was posted or changed): ${err.message}`);
+    }
+  }
 
   const force = req.query?.force === '1';
   const gate = await digestGate(force);
