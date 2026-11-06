@@ -61,48 +61,55 @@ function mockNetwork(emails, posts) {
     digestAnthropicRouter(),
     http.post('https://slack.com/api/chat.postMessage', async ({ request }) => {
       const body = await request.json();
-      posts.push(body.text);
+      posts.push(body);
       return HttpResponse.json({ ok: true, ts: `${1700000000 + posts.length}.000001` });
     })
   );
 }
 
 describe('digest triage classification', () => {
-  it('filters spam, surfaces the deadline email under Action Required, and omits automated noise', async () => {
+  it('posts Action Required only, filters spam and noise, and keeps must-show mail in a thread reply', async () => {
     const posts = [];
     mockNetwork(DIGEST_FIXTURE_EMAILS, posts);
 
     await runDigest();
 
-    // Exactly one post: the digest. No follow-up message about the buttons.
-    expect(posts).toHaveLength(1);
-    const digest = posts[0];
-    expect(digest).toContain('Morning Digest');
+    // Two posts: the digest, and one reply under it for the mail that must always appear.
+    expect(posts).toHaveLength(2);
+    const digest = posts[0].text;
+    const thread = posts[1];
+    expect(posts[0].thread_ts).toBeUndefined();
+    expect(thread.thread_ts).toBe('1700000001.000001'); // under the digest, not a new top-level post
 
     // Structure, not exact wording: the deadline email is present under Action Required...
+    expect(digest).toContain('Morning Digest');
     expect(digest).toContain('🔴 Action Required');
     expect(digest).toContain('BECU Loan Documents');
     expect(digest).not.toMatch(/undefined/);
 
-    // ...the obvious spam/cold-pitch sender never appears in the posted digest...
+    // ...and nothing else is in the main post: no Watching, FYI or Still open sections.
+    expect(digest).not.toMatch(/Watching|FYI|Still open|Merritt Hess/);
+
+    // ...the obvious spam/cold-pitch sender never appears anywhere...
     expect(digest).not.toContain('Totally Legit Marketing');
+    expect(thread.text).not.toContain('Totally Legit Marketing');
 
     // ...automated noise never appears (the AppFolio reports, Adobe, the newsletter,
     // the Zapier error -- there is no System Alerts bucket any more)...
-    expect(digest).not.toMatch(/AppFolio daily report|owner statement|Adobe Acrobat|Weekly newsletter|Zapier/);
-    expect(digest).not.toContain('System Alerts');
+    expect(digest + thread.text).not.toMatch(/AppFolio daily report|owner statement|Adobe Acrobat|Weekly newsletter|Zapier|System Alerts/);
 
     // ...mail about money and insurance is guaranteed a place even though the model
-    // said nothing about it (the invoice, the W-9s, the insurance renewal)...
-    expect(digest).toContain('Invoice #4471');
-    expect(digest).toContain('Insurance renewal reminder');
-    expect(digest).toContain('Psomas W-9 follow-up');
+    // said nothing about it: in the thread reply (the invoice, the W-9s, the insurance renewal)...
+    expect(thread.text).toContain('Invoice #4471');
+    expect(thread.text).toContain('Insurance renewal reminder');
+    expect(thread.text).toContain('Psomas W-9 follow-up');
+    expect(digest).not.toMatch(/Invoice #4471|Insurance renewal|Psomas/);
 
-    // ...and the post ends after the last bucket: no count line, no spam footnote.
-    expect(digest).not.toMatch(/emails total|need action|spam|filtered|archived|drafts/i);
+    // ...and the post ends after the last bucket: no count line, no footnotes.
+    expect(digest + thread.text).not.toMatch(/emails total|need action|spam|filtered|archived|drafts/i);
   });
 
-  it('flags a busy day above the volume cap in the digest footer', async () => {
+  it('adds no warning lines to the digest on a busy day (no volume-cap or too-much-mail note)', async () => {
     const manyEmails = Array.from({ length: 60 }, (_, i) => ({
       ...DIGEST_FIXTURE_EMAILS[i % DIGEST_FIXTURE_EMAILS.length],
       id: `bulk-${i}`,
@@ -114,14 +121,11 @@ describe('digest triage classification', () => {
 
     await runDigest();
 
-    const digest = posts.find(text => text.includes('Morning Digest'));
-    expect(digest).toBeDefined();
-    expect(digest).toMatch(/Volume cap hit today/i);
-    // 60 emails in a 24-hour window is more than the 50 the window allows: say so.
-    expect(digest).toMatch(/Too much mail for one pass: only the newest 50 emails/);
+    const digest = posts[0].text;
+    // More threads than the memory caps allow, but that is no longer posted to Slack.
+    expect(digest).not.toMatch(/Volume cap|Too much mail|not summarized|not scanned/i);
     // Regression (2026-09-29): Sonnet 5.5 replies start with a thinking block,
-    // and reading content[0].text posted the cap note under a bare "undefined"
-    // with the whole triage missing.
+    // and reading content[0].text posted a bare "undefined" with the whole triage missing.
     expect(digest).not.toMatch(/undefined/);
     expect(digest).toContain('🔴 Action Required');
   });

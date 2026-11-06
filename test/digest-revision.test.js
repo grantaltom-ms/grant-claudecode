@@ -60,6 +60,7 @@ function setup({
   lastCoverageEnd = null,
   carryOver = [],
   slackOk = true,
+  failThread = false,
   inboxFor,
 } = {}) {
   const seen = {
@@ -113,7 +114,7 @@ function setup({
     http.post('https://slack.com/api/chat.postMessage', async ({ request }) => {
       const body = await request.json();
       seen.posts.push(body);
-      return slackOk
+      return slackOk && !(failThread && body.thread_ts)
         ? HttpResponse.json({ ok: true, ts: `${1700000000 + seen.posts.length}.000001` })
         : HttpResponse.json({ ok: false, error: 'channel_not_found' });
     })
@@ -123,6 +124,8 @@ function setup({
 
 const lastRunPatch = (seen) => seen.runPatches[seen.runPatches.length - 1];
 const digestText = (seen) => seen.posts[0].text;
+// The reply under the digest that carries must-show mail ('' if there isn't one).
+const threadText = (seen) => seen.posts.find((p) => p.thread_ts)?.text || '';
 const windowHoursOf = (url) => {
   const since = /receivedDateTime ge (\S+)/.exec(decodeURIComponent(url.searchParams.get('$filter')))[1];
   return (Date.now() - Date.parse(since)) / HOUR;
@@ -141,14 +144,14 @@ describe('lookback: since the last successful digest', () => {
     await runDigest();
     const url = seen.inboxUrls[0];
     expect(windowHoursOf(url)).toBeCloseTo(24, 1);
-    expect(url.searchParams.get('$top')).toBe('51'); // cap 50, +1 to notice overflow
+    expect(url.searchParams.get('$top')).toBe('101'); // cap 100, +1 to notice overflow
   });
 
-  it('looks back ~72 hours on a Monday, with a fetch cap that grows to match', async () => {
+  it('looks back ~72 hours on a Monday, with a fetch cap that grows to match (up to 150)', async () => {
     const seen = setup({ emails: simple, triage: ACTION_A1, lastCoverageEnd: new Date(Date.now() - 72 * HOUR).toISOString() });
     await runDigest();
     expect(windowHoursOf(seen.inboxUrls[0])).toBeCloseTo(72, 1);
-    expect(seen.inboxUrls[0].searchParams.get('$top')).toBe('121'); // cap 120
+    expect(seen.inboxUrls[0].searchParams.get('$top')).toBe('151'); // cap 150 (the max)
     expect(seen.runPatches.length).toBeGreaterThan(0);
   });
 
@@ -192,7 +195,7 @@ describe('coverage time is saved on each successful run', () => {
     const end = Date.parse(patch.metadata.coverage_end);
     expect(end).toBeGreaterThanOrEqual(before);
     expect(end).toBeLessThanOrEqual(Date.now());
-    expect(patch.metadata).toMatchObject({ window_source: 'default_24h', fetch_cap: 50, fetch_truncated: false });
+    expect(patch.metadata).toMatchObject({ window_source: 'default_24h', fetch_cap: 100, fetch_truncated: false });
   });
 
   it('is saved for a quiet day too (no new emails)', async () => {
@@ -223,25 +226,41 @@ describe('coverage time is saved on each successful run', () => {
   });
 });
 
-describe('a window with more mail than the fetch cap is reported, not silently cut', () => {
+describe('a window with more mail than the fetch cap', () => {
   const lots = (n) => Array.from({ length: n }, (_, i) => mail({ id: `bulk-${i}`, name: `Sender ${i}`, address: `s${i}@x.example`, subject: `Topic ${i}` }));
+  const oneAction = '*🔴 Action Required*\n- [#1] Sender 0 — Topic 0: x';
 
-  it('warns when a normal day exceeds the cap of 50', async () => {
-    const seen = setup({ emails: lots(51), triage: '*🟡 FYI / Needs Awareness*\n- [#1] Sender 0 — Topic 0: x' });
+  it('holds a full normal day (a hundred emails) without being cut off', async () => {
+    const seen = setup({ emails: lots(100), triage: oneAction });
     await runDigest();
-    expect(digestText(seen)).toMatch(/Too much mail for one pass: only the newest 50 emails/);
-    expect(lastRunPatch(seen).metadata).toMatchObject({ fetch_truncated: true });
+    expect(seen.itemInserts).toHaveLength(100);
+    expect(lastRunPatch(seen).metadata).toMatchObject({ fetch_cap: 100, fetch_truncated: false });
   });
 
-  it('a Monday-sized window holds 100 emails without a warning (the old cap of 50 would have cut it)', async () => {
+  it('is cut at the cap, recorded and logged, but no longer announced in the digest', async () => {
+    const seen = setup({ emails: lots(101), triage: oneAction });
+    await runDigest();
+    expect(seen.itemInserts).toHaveLength(100);
+    expect(digestText(seen)).not.toMatch(/Too much mail|older mail|not reviewed/i);
+    expect(lastRunPatch(seen).metadata).toMatchObject({ fetch_truncated: true, fetch_cap: 100 });
+  });
+
+  it('a Monday-sized window holds 150 emails (the old cap of 50 would have cut it)', async () => {
     const seen = setup({
-      emails: lots(100),
-      triage: '*🟡 FYI / Needs Awareness*\n- [#1] Sender 0 — Topic 0: x',
+      emails: lots(150),
+      triage: oneAction,
       lastCoverageEnd: new Date(Date.now() - 72 * HOUR).toISOString(),
     });
     await runDigest();
-    expect(digestText(seen)).not.toMatch(/Too much mail/);
-    expect(seen.itemInserts).toHaveLength(100);
+    expect(seen.itemInserts).toHaveLength(150);
+    expect(lastRunPatch(seen).metadata).toMatchObject({ fetch_cap: 150, fetch_truncated: false });
+  });
+
+  it('adds no volume-cap note either, even when the memory caps are hit', async () => {
+    const seen = setup({ emails: lots(40), triage: oneAction }); // 40 threads > the 12-thread memory cap
+    await runDigest();
+    expect(digestText(seen)).not.toMatch(/Volume cap|not summarized|not scanned/i);
+    expect(lastRunPatch(seen).metadata.skipped_thread_summaries).toBeGreaterThan(0); // still recorded
   });
 });
 
@@ -311,8 +330,8 @@ describe('work-order mail never appears', () => {
       triage: NOTHING_ELSE,
     });
     await runDigest();
-    expect(digestText(seen)).toContain('Dinner Friday?');
-    expect(digestText(seen)).not.toMatch(/boiler/);
+    expect(threadText(seen)).toContain('Dinner Friday?');
+    expect(digestText(seen) + threadText(seen)).not.toMatch(/boiler/);
   });
 });
 
@@ -363,7 +382,7 @@ describe('threads Grant already replied to are dropped, even the same day', () =
   });
 });
 
-describe('the 👀 Watching bucket', () => {
+describe('the main post is Action Required only (Watching, FYI and Still open are not posted)', () => {
   const emails = [
     mail({ id: 'b1', name: 'Alice Anders', address: 'alice@a.example', subject: 'Roof quote' }),
     mail({ id: 'b2', name: 'Bob Baker', address: 'bob@b.example', subject: 'Gutter cleaning', to: [person('kelsey@milestoneproperties.net', 'Kelsey Dempsey')], cc: [person(GRANT)] }),
@@ -376,18 +395,20 @@ describe('the 👀 Watching bucket', () => {
     '*🟡 FYI / Needs Awareness*\n- [#3] Carol Chen — Parking signs: new signs ordered\n\n' +
     '3 emails total — 1 needs action';
 
-  it('sits between Action Required and FYI, names the owner, and carries no numbers', async () => {
+  it('shows the title and Action Required, and nothing about Watching or FYI mail', async () => {
     const seen = setup({ emails, triage });
     await runDigest();
     const text = digestText(seen);
-    expect(text.indexOf('🔴 Action Required')).toBeLessThan(text.indexOf('👀 Watching'));
-    expect(text.indexOf('👀 Watching')).toBeLessThan(text.indexOf('🟡 FYI'));
-    expect(text).toContain('Gutter cleaning: Kelsey is scheduling (owner: Kelsey Dempsey)');
-    expect(text).toContain('[#1] Alice Anders'); // Action Required keeps its number
-    expect(text).not.toMatch(/\[#[23]\]/);
+    expect(text).toBe(
+      `${text.split('\n')[0]}\n\n*🔴 Action Required*\n- [#1] Alice Anders — Roof quote: approve the bid`
+    );
+    expect(text).toMatch(/^\*🌅 Morning Digest — \w+day, \w+ \d{1,2}\*/);
+    // Not posted anywhere, and no reply is made, since none of it is must-show mail.
+    expect(seen.posts).toHaveLength(1);
+    expect(text).not.toMatch(/Gutter|Parking|Watching|FYI|Still open/);
   });
 
-  it('gets no buttons, is not saved to the to-do list, and does not carry over', async () => {
+  it('Watching and FYI mail gets no buttons and is not saved to the to-do list', async () => {
     const seen = setup({ emails, triage });
     await runDigest();
     const rows = seen.posts[0].blocks.filter((b) => b.type === 'actions').map((b) => b.block_id);
@@ -396,35 +417,66 @@ describe('the 👀 Watching bucket', () => {
     expect(marked).toHaveLength(1);
     expect(marked[0].url).toContain('id=eq.item-1');
     expect(seen.itemPatches.some((p) => p.body.classification && p.body.classification !== 'action_required')).toBe(false);
-    expect(lastRunPatch(seen).metadata).toMatchObject({ todo_today: 1, watching_shown: 1, fyi_shown: 1 });
+    expect(lastRunPatch(seen).metadata).toMatchObject({ todo_today: 1, hidden_watching: 1, hidden_fyi: 1, floor_shown: 0 });
   });
-});
 
-describe('caps: 5 each for Watching and FYI, Action Required uncapped', () => {
-  const emails = Array.from({ length: 22 }, (_, i) => mail({ id: `c${i + 1}`, name: `Person${String.fromCharCode(65 + i)} Last`, address: `p${i + 1}@x.example`, subject: `Subject ${i + 1}` }));
-  const line = (n, tail = '') => `- [#${n}] Person${String.fromCharCode(64 + n)} Last — Subject ${n}: summary${tail}`;
-  const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  it('Action Required is uncapped and keeps its numbers and buttons', async () => {
+    const many = Array.from({ length: 12 }, (_, i) => mail({ id: `m${i + 1}`, name: `Person${String.fromCharCode(65 + i)} Last`, address: `p${i + 1}@x.example`, subject: `Subject ${i + 1}` }));
+    const lines = many.map((_, i) => `- [#${i + 1}] Person${String.fromCharCode(65 + i)} Last — Subject ${i + 1}: do it`).join('\n');
+    const seen = setup({ emails: many, triage: `*🔴 Action Required*\n${lines}` });
+    await runDigest();
+    expect(digestText(seen).match(/\[#\d+\]/g)).toHaveLength(12);
+    expect(seen.posts[0].blocks.filter((b) => b.type === 'actions')).toHaveLength(12);
+  });
 
-  it('shows the top 5 of each, one "…and N more, not listed" line inside the bucket, and every Action Required item', async () => {
-    const triage =
-      `*🔴 Action Required*\n${range(1, 7).map((n) => line(n)).join('\n')}\n\n` +
-      `*👀 Watching*\n${range(8, 14).map((n) => line(n, ' (owner: Kelsey)')).join('\n')}\n\n` +
-      `*🟡 FYI / Needs Awareness*\n${range(15, 22).map((n) => line(n)).join('\n')}`;
-    const seen = setup({ emails, triage });
+  it('does not show "Still open from earlier", but still closes replied items and expires old ones in the background', async () => {
+    const dayAgo = (d) => new Date(Date.now() - d * 24 * HOUR).toISOString();
+    const open = (id, conv, days) => ({
+      id, digest_run_id: 'older-run', item_number: 1, graph_message_id: `msg-${id}`, graph_conversation_id: conv,
+      sender_name: `Sender ${id}`, sender_email: `${id}@x.example`, subject: `Subject ${id}`,
+      received_at: dayAgo(days), created_at: dayAgo(days), action_status: 'open', snoozed_until: null,
+    });
+    const seen = setup({
+      emails,
+      triage,
+      carryOver: [open('five', 'conv-five', 5), open('answered', 'conv-answered', 2), open('nine', 'conv-nine', 9)],
+      sentByConversation: { 'conv-answered': [new Date().toISOString()] },
+    });
     await runDigest();
     const text = digestText(seen);
-    const watching = text.slice(text.indexOf('*👀 Watching*'), text.indexOf('*🟡 FYI'));
-    const fyi = text.slice(text.indexOf('*🟡 FYI'));
-    expect(text.match(/\[#\d+\]/g)).toHaveLength(7);
-    expect(watching.match(/^- /gm)).toHaveLength(5);
-    expect(watching).toContain('…and 2 more, not listed');
-    expect(fyi.match(/^- /gm)).toHaveLength(5);
-    expect(fyi).toContain('…and 3 more, not listed');
-    expect(text.match(/not listed/g)).toHaveLength(2);
+    expect(text).not.toMatch(/Still open|Sender five|Sender nine|Sender answered/);
+    // No carried-over rows or buttons in the post...
+    expect(seen.posts[0].blocks.map((b) => b.block_id).filter(Boolean)).toEqual(['todo_item-1']);
+    // ...but the to-do list is still kept tidy: replied closed, 9-day-old expired, 5-day-old left open.
+    const closed = seen.itemPatches.filter((p) => p.body.action_status).map((p) => `${p.body.action_status}:${p.url.match(/id=in\.\((.*?)\)/)?.[1]}`);
+    expect(closed).toContain('replied:answered');
+    expect(closed).toContain('expired:nine');
+    expect(closed.some((c) => c.includes('five'))).toBe(false);
   });
 });
 
-describe('hard floors', () => {
+describe('a long digest is split at line ends, never mid-word', () => {
+  it('keeps every heading and line whole when the post is longer than one Slack block', async () => {
+    const many = Array.from({ length: 30 }, (_, i) => mail({ id: `l${i + 1}`, name: `Person${i + 1} Last`, address: `p${i + 1}@x.example`, subject: `Subject ${i + 1}` }));
+    const lines = many.map((_, i) => `- [#${i + 1}] Person${i + 1} Last — Subject ${i + 1}: ${'needs a decision on the quote and the schedule '.repeat(2)}`).join('\n');
+    const seen = setup({ emails: many, triage: `*🔴 Action Required*\n${lines}` });
+    await runDigest();
+    const text = digestText(seen);
+    expect(text.length).toBeGreaterThan(2900);
+    const sections = seen.posts[0].blocks.filter((b) => b.type === 'section').map((b) => b.text.text);
+    expect(sections.length).toBeGreaterThan(1);
+    for (const section of sections) expect(section.length).toBeLessThanOrEqual(2900);
+    // Joined back together with newlines it is exactly the digest: nothing was cut inside a line.
+    expect(sections.join('\n')).toBe(text.trim());
+    for (const section of sections) {
+      for (const sectionLine of section.split('\n')) {
+        expect(text.split('\n')).toContain(sectionLine);
+      }
+    }
+  });
+});
+
+describe('hard floors: must-show mail goes in a reply under the digest', () => {
   const emails = [
     mail({ id: 'f1', name: 'Rhoda Altom', address: 'rhoda@milestoneproperties.net', subject: 'Family dinner' }),
     mail({ id: 'f2', name: 'Caitlin Sogn', address: 'caitlin@collegeclub.org', subject: 'Club newsletter' }),
@@ -433,20 +485,41 @@ describe('hard floors', () => {
     mail({ id: 'f5', name: 'Caitlin Brisson', address: 'caitlin@brisson.example', subject: 'Weekend plans' }),
   ];
 
-  it('always shows mail from the named people (by address) and money mail, even when the model discards it', async () => {
+  it('shows mail from the named people (by address) and money mail in the thread, even when the model discards it', async () => {
     vi.stubEnv('DIGEST_PRIORITY_SENDERS', JSON.stringify([
       { name: 'Helmut Hummes', emails: ['helmut@hummes.example'] },
       { name: 'Caitlin Brisson', emails: ['caitlin@brisson.example'] },
     ]));
     const seen = setup({ emails, triage: '*🔴 Action Required*\n- [#2] Caitlin Sogn — Club newsletter: reply' });
     await runDigest();
-    const text = digestText(seen);
-    expect(text).toContain('Family dinner'); // Rhoda, by her address
-    expect(text).toContain('Hello from Helmut');
-    expect(text).toContain('Weekend plans'); // Caitlin BRISSON
-    expect(text).toContain('Invoice #4471 past due'); // money
+    const main = digestText(seen);
+    const thread = threadText(seen);
+    expect(main).toContain('Club newsletter'); // the model's own Action Required pick
+    expect(main).not.toMatch(/Family dinner|Hello from Helmut|Weekend plans|Invoice #4471/);
+    expect(thread).toContain('Family dinner'); // Rhoda, by her address
+    expect(thread).toContain('Hello from Helmut');
+    expect(thread).toContain('Weekend plans'); // Caitlin BRISSON
+    expect(thread).toContain('Invoice #4471 past due'); // money
+    expect(thread).not.toContain('Club newsletter'); // Caitlin Sogn is not a floor
     expect(seen.triage.user).toMatch(/Family dinner[^\n]*MUST APPEAR \(priority sender: Rhoda Altom\)/);
     expect(seen.triage.user).toMatch(/Invoice #4471 past due[^\n]*MUST APPEAR \(money mail\)/);
+  });
+
+  it('the reply goes under the digest itself and has no buttons', async () => {
+    const seen = setup({ emails: [emails[0]] });
+    await runDigest();
+    const reply = seen.posts.find((p) => p.thread_ts);
+    expect(seen.posts).toHaveLength(2);
+    expect(reply.thread_ts).toBe('1700000001.000001');
+    expect(reply.blocks).toBeUndefined();
+    expect(reply.text.split('\n')[0]).toMatch(/Always shown/);
+    expect(digestText(seen)).toContain('Nothing needs your action today');
+  });
+
+  it('makes no reply when nothing is must-show', async () => {
+    const seen = setup({ emails: simple, triage: ACTION_A1 });
+    await runDigest();
+    expect(seen.posts).toHaveLength(1);
   });
 
   it('does not treat Caitlin Sogn as Caitlin Brisson', async () => {
@@ -455,7 +528,8 @@ describe('hard floors', () => {
     await runDigest();
     expect(seen.triage.user).toContain('Club newsletter'); // she was triaged like anyone else...
     expect(seen.triage.user).not.toContain('MUST APPEAR'); // ...with no floor
-    expect(digestText(seen)).toContain('Nothing new needs your attention');
+    expect(digestText(seen)).toContain('Nothing needs your action today');
+    expect(seen.posts).toHaveLength(1); // no reply: nothing is must-show
     expect(digestText(seen)).not.toContain('Caitlin Sogn');
   });
 
@@ -463,7 +537,7 @@ describe('hard floors', () => {
     const seen = setup({ emails: [emails[0], emails[1]], spamIndices: [0, 1], triage: NOTHING_ELSE });
     vi.stubEnv('AUTO_ARCHIVE_SPAM', 'true');
     await runDigest();
-    expect(digestText(seen)).toContain('Family dinner');
+    expect(threadText(seen)).toContain('Family dinner');
     expect(seen.moves).toEqual(['f2']); // only Caitlin Sogn's mail was archived
   });
 
@@ -471,9 +545,51 @@ describe('hard floors', () => {
     const repliedAt = new Date(Date.parse(ARRIVED_AT) + 60_000).toISOString();
     const seen = setup({ emails: [emails[0]], sentByConversation: { 'conv-f1': [repliedAt] }, triage: NOTHING_ELSE });
     await runDigest();
-    expect(digestText(seen)).toContain('Nothing new needs your attention');
-    expect(digestText(seen)).not.toContain('Family dinner');
+    expect(digestText(seen)).toContain('Nothing needs your action today');
+    expect(seen.posts).toHaveLength(1);
     expect(seen.triage).toBeNull(); // nothing left to triage
+  });
+
+  it('a Watching item that is must-show keeps its owner in the reply', async () => {
+    const seen = setup({
+      emails: [mail({ id: 'w1', name: 'State Farm', address: 'agent@statefarm.example', subject: 'Insurance renewal', to: [person('rhoda@milestoneproperties.net', 'Rhoda Altom')], cc: [person(GRANT)] })],
+      triage: '*👀 Watching*\n- [#1] State Farm — Insurance renewal: Rhoda is handling it (owner: Rhoda Altom)',
+    });
+    await runDigest();
+    expect(threadText(seen)).toContain('State Farm — Insurance renewal: Rhoda is handling it (owner: Rhoda Altom)');
+    expect(threadText(seen)).not.toMatch(/\[#\d+\]/);
+  });
+
+  it('is never filed away by the auto-filer, because the reply counts as shown', async () => {
+    const seen = setup({ emails: [emails[2]], triage: NOTHING_ELSE });
+    server.use(http.post('https://api.anthropic.com/v1/messages', async ({ request }) => {
+      const body = await request.json();
+      const system = typeof body.system === 'string' ? body.system : (body.system?.[0]?.text || '');
+      if (system.includes('CLEAR inbox noise')) return reply('[0]'); // the model over-reaches on purpose
+      if (system.includes('morning email triage assistant')) return reply(NOTHING_ELSE);
+      if (system.includes('spam filter')) return reply('[]');
+      if (system.includes('Extract durable')) return reply('[]');
+      if (system.includes('summarize business email threads')) return reply(JSON.stringify({ current_summary: 's', open_items: [], status: 'active' }));
+      return reply('[]');
+    }));
+    await runDigest();
+    expect(threadText(seen)).toContain('Invoice #4471 past due');
+    expect(seen.moves).toEqual([]);
+  });
+});
+
+describe('coverage is only saved when the whole digest was delivered', () => {
+  it('is NOT saved if the reply with must-show mail could not be posted', async () => {
+    const seen = setup({ emails: [mail({ id: 'f1', name: 'Rhoda Altom', address: 'rhoda@milestoneproperties.net', subject: 'Family dinner' })], failThread: true });
+    await runDigest();
+    expect(digestText(seen)).toContain('Nothing needs your action today');
+    expect(lastRunPatch(seen).metadata.coverage_end).toBeUndefined();
+  });
+
+  it('is saved when both the digest and its reply were posted', async () => {
+    const seen = setup({ emails: [mail({ id: 'f1', name: 'Rhoda Altom', address: 'rhoda@milestoneproperties.net', subject: 'Family dinner' })] });
+    await runDigest();
+    expect(lastRunPatch(seen).metadata.coverage_end).toBeTruthy();
   });
 });
 
@@ -504,24 +620,13 @@ describe('the post ends after the last bucket', () => {
     expect(digestText(seen)).toContain('1 spam email failed to archive — still in Inbox');
   });
 
-  it('says plainly when nothing new needs attention, and still lists items still open from earlier', async () => {
-    const dayAgo = (d) => new Date(Date.now() - d * 24 * HOUR).toISOString();
-    const open = (id, conv, days) => ({
-      id, digest_run_id: 'older-run', item_number: 1, graph_message_id: `msg-${id}`, graph_conversation_id: conv,
-      sender_name: `Sender ${id}`, sender_email: `${id}@x.example`, subject: `Subject ${id}`,
-      received_at: dayAgo(days), created_at: dayAgo(days), action_status: 'open', snoozed_until: null,
-    });
+  it('says plainly when only work-order mail came in', async () => {
     const seen = setup({
       emails: [mail({ id: 'w9', name: 'AppFolio', address: 'noreply@appfolio.com', subject: 'Work Order #9 updated' })],
-      carryOver: [open('five', 'conv-five', 5), open('nine', 'conv-nine', 9)],
     });
     await runDigest();
-    const text = digestText(seen);
-    expect(text).toContain('Nothing new needs your attention');
-    expect(text).toContain('📌 Still open from earlier');
-    expect(text).toContain('Sender five'); // 5 days old: kept (used to be dropped after 3)
-    expect(text).not.toContain('Sender nine'); // 9 days old: past the 7-day limit
-    expect(text).not.toMatch(/dropped after|closed because/);
+    expect(digestText(seen)).toContain('Nothing needs your action today');
+    expect(seen.posts).toHaveLength(1);
   });
 });
 

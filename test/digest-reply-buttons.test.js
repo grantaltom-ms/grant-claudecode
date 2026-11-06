@@ -149,9 +149,14 @@ describe('digest reply buttons', () => {
     const digestPost = posts.find(p => p.text?.includes('Morning Digest'));
     expect(digestPost.text).toContain('[#1] Harper Law');
     expect(digestPost.text).toContain('[#2] Scott Sanborn');
-    expect(digestPost.text).toContain('insurance renewal planning');
-    // Only Action Required items are numbered; the FYI line is not.
+    // Rhoda's insurance email is not an action item: it is a must-show email, so
+    // it is in the reply under the digest, not in the main post.
+    expect(digestPost.text).not.toContain('insurance renewal planning');
     expect(digestPost.text).not.toContain('[#3]');
+    const reply = posts.find(p => p.thread_ts);
+    expect(reply.text).toContain('Rhoda Carlson');
+    expect(reply.text).toContain('insurance renewal planning');
+    expect(reply.text).not.toContain('[#3]');
   });
 
   it('posts NO buttons when the model renumbered its items, rather than wiring them to the wrong emails', async () => {
@@ -189,9 +194,12 @@ describe('digest reply buttons', () => {
     // digest_runs.slack_thread_ts stores and resolve_digest_item looks up.
     expect(digestPost.thread_ts).toBeUndefined();
 
-    // The old thread message explaining the buttons is gone: the digest is the only post.
-    expect(posts).toHaveLength(1);
+    // The old thread message explaining the buttons is gone. The only reply is
+    // the one carrying must-show mail (Rhoda's insurance email here), and it has no buttons.
+    expect(posts).toHaveLength(2);
     expect(posts.some(p => p.text?.includes('Each item above has buttons'))).toBe(false);
+    expect(posts[1].thread_ts).toBe('1700000001.000001');
+    expect(posts[1].blocks).toBeUndefined();
   });
 });
 
@@ -326,8 +334,11 @@ describe('digest auto-filing', () => {
     expect(moves.map((m) => m.id)).toEqual(['e2']);
     expect(moves.every((m) => m.to === 'folder-filed')).toBe(true);
     const digestPost = posts.find((p) => p.text?.includes('Morning Digest'));
-    expect(digestPost.text).toContain('Harper Law');
-    expect(digestPost.text).toContain('Rhoda Carlson');
+    // Both are must-show mail, so they appear (in the thread reply), and that is
+    // what keeps them out of "Filed by Bot".
+    const reply = posts.find((p) => p.thread_ts);
+    expect(reply.text).toContain('Harper Law');
+    expect(reply.text).toContain('Rhoda Carlson');
     // Filing is silent in the text; the button is how Grant finds what was filed.
     expect(digestPost.text).not.toMatch(/Filed by Bot|Nothing was deleted|Filed \d+/);
     const btn = digestPost.blocks.find((b) => b.block_id === 'filed_list').elements[0];

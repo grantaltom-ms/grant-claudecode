@@ -7,7 +7,7 @@ import { slackPost as _slackPost } from '../../lib/slack';
 import { buildTodoBlocks, extractDigestItemNumbers, filedButtonBlock, verifyDigestItemNumbers } from '../../lib/inbox-blocks';
 import { autoFileNoise } from '../../lib/auto-file';
 import { resolveTriageFolderId } from '../../lib/mailbox-folders';
-import { dropRepliedEmails, formatCarryOverSection, handoffContacts, itemLabel, loadCarryOver, markActionItems, sweepCarryOver } from '../../lib/todo';
+import { dropRepliedEmails, handoffContacts, itemLabel, loadCarryOver, markActionItems, sweepCarryOver } from '../../lib/todo';
 import { cleanupStaleDrafts } from '../../lib/auto-drafts';
 import { callClaude, responseText } from '../../lib/claude';
 import { isPacificHour, samePacificDay } from '../../lib/schedule';
@@ -778,11 +778,12 @@ export async function runDigest({ force = false } = {}) {
     ...extra,
   });
 
-  // Genuine warnings only (something was cut short or failed) -- never routine
-  // counts. Appended after the last bucket.
-  const truncationNote = truncated
-    ? `\n_⚠️ Too much mail for one pass: only the newest ${emails.length} emails from the last ${Math.round(lookback.hours)} hours were reviewed; older mail in that stretch was not. Check Outlook for anything older._`
-    : '';
+  // A window with more mail than the fetch cap is no longer announced in Slack
+  // (the owner chose a clean post); it is logged and kept in the run's metadata
+  // (fetch_truncated), so it can still be found.
+  if (truncated) {
+    console.error(`Digest fetch hit its cap of ${fetchCap}: only the newest ${emails.length} emails from the last ${Math.round(lookback.hours)}h were reviewed; older mail in that window was not.`);
+  }
 
   // SPF/DKIM/DMARC verdicts Microsoft 365 already computed on inbound mail --
   // read once here so both the spam pre-pass and the triage prompt (and the
@@ -895,7 +896,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     : '';
 
   if (filteredEmails.length === 0) {
-    const digestTs = await slackPost(`*Morning Digest* — Nothing new needs your attention. ✅${archiveFailedNote}${truncationNote}`);
+    const digestTs = await slackPost(`*Morning Digest* — Nothing needs your action today. ✅${archiveFailedNote}`);
     await updateDigestRun(digestRun?.id, {
       slack_thread_ts: digestTs || null,
       run_completed_at: new Date().toISOString(),
@@ -1040,7 +1041,7 @@ BUCKETS:
 - 🟡 FYI / Needs Awareness: things Grant should know about but that need no action yet — reports, forwarded info, colleague updates.
 
 ORDER AND LENGTH:
-- In 👀 Watching and 🟡 FYI, put the most important item first, with any 🔒 MUST APPEAR items at the top, and list EVERY qualifying item, one per line. The system trims each of those buckets to the top 5 and adds the "…and N more" line itself — do not write one.
+- In 👀 Watching and 🟡 FYI, put the most important item first, with any 🔒 MUST APPEAR items at the top, and list EVERY qualifying item, one per line. Grant is only shown 🔴 Action Required, plus the 🔒 MUST APPEAR items from the other two buckets; the rest are used only to decide what stays in his inbox, so do not leave any out, and do not write an "…and N more" line.
 - Keep every line to one short sentence.
 
 SENDER IDENTIFICATION:
@@ -1140,28 +1141,21 @@ OMIT buckets with no emails entirely.${triageRulesSection}`,
     items: (await loadCarryOver(supabase, digestRun?.id))
       .filter(item => !markedTodos.some(t => t.graph_conversation_id && t.graph_conversation_id === item.graph_conversation_id)),
   });
-  const carrySection = formatCarryOverSection(carry);
-  if (carrySection) digest += `\n${carrySection}`;
+  // The sweep above still closes items Grant replied to and expires old ones
+  // (so the to-do list stays accurate), but the "📌 Still open" section is no
+  // longer shown: the post is Action Required only.
 
-  // Warnings -- things that were cut short or failed -- are the only thing
-  // allowed after the last bucket. Routine counts (spam, filed, drafts,
-  // to-do closures) are not reported.
+  // Only real failures are allowed after the last bucket: a failed archive, an
+  // expired delta cursor. Routine counts and the fetch-cap / memory-cap notes
+  // are not posted (they stay in the logs and the run's metadata).
   digest += archiveFailedNote;
-  digest += truncationNote;
-
-  const capNotes = [];
-  if (skippedThreadCount > 0) capNotes.push(`${skippedThreadCount} thread${skippedThreadCount > 1 ? 's' : ''} not summarized`);
-  if (skippedEntityCount > 0) capNotes.push(`${skippedEntityCount} email${skippedEntityCount > 1 ? 's' : ''} not scanned for entities`);
-  if (capNotes.length > 0) {
-    digest += `\n_⚠️ Volume cap hit today: ${capNotes.join(', ')} due to per-digest limits. These weren't added to memory today — the maintenance rotation covers this task roughly once every 10 days, so run it manually (\`/api/memory-maintenance?task=operational_memory\` or \`?task=entities\`) if you want it sooner._`;
-  }
 
   if (deltaResynced) {
     digest += `\n_🔄 Delta sync cursor expired and was reset — this run used a full pull instead. Re-run \`/api/backfill-inbox-delta\` when convenient to re-establish it._`;
   }
 
   // Auto-file clear noise into "Filed by Bot" (never anything the digest
-  // surfaced -- including items the 5-item cap hid -- anyone Grant writes to,
+  // surfaced -- including the Watching / FYI items that are no longer posted -- anyone Grant writes to,
   // or anything about money/deadlines). The count is not printed; the
   // "See what I filed" button is how Grant finds it.
   const filing = await autoFileNoise({
@@ -1178,18 +1172,29 @@ OMIT buckets with no emails entirely.${triageRulesSection}`,
     resolveFolderId: () => resolveTriageFolderId(supabase, token, OWNER_EMAIL, 'filed_by_bot'),
   });
 
+  // Buttons only for today's Action Required items (no carried-over rows now).
   const digestTs = await slackPost(
     digest,
     null,
-    buildTodoBlocks(digest, markedTodos, carry.stillOpen, handoffContacts(), itemLabel, filedButtonBlock(digestRun?.id, filing.filed.length))
+    buildTodoBlocks(digest, markedTodos, [], handoffContacts(), itemLabel, filedButtonBlock(digestRun?.id, filing.filed.length))
   );
+
+  // Must-show mail that is not in Action Required (money, legal, government,
+  // insurance, the named people) goes in a reply under the digest. If that reply
+  // can't be posted the run does not count as delivered, so its coverage time is
+  // not stored and the next run covers the same mail.
+  let delivered = Boolean(digestTs);
+  if (finalized.thread && digestTs) {
+    const threadTs = await slackPost(finalized.thread, digestTs);
+    delivered = Boolean(threadTs);
+  }
   await updateDigestRun(digestRun?.id, {
     slack_thread_ts: digestTs || null,
     run_completed_at: new Date().toISOString(),
     included_count: candidates.length,
     archived_count: archivedCount,
     status: 'posted',
-    metadata: runMetadata(triageFailed ? undefined : digestTs, {
+    metadata: runMetadata(triageFailed || !delivered ? undefined : digestTs, {
       filtered_spam_count: emails.length - filteredEmails.length,
       archive_failed_count: archiveFailedCount,
       auto_archive_spam: process.env.AUTO_ARCHIVE_SPAM === 'true',
