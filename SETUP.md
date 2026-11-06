@@ -7,7 +7,7 @@ _Last verified against code: 2026-07-27._
 Inbox Assistant is a Next.js app deployed to Vercel that runs three things for Grant Carlson at Milestone Properties:
 
 1. **Interactive Slack bot** (`pages/api/inbox-assistant.js`) — post a message in `#inbox-digest` and Claude reads/searches/drafts/sends your Outlook mail through Microsoft Graph. Drafts require explicit approval before sending.
-2. **Morning digest cron** (`pages/api/digest.js`) — at 7:30 AM Pacific, Monday to Friday, triages everything that arrived since the last digest into 🔴 Action Required / 👀 Watching / 🟡 FYI and posts to `#inbox-digest`.
+2. **Morning digest cron** (`pages/api/digest.js`) — at 7:30 AM Pacific, Monday to Friday, reads everything that arrived since the last digest and posts the 🔴 Action Required items to `#inbox-digest`, with a short reply underneath for mail that must always be shown (money, legal, government, insurance, key people).
 3. **Memory pipeline** (`pages/api/backfill-*.js`, `memory-maintenance.js`) — ingests email into Supabase so the assistant has long-term context (entities, projects, commitments, open loops).
 
 There's also a separate Comply-or-Vacate legal-notice bot (`pages/api/comply-vacate.js`) running in its own Slack channel with its own credentials — see `docs/inbox-memory-architecture.md` for that system.

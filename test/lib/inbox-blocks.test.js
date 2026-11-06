@@ -9,6 +9,7 @@ import {
   verifyDigestItemNumbers,
   formatResolvedMessage,
   formatDraftSummary,
+  splitIntoChunks,
   DRAFT_APPROVAL_FOOTER,
 } from '../../lib/inbox-blocks';
 
@@ -389,5 +390,50 @@ describe('formatDraftSummary', () => {
     expect(formatDraftSummary(reply)).toContain(DRAFT_APPROVAL_FOOTER);
     expect(formatDraftSummary({ kind: 'new', subject: 'x', to: ['a@b.c'], body: '' }))
       .toContain(DRAFT_APPROVAL_FOOTER);
+  });
+});
+
+describe('splitIntoChunks (long digests are split between lines, never mid-word)', () => {
+  it('leaves text that fits in one piece', () => {
+    expect(splitIntoChunks('one\ntwo\nthree', 100)).toEqual(['one\ntwo\nthree']);
+  });
+
+  it('splits between lines, every piece within the limit, and nothing is lost', () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `- line ${i} ${'x'.repeat(30)}`);
+    const text = lines.join('\n');
+    const chunks = splitIntoChunks(text, 200);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(200);
+    expect(chunks.join('\n')).toBe(text);
+    // Every line is intact in exactly one piece.
+    for (const line of lines) expect(chunks.filter((c) => c.split('\n').includes(line))).toHaveLength(1);
+  });
+
+  it('never cuts a heading in half (the "Still open from earli / er" bug)', () => {
+    // Build text where a fixed-width cut at 100 would land inside the heading.
+    const filler = 'a'.repeat(86); // heading starts at index 87 (after the newline)
+    const heading = '*📌 Still open from earlier*';
+    const text = `${filler}\n${heading}\n- item`;
+    expect(text.slice(0, 100)).not.toContain('earlier*'); // the old cut would have split it
+    const chunks = splitIntoChunks(text, 100);
+    expect(chunks.some((c) => c.includes(heading))).toBe(true);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(100);
+  });
+
+  it('only a single line longer than the limit is cut, and it is cut into pieces within the limit', () => {
+    const long = 'y'.repeat(250);
+    const chunks = splitIntoChunks(`short\n${long}\nend`, 100);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(100);
+    // Nothing is lost: the pieces, put back in order, are the original text
+    // (the break after "short" is a line break between pieces, so it is not in join('')).
+    expect(chunks.join('')).toBe(`short${long}\nend`);
+    expect(chunks[0]).toBe('short'); // the short line before it stays whole
+  });
+
+  it('uses the 2900-character Slack block size by default', () => {
+    const text = Array.from({ length: 200 }, (_, i) => `- line ${i} ${'z'.repeat(40)}`).join('\n');
+    const chunks = splitIntoChunks(text);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(2900);
   });
 });

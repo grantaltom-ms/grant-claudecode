@@ -64,13 +64,16 @@ describe('lookback window: since the last successful digest', () => {
 });
 
 describe('fetch cap scales with the window', () => {
-  it('is ~40 per 24h, never below the old 50, capped at 150', () => {
-    expect(fetchCapForWindow(24)).toBe(50);
-    expect(fetchCapForWindow(48)).toBe(80);
-    expect(fetchCapForWindow(72)).toBe(120);
+  it('is ~100 per 24h, never below 50, capped at 150', () => {
+    expect(fetchCapForWindow(24)).toBe(100);
+    expect(fetchCapForWindow(48)).toBe(150); // 200 would be over the max
+    expect(fetchCapForWindow(72)).toBe(150);
     expect(fetchCapForWindow(96)).toBe(150);
     expect(fetchCapForWindow(500)).toBe(150);
+    expect(fetchCapForWindow(12)).toBe(50);
     expect(fetchCapForWindow(1)).toBe(50);
+    // A window a few seconds over 24h is still a 24h window.
+    expect(fetchCapForWindow(24.003)).toBe(100);
   });
 });
 
