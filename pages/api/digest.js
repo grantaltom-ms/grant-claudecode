@@ -17,6 +17,7 @@ import {
   prioritySenderFor, resolvePrioritySenders, resolveWindow, sendersMissingAddresses,
 } from '../../lib/digest-rules';
 import { finalizeDigest } from '../../lib/digest-format';
+import { runTriage } from '../../lib/digest-triage';
 import { formatPreview } from '../../lib/digest-preview';
 
 const CHANNEL_ID = 'C0AS84GA607'; // #inbox-digest
@@ -1007,7 +1008,9 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     if (reason) floorReasons.set(i + 1, reason);
   });
 
-  const emailList = candidates.map((e, i) => {
+  // emailLines[i] is email [#i+1]: the triage batches are slices of this one
+  // numbered list, so a number means the same email in every batch.
+  const emailLines = candidates.map((e, i) => {
     const received = new Date(e.receivedDateTime);
     const daysAgo = Math.floor((today - received) / (1000 * 60 * 60 * 24));
     const ageNote = daysAgo > 0 ? ` (${daysAgo}d ago)` : ' (today)';
@@ -1032,7 +1035,7 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
     return `${i + 1}. From: ${e.from?.emailAddress?.name || e.from?.emailAddress?.address} <${e.from?.emailAddress?.address}> | Subject: ${e.subject} | Read: ${e.isRead}${ageNote} | Preview: ${e.bodyPreview?.slice(0, 150)}${authNote}${historyNote}${floorNote}${ccNote}\n`
       + `   To: ${formatRecipients(e.toRecipients)}\n`
       + `   Cc: ${formatRecipients(e.ccRecipients)}`;
-  }).join('\n');
+  });
 
   // Deterministic check, not model judgment: flag anything that failed sender
   // authentication AND asks to change how/where money moves. This is exactly
@@ -1053,9 +1056,11 @@ Return format: [0, 3, 7] or [] if none. Return ONLY the JSON array, nothing else
   let digest;
   let triageFailed = false;
   let finalized = { surfacedText: '' };
+  let triageStats = {};
   if (candidates.length > 0) {
-    const response = await callClaude({
-      maxTokens: 4000,
+    // Budget, the one max_tokens retry, and batching of big windows live in
+    // lib/digest-triage.js (see the note there on the Nov 2026 failures).
+    const triage = await runTriage({ callClaude, responseText, emailLines, buildRequest: (batchList, batch) => ({
       // The model now lists every Watching / FYI item (the code trims to 5), and
       // a Monday window is ~3x the mail: give it more than the 60s default. The
       // function itself is allowed 300s.
@@ -1133,19 +1138,24 @@ CORRESPONDENCE HISTORY:
 OMIT buckets with no emails entirely.${triageRulesSection}`,
       messages: [{
         role: 'user',
-        content: `Here are Grant's emails from the last ${Math.round(lookback.hours)} hours (everything since the last digest). Please triage them:\n\n${emailList}`,
+        content: `Here are Grant's emails from the last ${Math.round(lookback.hours)} hours (everything since the last digest).`
+          + (batch.total > 1
+            ? ` There are too many to triage at once, so this is batch ${batch.index + 1} of ${batch.total}; the other batches are triaged separately. Only list emails from this batch, with their own numbers as shown.`
+            : '')
+          + ` Please triage them:\n\n${batchList}`,
       }],
-    });
+    }) });
 
-    modelText = responseText(response);
-    if (!modelText) {
+    modelText = triage.text;
+    triageStats = { triage_batches: triage.batches, triage_retries: triage.retries };
+    if (triage.failed) {
       // Never post a blank or "undefined" digest again: say plainly that the
       // model gave no text, and why, so the run is visibly failed rather than
       // silently empty. A digest like this did not cover the window, so it
       // does not move the coverage time forward either.
       triageFailed = true;
-      console.error('Digest triage returned no text', { stop_reason: response.stop_reason });
-      digest = `*🌅 Morning Digest*\n_⚠️ Claude returned no digest text today (stop reason: ${response.stop_reason || 'unknown'}). Re-run \`/api/digest?force=1\` to try again._`;
+      console.error('Digest triage returned no text', { stop_reason: triage.stopReason, ...triageStats });
+      digest = `*🌅 Morning Digest*\n_⚠️ Claude returned no digest text today (stop reason: ${triage.stopReason || 'unknown'}). Re-run \`/api/digest?force=1\` to try again._`;
     }
   }
 
@@ -1287,6 +1297,7 @@ OMIT buckets with no emails entirely.${triageRulesSection}`,
       floor_count: floorReasons.size,
       priority_senders_without_address: sendersWithoutAddress,
       ...(finalized.stats || {}),
+      ...triageStats,
       todo_today: markedTodos.length,
       todo_carried_over: carry.stillOpen.length,
       todo_closed_replied: carry.replied.length,
